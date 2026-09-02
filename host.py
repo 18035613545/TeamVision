@@ -1271,10 +1271,13 @@ def run_server(runtime):
                 send_fps = runtime.stats["send_fps"]
                 encode_ms = runtime.stats["encode_ms"]
                 avg_send_ms = runtime.stats["avg_send_ms"]
+                still_now = bool(runtime.stats.get("still", False))
             with runtime.slot_lock:
                 quality = runtime.slot["quality"]
                 scale = runtime.slot["scale"]
                 fps_now = runtime.slot.get("fps", fps)
+                out_w = runtime.slot.get("out_w", 0)
+                out_h = runtime.slot.get("out_h", 0)
             budget_ms = 1000.0 / max(fps_now, 1) * 0.8
             # 各客户端带宽汇总（KB/s、累计 MB、RTT）；同时汇总真实发送耗时与丢帧信号
             client_send_ms = []
@@ -1308,16 +1311,21 @@ def run_server(runtime):
                 runtime.stats["avg_send_ms"] = effective_send_ms
                 runtime.stats["worst_rtt_ms"] = worst_rtt
             log.info(
-                "性能: 采集 %d fps / 编码 %d fps / 发送 %d fps / 帧率 %d / 质量 %d / 缩放 %.2f / 编码 %.1f ms / 发送 %.1f ms%s",
+                "性能: 采集 %d fps / 编码 %d fps / 发送 %d fps / 帧率 %d / 质量 %d / 缩放 %.2f / 输出 %dx%d / 编码 %.1f ms / 发送 %.1f ms%s",
                 capture_fps, encode_fps, send_fps, fps_now, quality, scale,
-                encode_ms, effective_send_ms,
-                "（有客户端丢帧）" if recent_drop else "",
+                out_w, out_h, encode_ms, effective_send_ms,
+                "（画面静止，暂停发送）" if still_now else
+                ("（有客户端丢帧）" if recent_drop else ""),
             )
             if bw_lines:
                 log.info("带宽: %s", "；".join(bw_lines))
             # 每次评估时从 runtime.cfg 读取开关，让 GUI 修改可以即时生效
             adaptive_now = bool(runtime.cfg["host"].get("perf", {}).get("adaptive", True))
             if not adaptive_now:
+                continue
+            if still_now:
+                # 画面静止停发：发送耗时≈0 会让常规评估误入"回升"分支，
+                # 反复重建编码器（浪费 CPU）。静止期只统计不评估，恢复后自动继续。
                 continue
             # 同步读取用户最新基准值（GUI 修改 fps/质量/缩放后，回升目标随之更新，
             # 避免自适应回升"对抗"用户手动设置）
