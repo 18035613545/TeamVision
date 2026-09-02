@@ -910,6 +910,13 @@ def run_server(runtime):
     quality_min = perf_cfg.get("quality_min", 40)
     scale_min = perf_cfg.get("scale_min", 0.6)
     fps_min = max(1, perf_cfg.get("fps_min", 15))
+    # 静止检测配置（perf.still，全部可配；enabled=false 关闭后行为与旧版一致）
+    still_cfg = perf_cfg.get("still", {})
+    still_enabled = bool(still_cfg.get("enabled", True))
+    still_probe_interval = 1.0 / max(1, int(still_cfg.get("probe_fps", 5)))
+    still_frames = max(1, int(still_cfg.get("still_frames", 3)))
+    point_thr = int(still_cfg.get("point_thr", 10))
+    ratio_thr = float(still_cfg.get("ratio_thr", 0.005))
     # H.264 视频编码配置
     codec_cfg = cfg["host"].get("codec", {})
     encoder_sel = codec_cfg.get("encoder", "auto")
@@ -967,6 +974,9 @@ def run_server(runtime):
             region = runtime.slot["region"]
         cap = CaptureManager(backend, monitor, region)
         consecutive_errors = 0
+        still_ref = None      # 最近一次发送帧的抽稀参考图
+        still_hits = 0        # 连续静止帧计数（迟滞）
+        in_still = False      # 是否处于静止停发态
         try:
             while not runtime.stop_event.is_set():
                 with runtime.slot_lock:
@@ -1007,6 +1017,31 @@ def run_server(runtime):
                     continue
                 if consecutive_errors > 0:
                     consecutive_errors = 0  # 恢复成功，清空连续错误计数
+                # ---- 静止检测闸门（画面无有效变化时不写 raw 槽，编码/发送自然停摆）----
+                if still_enabled:
+                    try:
+                        changed, still_ref = motion_changed(
+                            still_ref, downsample_frame(bgr), point_thr, ratio_thr)
+                    except Exception:
+                        # 探测异常按“有变化”处理：宁可多发一帧，不可画面冻结
+                        changed, still_ref = True, downsample_frame(bgr)
+                    if not changed:
+                        if not in_still:
+                            still_hits += 1
+                            if still_hits >= still_frames:
+                                in_still = True
+                                log.info("画面静止，暂停发送（%d fps 探测）", int(1 / still_probe_interval))
+                                with runtime.stats_lock:
+                                    runtime.stats["still"] = True
+                        # 静止：跳过帧写入与统计，按探测间隔等待后继续探测
+                        time.sleep(still_probe_interval)
+                        continue
+                    if in_still:
+                        in_still = False
+                        still_hits = 0
+                        log.info("画面变化，恢复发送")
+                        with runtime.stats_lock:
+                            runtime.stats["still"] = False
                 now = time.perf_counter()
                 with runtime.slot_lock:
                     runtime.slot["raw"] = bgr
