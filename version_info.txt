@@ -1,0 +1,32 @@
+# UTF-8
+#
+# PyInstaller --version-file 版本信息文件（中文简体，Unicode 编码）
+# 供 fps-host.exe / fps-viewer.exe 使用
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 2, 0, 0),
+    prodvers=(1, 2, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'080404b0',
+          [StringStruct(u'CompanyName', u'SakuraVision'),
+           StringStruct(u'FileDescription', u'队友视野 - FPS 队友实时画面传输程序'),
+           StringStruct(u'FileVersion', u'1.2.0'),
+           StringStruct(u'InternalName', u'SakuraVision'),
+           StringStruct(u'LegalCopyright', u'Copyright (c) 2026 SakuraVision Team'),
+           StringStruct(u'OriginalFilename', u'SakuraVision.exe'),
+           StringStruct(u'ProductName', u'队友视野 SakuraVision'),
+           StringStruct(u'ProductVersion', u'1.2.0')])
+      ]),
+    VarFileInfo([VarStruct(u'Translation', [2052, 1200])])
+  ]
+)

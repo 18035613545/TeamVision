@@ -1,0 +1,9 @@
+mss>=9.0.1
+opencv-python>=4.8.1
+numpy>=1.24.0
+pillow>=10.0.0
+pywin32>=306
+# H.264 视频编码（host.codec.encoder!="jpeg"）：NVENC 硬件/x264 软件，带宽比 JPEG 降 5-20 倍
+av>=12.0.0
+# 可选：DXGI 硬件采集后端（host.capture.backend="dxgi"），游戏独占全屏场景建议安装
+dxcam>=0.0.5

@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.conda-pkgs/
+
+# ---- IDE / 编辑器 ----
+.trae/
+.idea/
+.vscode/
+
+# ---- 构建产物（PyInstaller / Inno Setup）----
+build/
+dist/
+
+# ---- 运行期生成 / 可能含凭据 ----
+logs/
+config.json
+accounts.json
+frpc.exe
+
+# ---- 第三方依赖本地副本（可由 requirements.txt 重建）----
+vendor/
+
+# ---- 临时脚本 ----
+_tmp_*.py
