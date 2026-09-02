@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """观看组模式（MultiView v1）单元测试：订阅路由 / 关键帧门控 / roster / 模块抽取。"""
+import json
 import socket
+import time
 import unittest
 
 from common import MSG_CTRL, parse_message
@@ -122,3 +124,83 @@ class TestRouteFrame(unittest.TestCase):
         loc.need_key = True  # 切换源重新门控
         self._route({"a": loc}, "peer:1", b"P", is_key=False)
         self.assertEqual(loc.captured, [b"K"])
+
+
+def _read_ctrl(sock, timeout=1.0):
+    """从 socket 读一条 MSG_CTRL 消息并解析为 dict（仅用于已连接的 socketpair）。"""
+    import select
+    import common
+    buf = b""
+    end = time.time() + timeout
+    while time.time() < end:
+        r, _, _ = select.select([sock], [], [], 0.2)
+        if not r:
+            continue
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            consumed, kind, payload = common.parse_message(buf)
+            if consumed == 0:
+                break
+            buf = buf[consumed:]
+            if kind == common.MSG_CTRL:
+                return json.loads(payload.decode("utf-8"))
+    return None
+
+
+class TestRoster(unittest.TestCase):
+
+    def _runtime(self):
+        import threading
+        import host
+        rt = host.HostRuntime.__new__(host.HostRuntime)
+        rt.clients = {}
+        rt.clients_lock = threading.Lock()
+        rt._next_share_id = 0
+        rt._register_sharer = host.HostRuntime._register_sharer.__get__(rt)
+        rt._unregister_sharer = host.HostRuntime._unregister_sharer.__get__(rt)
+        rt.broadcast_roster = host.HostRuntime.broadcast_roster.__get__(rt)
+        return rt
+
+    def _client(self, rt, name="alice"):
+        import host
+        a, b = socket.socketpair()
+        info = host.ClientInfo(("10.0.0.1", 5701))
+        info.username = name
+        rt.clients[a] = info
+        return a, b, info
+
+    def test_register_broadcasts_roster_and_disconnect_clears(self):
+        rt = self._runtime()
+        a, ra, ia = self._client(rt, "alice")   # 旁观者 A
+        b, rb, ib = self._client(rt, "bob")     # 共享者 B
+        try:
+            sid = rt._register_sharer(b, ib)
+            self.assertEqual(sid, "peer:1")
+            self.assertEqual(ib.share_id, "peer:1")
+            msg_a = _read_ctrl(ra)
+            msg_b = _read_ctrl(rb)
+            self.assertEqual(msg_a["action"], "peers")
+            self.assertEqual(msg_a["peers"], [{"id": "peer:1", "name": "bob", "addr": "10.0.0.1:5701"}])
+            self.assertEqual(msg_b["action"], "peers")
+            # 注销后 roster 清空
+            rt._unregister_sharer(ib)
+            self.assertIsNone(ib.share_id)
+            msg_a2 = _read_ctrl(ra)
+            self.assertEqual(msg_a2["peers"], [])
+        finally:
+            a.close(); b.close()
+
+    def test_register_id_unique_and_not_reused(self):
+        rt = self._runtime()
+        a, ra, ia = self._client(rt)
+        b, rb, ib = self._client(rt)
+        try:
+            self.assertEqual(rt._register_sharer(a, ia), "peer:1")
+            rt._unregister_sharer(ia)
+            self.assertEqual(rt._register_sharer(b, ib), "peer:2")  # 不复用 1
+            _read_ctrl(rb)  # 排空 b 侧 roster
+        finally:
+            a.close(); b.close()

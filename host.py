@@ -258,6 +258,8 @@ def _drop_client(runtime, sock, info, reason="断开"):
         remaining = len(runtime.clients)
     if removed is None:
         return False
+    if getattr(removed, "share_id", None) is not None:
+        runtime._unregister_sharer(removed)
     stop_sender = getattr(removed, "stop_sender", None)
     if callable(stop_sender):
         stop_sender()
@@ -479,6 +481,7 @@ class HostRuntime:
         self.stats_lock = threading.Lock()
         self.accounts = AccountManager()
         self.frp = FrpManager(cfg)
+        self._next_share_id = 0  # 共享成员序号（连接递增分配，断开不复用）
         self._server = None
         self._server_thread = None
 
@@ -506,6 +509,42 @@ class HostRuntime:
         self.frp.stop()
         if self._server_thread is not None:
             self._server_thread.join(timeout=3)
+
+    def _register_sharer(self, sock, info):
+        """登记共享成员（首个上行帧时调用）：分配 peer:<n> 并广播 roster。"""
+        with self.clients_lock:
+            if info.share_id is not None:
+                return info.share_id
+            self._next_share_id += 1
+            info.share_id = "peer:%d" % self._next_share_id
+        self.broadcast_roster()
+        log.info("共享成员 %s 上线：%s（%s）", info.addr, info.share_id,
+                 info.username or "-")
+        return info.share_id
+
+    def _unregister_sharer(self, info):
+        """注销共享成员（连接断开时调用）并广播 roster；返回是否真的有注销。"""
+        with self.clients_lock:
+            if info.share_id is None:
+                return False
+            info.share_id = None
+        self.broadcast_roster()
+        return True
+
+    def broadcast_roster(self):
+        """向所有存活客户端推送一次 peers 名单（id/name/addr）。"""
+        with self.clients_lock:
+            snapshot = list(self.clients.items())
+            rows = [{"id": c.share_id,
+                     "name": (c.username or "").strip() or c.addr,
+                     "addr": c.addr}
+                    for _, c in snapshot if c.share_id]
+        msg = {"action": "peers", "peers": rows}
+        for sock, info in snapshot:
+            try:
+                info.send_ctrl(sock, msg)
+            except OSError:
+                log.debug("向 %s 推送 roster 失败（连接可能已断）", info.addr)
 
     def update_capture(self, monitor=None, region=None, backend=None):
         """更新采集源配置并即时生效（写配置 + 写共享槽，采集线程每帧读取）。"""
@@ -724,6 +763,8 @@ def handle_client(sock, addr, runtime):
             info = runtime.clients.pop(sock, None)
             remaining = len(runtime.clients)
         if info is not None:
+            if info.share_id is not None:
+                runtime._unregister_sharer(info)
             info.stop_sender()
         try:
             sock.close()
