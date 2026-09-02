@@ -12,6 +12,9 @@
                  codec 0x01 = H.264 / 0x02 = HEVC；flags bit0 = 关键帧（含 SPS/PPS/IDR，解码起点）
 kind 标记让接收端无需猜测即可区分帧与控制消息（ping/pong 等），并支持
 “只解码缓冲区里最新一帧”的低延迟接收策略。
+
+观看组（v2.1，MultiView）：新增 CTRL action cap_probe/cap/watch/peers——
+上行帧视为共享声明，下行帧按 watch 源订阅路由；全部向后兼容（未知 action 忽略）。
 """
 
 import copy
@@ -42,7 +45,7 @@ VIDEO_FLAG_KEY = 0x01
 
 #: 品牌与应用信息
 APP_NAME = "队友视野"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_COPYRIGHT = "Copyright © 2026 SakuraVision Team"
 
 #: 配置读写全局锁（防止多线程同时 save_config 导致丢失更新）
