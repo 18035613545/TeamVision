@@ -117,16 +117,57 @@ class AccountManager:
         return True, "登录成功"
 
 
-def encode_bgr(bgr, scale, quality):
+#: 静止检测抽稀步长（2K 下约 183x103 采样点，开销 <1ms）
+STILL_STEP = 14
+
+
+def downsample_frame(bgr, step=STILL_STEP):
+    """把 BGR 帧抽稀为小参考图（拷贝，避免长期持有全帧内存）。"""
+    if bgr is None:
+        return None
+    return bgr[::step, ::step].copy()
+
+
+def motion_changed(ref, cur, point_thr=10, ratio_thr=0.005):
+    """判定两帧抽稀图之间是否有“有效变化”，返回 (changed, 最新参考小图)。
+
+    变点：采样点三通道平均绝对差 > point_thr；变点占比 > ratio_thr 判定有变化。
+    参考图仅在判定有变化（或形状不匹配）时更新：缓慢渐变会因累计帧差自动触发，
+    无需定期刷新。异常按“有变化”处理（错误取向=宁可多发一帧，不可画面冻结）。
+    """
+    if ref is None or cur is None or ref.shape != cur.shape:
+        return True, cur
+    diff = cv2.absdiff(cur, ref)
+    pts = int(np.count_nonzero(diff > point_thr))
+    total = max(1, diff.size)
+    if pts / total > ratio_thr:
+        return True, cur
+    return False, ref
+
+
+def calc_output_size(src_w, src_h, scale, target_width=0):
+    """计算实际编码输出尺寸：先按 scale 缩放，再受 target_width 上限压制。
+
+    target_width<=0 不压制；宽高向下对齐到偶数（H.264/HEVC 要求）。"""
+    w = max(2, int(round(src_w * scale)))
+    h = max(2, int(round(src_h * scale)))
+    if target_width and target_width > 0 and w > target_width:
+        w = int(target_width)
+        h = max(2, int(round(src_h * w / src_w)))
+    return w - (w % 2), h - (h % 2)
+
+
+def encode_bgr(bgr, scale, quality, target_width=0):
     """把一帧 BGR 图像按缩放比例编码为 JPEG 字节，返回 (jpeg_bytes, encode_ms)。
 
     参数由调用方传入动态值（自适应可能修改 scale/quality）；
+    target_width>0 时输出宽度受其上限压制（分辨率档位）；
     encode_ms 为本次缩放+编码耗时（毫秒，用 time.perf_counter 测量）。
     """
     start = time.perf_counter()
-    if scale != 1.0:
-        width = max(1, int(bgr.shape[1] * scale))
-        height = max(1, int(bgr.shape[0] * scale))
+    width, height = calc_output_size(
+        bgr.shape[1], bgr.shape[0], scale, target_width)
+    if (width, height) != (bgr.shape[1], bgr.shape[0]):
         bgr = cv2.resize(bgr, (width, height), interpolation=cv2.INTER_AREA)
     ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
