@@ -1,14 +1,41 @@
 # -*- coding: utf-8 -*-
 """观看组模式（MultiView v1）单元测试：订阅路由 / 关键帧门控 / roster / 模块抽取。"""
 import json
+import select
 import socket
+import threading
 import time
 import unittest
 
-from common import MSG_CTRL, parse_message
+import numpy as np
+
+from common import MSG_CTRL, MSG_FRAME, parse_message
 
 import screen
 import host
+import share as share_mod
+
+
+def recv_frames(sock, timeout):
+    """收一段时间内到达的消息，返回 [(kind, payload)]（收集满整个窗口）。"""
+    out = []
+    buf = b""
+    end = time.time() + timeout
+    while time.time() < end:
+        r, _, _ = select.select([sock], [], [], 0.2)
+        if not r:
+            continue
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            consumed, kind, payload = parse_message(buf)
+            if consumed == 0:
+                break
+            buf = buf[consumed:]
+            out.append((kind, payload))
+    return out
 
 
 class TestScreenExtraction(unittest.TestCase):
@@ -202,5 +229,118 @@ class TestRoster(unittest.TestCase):
             rt._unregister_sharer(ia)
             self.assertEqual(rt._register_sharer(b, ib), "peer:2")  # 不复用 1
             _read_ctrl(rb)  # 排空 b 侧 roster
+        finally:
+            a.close(); b.close()
+
+
+class _FakeCapture(object):
+    """可编程伪采集器：按帧序返回静止或运动帧。"""
+
+    def __init__(self):
+        self._h = 0
+        self.closed = False
+
+    def feed(self, frames):
+        self._frames = list(frames)
+
+    def grab(self):
+        if not self._frames:
+            return None
+        self._h += 1
+        return self._frames.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def _motion_frames(n=12, w=160, h=90):
+    out = []
+    for i in range(n):
+        img = np.full((h, w, 3), (30 + i * 5) % 200, dtype=np.uint8)
+        img[::4, :, :] = (i * 7) % 255  # 大面积抽稀可见差异，保证 motion_changed 判变
+        out.append(img)
+    return out
+
+
+def _static_frame(w=160, h=90):
+    img = np.full((h, w, 3), 100, dtype=np.uint8)
+    img[::4, :, :] = 200
+    return img
+
+
+def _share_cfg(fps=10, probe_fps=10):
+    return {"host": {
+        "fps": fps,
+        "jpeg_quality": 70,
+        "capture": {"monitor": 1, "region": None, "backend": "mss"},
+        "codec": {"encoder": "jpeg", "bitrate_kbps": 500, "keyint": 30,
+                  "target_width": 0, "preset": ""},
+        "perf": {"still": {"enabled": True, "probe_fps": probe_fps,
+                           "still_frames": 2, "point_thr": 10,
+                           "ratio_thr": 0.005}},
+    }}
+
+
+class TestScreenShareSession(unittest.TestCase):
+    """JPEG 回退模式（无 PyAV 环境等价路径）：发送/静止停发/恢复/请求响应。"""
+
+    def _session(self, sock_a, sock_b, frames, still=False):
+        tx = threading.Lock()
+        cap = _FakeCapture()
+        if still:
+            cap.feed([_static_frame()] * 30)
+        else:
+            cap.feed(frames)
+        sess = share_mod.ScreenShareSession(sock_a, tx, _share_cfg(), "test", capture=cap)
+        sess.start()
+        return sess
+
+    def _collect(self, sock, timeout):
+        return recv_frames(sock, timeout)
+
+    def test_sends_frames_while_moving_then_silent_then_resume(self):
+        a, b = socket.socketpair()
+        try:
+            sess = self._session(a, b, _motion_frames(8))
+            # 运动期：应收到 ≥2 帧
+            msgs = self._collect(b, 2.0)
+            self.assertGreaterEqual(len([1 for k, _ in msgs if k == MSG_FRAME]), 2)
+            # 供完运动帧后变为静止（grab 返回 None 视为静止）：不再有新帧
+            time.sleep(1.0)
+            msgs2 = self._collect(b, 1.0)
+            self.assertEqual([1 for k, _ in msgs2 if k == MSG_FRAME], [])
+            sess.stop()
+            self.assertFalse(sess.alive)
+        finally:
+            a.close(); b.close()
+
+    def test_stop_closes_capture(self):
+        a, b = socket.socketpair()
+        try:
+            cap = _FakeCapture()
+            cap.feed(_motion_frames(2))
+            sess = share_mod.ScreenShareSession(
+                a, threading.Lock(), _share_cfg(), "test", capture=cap)
+            sess.start()
+            sess.stop()
+            self.assertFalse(sess.alive)
+            self.assertTrue(cap.closed)
+        finally:
+            a.close(); b.close()
+
+    def test_request_keyframe_while_idle_responds_once(self):
+        """JPEG 模式静止/空闲期收到 req_keyframe：重发缓存帧一次（自包含可起解）。"""
+        a, b = socket.socketpair()
+        try:
+            sess = self._session(a, b, _motion_frames(4), still=True)
+            self._collect(b, 2.0)  # 首帧（或几帧）已发，之后静止
+            sess.request_keyframe()
+            msgs = self._collect(b, 1.5)
+            n = len([1 for k, _ in msgs if k == MSG_FRAME])
+            self.assertGreaterEqual(n, 1)
+            # 之后不再自发
+            msgs2 = self._collect(b, 1.0)
+            self.assertEqual([1 for k, _ in msgs2 if k == MSG_FRAME], [])
+            sess.stop()
         finally:
             a.close(); b.close()
