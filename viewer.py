@@ -1329,15 +1329,27 @@ class ViewerApp:
                     if new_h > 165:
                         new_w, new_h = max(1, int(round(w * 165.0 / h))), 165
                     img = img.resize((new_w, new_h), Image.BILINEAR)
-                    self._panel_photo = ImageTk.PhotoImage(img)
-                    self._preview_label.configure(image=self._panel_photo, text="")
+                    photo = ImageTk.PhotoImage(img)
+                    # 先让 label 指向新图再释放旧引用：否则旧 Tk 图像在 label 仍显示时
+                    # 被删除，随后的 configure 可能报 "image ... doesn't exist"
+                    self._preview_label.configure(image=photo, text="")
+                    self._panel_photo = photo
                     self._panel_last_serial = serial
                     self._panel_last_idx = idx
         else:
-            self._panel_last_serial = -1
-            self._panel_last_idx = -1
-            self._panel_photo = None
-            self._preview_label.configure(image=None, text="暂无画面")
+            # 仅当目标频道确无可用画面（未在线/首帧未到）才清空预览；
+            # 流静止（serial 未变）但频道仍在线时保留上一帧，避免画面反复闪空
+            clear = True
+            if self.channels and 0 <= idx < len(self.channels):
+                with self.channels[idx].lock:
+                    clear = (self.channels[idx].status != "receiving"
+                             or self.channels[idx].last_frame is None)
+            if clear:
+                self._panel_last_serial = -1
+                self._panel_last_idx = -1
+                # 先让 label 脱离旧图像再释放引用（同上，避免删除仍在显示的图像）
+                self._preview_label.configure(image=None, text="暂无画面")
+                self._panel_photo = None
         # 预览小字：频道名称与状态
         if name is None:
             self._preview_info.configure(text="", fg=COL_DIM)
