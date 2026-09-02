@@ -739,28 +739,38 @@ def handle_client(sock, addr, runtime):
                      addr, username or "未登录", reason, remaining)
 
 
-def broadcast_frame(runtime, frame, send_timeout=2.0):
-    """把同一帧投递到所有存活客户端的独立发送队列。
+def route_frame(runtime, source, frame, is_key=False, is_jpeg=False, send_timeout=2.0):
+    """把一帧消息投递给 watch_source == source 的存活客户端（订阅路由）。
 
-    每个客户端只保留最新一帧：发送慢的客户端由自己的发送线程丢帧/超时淘汰，
-    不会阻塞广播线程，也不会影响其他正常观看端。`send_timeout` 保留给发送线程
-    作为单次 TCP 发送超时上限。
+    语义与旧 broadcast_frame 完全一致：_sender_active 者走 enqueue_frame（容量 1，
+    发送慢丢中间帧）；否则同步 sendall fallback（测试/旧式直连）。新增关键帧门控：
+    视频订阅者在 need_key 期间（新连接/切换源后）只收关键帧，收到后清除；
+    JPEG 帧自包含，始终放行。
     """
     if not frame:
         return
     with runtime.clients_lock:
-        snapshot = list(runtime.clients.items())
-    for sock, info in snapshot:
+        targets = []
+        for sock, info in runtime.clients.items():
+            if info.watch_source != source:
+                continue
+            if not is_jpeg and info.need_key and not is_key:
+                continue  # 等待关键帧：GOP 中间帧无法起解，丢弃
+            if not is_jpeg and is_key:
+                info.need_key = False
+            targets.append((sock, info))
+    for sock, info in targets:
         if getattr(info, "_sender_active", False):
             info.enqueue_frame(frame)
         else:
             # 兼容未启动独立发送线程的调用（测试/旧式直连）：保持原同步发送语义
-            try:
-                sock.settimeout(send_timeout)
-                sock.sendall(frame)
-                info.record_sent(len(frame))
-            except OSError:
-                _drop_client(runtime, sock, info, "发送失败")
+            with info._write_lock:
+                try:
+                    sock.settimeout(send_timeout)
+                    sock.sendall(frame)
+                    info.record_sent(len(frame))
+                except OSError:
+                    _drop_client(runtime, sock, info, "发送失败")
 
 
 def run_server(runtime):
@@ -1112,17 +1122,18 @@ def run_server(runtime):
             if video is not None and video_ts != last_sent_video_ts:
                 send_start = time.perf_counter()
                 try:
-                    broadcast_frame(
-                        runtime,
+                    route_frame(
+                        runtime, "local",
                         pack_video(video, video_ts, is_key, codec=video_codec),
-                        send_timeout=2.0)
+                        is_key=is_key, send_timeout=2.0)
                     last_sent_video_ts = video_ts  # 仅发送成功后才视为已发送
                 except Exception as e:
                     log.warning("广播错误: %s", e)
             elif jpeg is not None and ts != last_sent_jpeg_ts:
                 send_start = time.perf_counter()
                 try:
-                    broadcast_frame(runtime, pack_frame(jpeg, ts), send_timeout=2.0)
+                    route_frame(runtime, "local", pack_frame(jpeg, ts),
+                                is_jpeg=True, send_timeout=2.0)
                     last_sent_jpeg_ts = ts  # 仅发送成功后才视为已发送
                 except Exception as e:
                     log.warning("广播错误: %s", e)
