@@ -59,7 +59,7 @@ DEFAULT_CONFIG = {
     "host": {
         "listen_host": "0.0.0.0",
         "port": 5700,
-        "fps": 60,
+        "fps": 30,
         "jpeg_quality": 80,
         "scale": 1.0,
         "capture": {
@@ -76,15 +76,24 @@ DEFAULT_CONFIG = {
         "perf": {
             "adaptive": True,
             "quality_min": 40,
-            "scale_min": 0.6,
-            "fps_min": 15      # 拥塞时最低帧率（质量→缩放→帧率三级降级）
+            "scale_min": 0.25,  # 拥塞时最低缩放（质量→缩放→帧率三级降级，允许更低分辨率保连通）
+            "fps_min": 10,      # 拥塞时最低帧率
+            # 静止检测：画面无有效变化时暂停编码/发送（省流 + 降 CPU）
+            "still": {
+                "enabled": True,   # 总开关；false 后行为与旧版一致
+                "probe_fps": 5,    # 静止期探测帧率（变化恢复延迟 ≤ 1/probe_fps + 一帧）
+                "still_frames": 3, # 连续 N 帧静止才进入静止态（迟滞，防抖动误入）
+                "point_thr": 10,   # 抽稀采样点每通道平均绝对差阈值（0-255），超过视为变点
+                "ratio_thr": 0.005 # 变点占全部采样点比例阈值（0-1），超过判定有变化
+            }
         },
         "codec": {
             "encoder": "auto",       # auto|nvenc|x264|jpeg；auto=NVENC 硬件优先，x264 回退
-            "bitrate_kbps": 6000,    # H.264 目标码率基线（CBR，Kbps）
-            "keyint": 30,            # 关键帧间隔（帧数）
-            "min_bitrate_kbps": 1000,  # 码率自适应下限
-            "max_bitrate_kbps": 20000,  # 码率自适应上限
+            "bitrate_kbps": 2500,    # H.264 目标码率基线（CBR，Kbps）
+            "keyint": 60,            # 关键帧间隔（帧数）
+            "min_bitrate_kbps": 400,  # 码率自适应下限
+            "max_bitrate_kbps": 6000,  # 码率自适应上限
+            "target_width": 854,     # 传输分辨率档位（输出宽度上限，0=关闭仅按 scale）
             "preset": ""             # 空=编码器默认低延迟预设；nvenc: p1..p7，x264: veryfast 等
         },
         "frp": {
