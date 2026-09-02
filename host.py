@@ -587,6 +587,8 @@ class HostRuntime:
             "fps": host.get("fps", 60),
             "encode_ms": 0.0,
             "bitrate": 0,        # 当前视频编码码率（bps，0=JPEG 模式）
+            "out_w": 0,        # 最近一帧实际编码输出宽度（target_width 压制后）
+            "out_h": 0,        # 最近一帧实际编码输出高度
             "monitor": capture.get("monitor", 1),
             "region": capture.get("region"),
             "backend": capture.get("backend", "mss"),
@@ -601,7 +603,7 @@ class HostRuntime:
         self.stats = {"capture_fps": 0, "encode_fps": 0, "send_fps": 0,
                   "encode_ms": 0.0, "avg_send_ms": 0.0, "worst_rtt_ms": 0.0,
                   "codec_name": "", "bitrate_kbps": 0, "keyint": 0,
-                  "keyframe_total": 0, "abr_changes": 0}
+                  "keyframe_total": 0, "abr_changes": 0, "still": False}
         self.stats_lock = threading.Lock()
         self.accounts = AccountManager()
         self.frp = FrpManager(cfg)
