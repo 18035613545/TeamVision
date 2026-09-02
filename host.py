@@ -147,6 +147,13 @@ class ClientInfo:
         self.last_send_at = 0.0
         self._stop = threading.Event()
         self._sender_active = False
+        # MultiView 订阅状态：watch_source 默认 local（旧 viewer 语义不变）
+        self.watch_source = "local"  # "local" 或共享成员的 "peer:<n>"
+        self.need_key = True         # 视频订阅者是否在等关键帧（新连接/切换源后为 True）
+        self.share_id = None         # 登记为共享成员后的 "peer:<n>"；None=未共享
+        # 本连接全部 socket 写入（发送线程帧 + 各线程控制消息）共用写锁，
+        # 防止多线程 sendall 字节交错破坏帧协议（新增跨连接转发后成为必要）
+        self._write_lock = threading.Lock()
 
     def note_rx(self, now=None):
         """记录一次客户端活跃（收到了它的任何数据，用于半开连接检测）。"""
@@ -156,6 +163,11 @@ class ClientInfo:
         """记录一次应用层 ping/pong 往返时延（毫秒）。"""
         with self._lock:
             self.rtt_ms = rtt_ms
+
+    def send_ctrl(self, sock, obj):
+        """发送一条控制消息（与帧发送共用写锁，防字节交错）。"""
+        with self._write_lock:
+            send_msg(sock, obj)
 
     def enqueue_frame(self, frame):
         """把最新一帧放入该客户端的发送队列，旧帧直接丢弃，绝不阻塞广播线程。"""
@@ -226,7 +238,8 @@ def _client_sender_loop(sock, info, runtime, send_timeout=2.0):
             try:
                 sock.settimeout(send_timeout)
                 start = time.perf_counter()
-                sock.sendall(frame)
+                with info._write_lock:
+                    sock.sendall(frame)
                 info.record_sent(
                     len(frame),
                     send_ms=(time.perf_counter() - start) * 1000.0,
