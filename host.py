@@ -1077,6 +1077,8 @@ def run_server(runtime):
         - scale/fps 自适应变化自动重建编码器；编码器不可用自动回退逐帧 JPEG
         """
         last_raw_ts = -1
+        target_width = int(codec_cfg.get("target_width", 854) or 0)
+        last_frame = None   # 最近一次成功编码（缩放后）的帧：静止期强制关键帧恢复用
         # 1 秒滑动窗口：记录每次编码完成时刻，用于统计编码帧率
         enc_window = []
         error_cooldown_until = 0.0
@@ -1090,17 +1092,38 @@ def run_server(runtime):
                 quality = runtime.slot["quality"]
                 fps_now = runtime.slot.get("fps", fps)
             if raw is None or raw_ts == last_raw_ts:
-                time.sleep(0.001)  # 尚无新原始帧，短暂等待
+                # 无新帧：若画面静止且有观看端请求关键帧（新观众接入/花屏恢复），
+                # 用最近一次编码帧强制出一帧 IDR（新 pts 绕过发送端同帧去重）
+                if runtime.force_key:
+                    with runtime.slot_lock:
+                        need_key = runtime.force_key
+                        runtime.force_key = False
+                    if (need_key and encoder is not None and encoder.available
+                            and last_frame is not None):
+                        key_ts = int(time.time() * 1_000_000)
+                        res = encoder.encode(last_frame, raw_ts=key_ts, force_key=True)
+                        if res is not None:
+                            nal, is_key, encode_ms, out_ts = res
+                            with runtime.slot_lock:
+                                runtime.slot["video"] = nal
+                                runtime.slot["video_ts"] = out_ts
+                                runtime.slot["is_key"] = is_key
+                                runtime.slot["video_codec"] = encoder.codec_id
+                                runtime.slot["encode_ms"] = encode_ms
+                                runtime.slot["bitrate"] = encoder.bitrate
+                            with runtime.stats_lock:
+                                runtime.stats["encode_ms"] = encode_ms
+                            log.info("静止期响应关键帧请求（%d 字节）", len(nal))
+                time.sleep(0.001)
                 continue
-            # 有新帧即将编码：原子读取并清除强制关键帧标志。
-            # 仅在真正编码时消费，避免"无新帧"轮次误丢关键帧请求（观看端会一直等关键帧）。
+            # 有新帧即将编码：原子读取并清除强制关键帧标志（仅在真正编码时消费）
             with runtime.slot_lock:
                 force_key = runtime.force_key
                 runtime.force_key = False
             now = time.perf_counter()
             try:
-                w = max(1, int(raw.shape[1] * scale))
-                h = max(1, int(raw.shape[0] * scale))
+                # 有效输出尺寸：scale 缩放 + target_width 上限压制（分辨率档位）
+                (w, h) = calc_output_size(raw.shape[1], raw.shape[0], scale, target_width)
                 if encoder is not None and not encoder.available:
                     encoder = None  # 编码器失效（如 GPU 驱动错误）：下次重建/回退
                 if encoder is None and encoder_sel != "jpeg":
@@ -1123,7 +1146,7 @@ def run_server(runtime):
                         encoder.set_fps(fps_now)  # 帧率档变化重建
                         enc_fps_now = fps_now
                     frame = raw
-                    if scale != 1.0:
+                    if (w, h) != (raw.shape[1], raw.shape[0]):
                         frame = cv2.resize(raw, (w, h), interpolation=cv2.INTER_AREA)
                     result = encoder.encode(frame, raw_ts=raw_ts, force_key=force_key)
                     if result is None:
@@ -1131,6 +1154,7 @@ def run_server(runtime):
                         time.sleep(0.001)
                         continue
                     nal, is_key, encode_ms, out_ts = result
+                    last_frame = frame  # 缓存缩放后帧：静止期强制关键帧恢复用
                     with runtime.slot_lock:
                         runtime.slot["video"] = nal
                         runtime.slot["video_ts"] = out_ts
@@ -1138,18 +1162,24 @@ def run_server(runtime):
                         runtime.slot["video_codec"] = encoder.codec_id
                         runtime.slot["encode_ms"] = encode_ms
                         runtime.slot["bitrate"] = encoder.bitrate
+                        runtime.slot["out_w"] = w
+                        runtime.slot["out_h"] = h
                     with runtime.stats_lock:
                         runtime.stats["keyframe_total"] = encoder.keyframe_sent
                         runtime.stats["encode_ms"] = encode_ms
                     last_raw_ts = raw_ts
                 else:
                     # JPEG 回退（无可用视频编码器）
-                    jpeg, encode_ms = encode_bgr(raw, scale, quality)
+                    jpeg, encode_ms = encode_bgr(raw, scale, quality, target_width)
+                    jw, jh = calc_output_size(
+                        raw.shape[1], raw.shape[0], scale, target_width)
                     with runtime.slot_lock:
                         runtime.slot["jpeg"] = jpeg
                         runtime.slot["ts"] = raw_ts  # 帧采集时间戳原样透传
                         runtime.slot["encode_ms"] = encode_ms
                         runtime.slot["bitrate"] = 0
+                        runtime.slot["out_w"] = jw
+                        runtime.slot["out_h"] = jh
                     with runtime.stats_lock:
                         runtime.stats["encode_ms"] = encode_ms
                     last_raw_ts = raw_ts
