@@ -226,6 +226,22 @@ class TestHubMultiView(unittest.TestCase):
         finally:
             a.close()
 
+    def test_member_unshare_drops_from_roster(self):
+        """成员主动停止共享（连接保留）：roster 移除该成员（观看端据此回落 local）。"""
+        a = join_hub(self.hub.port, name="alice")
+        b = join_hub(self.hub.port, name="bob")
+        try:
+            b.sendall(pack_video(b"KEY", keyframe=True, codec=CODEC_H264))
+            recv_kinds(a, timeout=2.0)
+            recv_kinds(b, timeout=0.5)
+            send_msg(b, {"action": "unshare"})
+            msgs = recv_kinds(a, timeout=3.0)
+            peer_msgs = [m for m in ctrls(msgs) if m.get("action") == "peers"]
+            self.assertTrue(peer_msgs)
+            self.assertEqual(peer_msgs[-1]["peers"], [])
+        finally:
+            a.close(); b.close()
+
     def test_new_joiner_gets_current_roster(self):
         b = join_hub(self.hub.port, name="bob")
         try:

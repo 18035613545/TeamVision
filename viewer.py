@@ -597,6 +597,15 @@ class Channel:
             if not on:
                 self.share_enabled = False
                 self._stop_share()
+                # 通知 host 注销本成员的共享登记（连接保留）：host 广播 roster，
+                # 其他观看端据此从源列表移除本端并回落 local
+                sock = self._active_sock
+                if sock is not None:
+                    try:
+                        with self._tx_lock:
+                            send_msg(sock, {"action": "unshare"})
+                    except (OSError, ValueError):
+                        pass
                 log.info("频道[%s] 共享已关闭", self.name)
                 return True, ""
             if self.share_enabled and self._share is not None:

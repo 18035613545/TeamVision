@@ -787,6 +787,14 @@ def handle_client(sock, addr, runtime):
                         else:
                             log.debug("watch 无效源 %r（%s），保持原源 %r",
                                       src, addr, info.watch_source)
+                    elif isinstance(msg, dict) and msg.get("action") == "unshare":
+                        # 成员主动停止共享（连接保留）：注销并广播 roster，
+                        # 让订阅该 peer 的观看端回落 local（viewer peers 处理）
+                        if info.share_id is not None:
+                            old_id = info.share_id
+                            runtime._unregister_sharer(info)
+                            log.info("共享成员 %s 注销：%s（%s）", addr,
+                                     old_id, info.username or "-")
                     elif isinstance(msg, dict) and msg.get("action") == "req_keyframe":
                         if info.watch_source.startswith("peer:"):
                             member = _sharer_sock(runtime, info.watch_source)
