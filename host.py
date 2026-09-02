@@ -535,10 +535,17 @@ class HostRuntime:
         """向所有存活客户端推送一次 peers 名单（id/name/addr）。"""
         with self.clients_lock:
             snapshot = list(self.clients.items())
-            rows = [{"id": c.share_id,
-                     "name": (c.username or "").strip() or c.addr,
-                     "addr": c.addr}
-                    for _, c in snapshot if c.share_id]
+            rows = []
+            for _, c in snapshot:
+                if not c.share_id:
+                    continue
+                if isinstance(c.addr, tuple):
+                    addr_txt = "%s:%s" % (c.addr[0], c.addr[1])
+                else:
+                    addr_txt = str(c.addr)
+                rows.append({"id": c.share_id,
+                             "name": (c.username or "").strip() or addr_txt,
+                             "addr": addr_txt})
         msg = {"action": "peers", "peers": rows}
         for sock, info in snapshot:
             try:
