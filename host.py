@@ -145,6 +145,22 @@ def motion_changed(ref, cur, point_thr=10, ratio_thr=0.005):
     return False, ref
 
 
+def still_gate_update(in_still, quiet_since, changed, now, quiet_ms):
+    """静止闸门状态机：连续无变化满 quiet_ms 判定静止；任何变化帧立即复位并恢复发送。
+
+    返回 (in_still, quiet_since)。quiet_since = 最近一次变化帧之后的连续无变化起始
+    时刻（None = 上一帧有变化）。仅“连续”无变化累计：打字/低频更新等间歇内容不会
+    因零星停顿跨帧累计误入静止；时刻需与调用方同一单调时钟（time.perf_counter）。
+    """
+    if changed:
+        return False, None
+    if quiet_since is None:
+        quiet_since = now
+    elif not in_still and now - quiet_since >= quiet_ms:
+        in_still = True
+    return in_still, quiet_since
+
+
 def calc_output_size(src_w, src_h, scale, target_width=0):
     """计算实际编码输出尺寸：先按 scale 缩放，再受 target_width 上限压制。
 
@@ -919,6 +935,9 @@ def run_server(runtime):
     still_frames = max(1, int(still_cfg.get("still_frames", 3)))
     point_thr = int(still_cfg.get("point_thr", 10))
     ratio_thr = float(still_cfg.get("ratio_thr", 0.005))
+    # 连续无变化满该时长才判定静止（默认 3 次探测 × 0.2s = 0.6s，仅连续累计，
+    # 间歇内容不会因零星停顿跨帧累计误入静止）
+    still_quiet_ms = still_frames * still_probe_interval
     # H.264 视频编码配置
     codec_cfg = cfg["host"].get("codec", {})
     encoder_sel = codec_cfg.get("encoder", "auto")
@@ -977,8 +996,9 @@ def run_server(runtime):
         cap = CaptureManager(backend, monitor, region)
         consecutive_errors = 0
         still_ref = None      # 最近一次发送帧的抽稀参考图
-        still_hits = 0        # 连续静止帧计数（迟滞）
+        quiet_since = None    # 连续无变化起始时刻（perf_counter）；None=上一帧有变化
         in_still = False      # 是否处于静止停发态
+        was_still = False     # 上一帧静止态（边沿触发日志与统计）
         try:
             while not runtime.stop_event.is_set():
                 with runtime.slot_lock:
@@ -1027,23 +1047,29 @@ def run_server(runtime):
                     except Exception:
                         # 探测异常按“有变化”处理：宁可多发一帧，不可画面冻结
                         changed, still_ref = True, downsample_frame(bgr)
-                    if not changed:
-                        if not in_still:
-                            still_hits += 1
-                            if still_hits >= still_frames:
-                                in_still = True
-                                log.info("画面静止，暂停发送（%d fps 探测）", int(1 / still_probe_interval))
-                                with runtime.stats_lock:
-                                    runtime.stats["still"] = True
-                        # 静止：跳过帧写入与统计，按探测间隔等待后继续探测
-                        time.sleep(still_probe_interval)
-                        continue
-                    if in_still:
-                        in_still = False
-                        still_hits = 0
+                    in_still, quiet_since = still_gate_update(
+                        in_still, quiet_since, changed, time.perf_counter(), still_quiet_ms)
+                    if in_still and not was_still:
+                        log.info("画面静止，暂停发送（%d fps 探测）", int(1 / still_probe_interval))
+                        with runtime.stats_lock:
+                            runtime.stats["still"] = True
+                    elif was_still and not in_still:
                         log.info("画面变化，恢复发送")
                         with runtime.stats_lock:
                             runtime.stats["still"] = False
+                    was_still = in_still
+                    if not changed:
+                        if in_still:
+                            # 静止期：按探测间隔巡检，降低采集开销
+                            time.sleep(still_probe_interval)
+                        else:
+                            # 未入静止：按正常帧节奏继续巡检。不按探测间隔空等——
+                            # 间歇内容（打字/低频更新）不会因零星停顿被压到探测速率
+                            elapsed = time.perf_counter() - frame_start
+                            wait = frame_interval - elapsed
+                            if wait > 0:
+                                time.sleep(wait)
+                        continue
                 now = time.perf_counter()
                 with runtime.slot_lock:
                     runtime.slot["raw"] = bgr
@@ -1402,11 +1428,15 @@ def run_server(runtime):
                     log.warning("自适应降级: %s（发送耗时 %.0f ms%s）",
                                 level, effective_send_ms,
                                 "，丢帧" if recent_drop else "")
-            elif (not recent_drop and effective_send_ms < budget_ms * 0.5
+            elif (send_fps >= 5 and not recent_drop
+                  and effective_send_ms < budget_ms * 0.5
                   and (fps_now < base_fps or scale < base_scale
                        or (video_mode and cur_bitrate < max_bitrate)
                        or (not video_mode and quality < base_quality))):
                 # 回升：视频模式 帧率->缩放->码率；JPEG 模式 帧率->缩放->质量
+                # 活动门限 send_fps>=5：内容为稀疏/间歇变化（打字、低频 UI 更新）时
+                # 发送耗时≈0 会让回升误判链路空闲，每 1-2s 重建一次编码器（关键帧风暴）；
+                # 发送不足时冻结参数，密集内容恢复后自然回升
                 level = ""
                 if fps_now < base_fps:
                     fps_now = min(base_fps, fps_now * 2)

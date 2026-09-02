@@ -74,6 +74,58 @@ class TestMotionChanged(unittest.TestCase):
         self.assertTrue(changed)
 
 
+def _gate_step(state, changed, now, quiet_ms=0.6):
+    """推进一步静止闸门状态机（(in_still, quiet_since) + 本帧是否有变化 + 时刻）。"""
+    from host import still_gate_update
+    return still_gate_update(state[0], state[1], changed, now, quiet_ms)
+
+
+class TestStillGateUpdate(unittest.TestCase):
+    """静止闸门状态机回归：连续无变化满 quiet_ms 才入静止；任何变化帧立即复位/恢复。
+
+    quiet_ms 默认 0.6 = 原语义 still_frames(3) × 探测间隔(0.2s)，仅连续累计。
+    """
+
+    def test_change_resets_accumulation(self):
+        # 打字等间歇内容：无变化帧不得跨“变化帧”累计入静止（原缺陷：still_hits 不重置）
+        s = (False, None)
+        s = _gate_step(s, True, 0.0)     # 击键
+        s = _gate_step(s, False, 0.05)   # 短暂停顿
+        s = _gate_step(s, True, 0.3)     # 再次击键：必须复位累计
+        self.assertEqual(s, (False, None))
+        s = _gate_step(s, False, 0.5)
+        s = _gate_step(s, False, 0.8)    # 连续无变化仅 0.3s < 0.6s
+        self.assertEqual(s, (False, 0.5))
+
+    def test_true_still_enters_after_quiet_ms(self):
+        s = (False, None)
+        s = _gate_step(s, False, 0.0)
+        s = _gate_step(s, False, 0.3)
+        self.assertEqual(s, (False, 0.0))
+        s = _gate_step(s, False, 0.6)    # 满 0.6s 连续无变化 → 静止
+        self.assertTrue(s[0])
+
+    def test_recovery_on_change(self):
+        s = (True, 0.6)
+        s = _gate_step(s, True, 0.9)
+        self.assertEqual(s, (False, None))
+
+    def test_unchanged_keeps_still(self):
+        s = (True, 0.6)
+        s = _gate_step(s, False, 1.2)
+        self.assertTrue(s[0])
+
+    def test_change_between_quiet_frames_no_still(self):
+        # 变化帧夹在两个无变化帧之间不得入静止（对应 19:57 日志 ~0.55s 的“假静止”振荡）
+        s = (False, None)
+        s = _gate_step(s, False, 0.0)
+        s = _gate_step(s, True, 0.3)
+        s = _gate_step(s, False, 0.9)
+        self.assertEqual(s, (False, 0.9))
+        s = _gate_step(s, False, 1.4)    # 本次连续无变化 0.5s < 0.6s 仍不静止
+        self.assertEqual(s, (False, 0.9))
+
+
 class TestEncodeBgrTarget(unittest.TestCase):
     def test_encode_bgr_caps_size(self):
         from host import encode_bgr
