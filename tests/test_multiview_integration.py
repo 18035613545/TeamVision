@@ -61,6 +61,12 @@ class Hub:
     def close(self):
         self.runtime.shutdown()
 
+    def reset_ids(self):
+        """每个用例独立编号空间：等待上一个用例成员的注销广播落定后复位序号，
+        使各用例内部的共享成员从 peer:1 起编号（用例间成员互不残留）。"""
+        time.sleep(0.05)
+        self.runtime._next_share_id = 0
+
 
 def join_hub(port, name=""):
     """连接 hub 并完成握手 + 可选 auth（准入关闭），返回已入册 socket。"""
@@ -116,6 +122,9 @@ class TestHubMultiView(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.hub.close()
+
+    def setUp(self):
+        self.hub.reset_ids()
 
     def test_old_style_client_still_receives_local(self):
         """只发 ping 的旧式客户端：默认订阅 local，持续收到本地帧。"""

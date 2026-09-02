@@ -25,6 +25,7 @@ import queue
 import select
 import secrets
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -37,7 +38,8 @@ import codec as codec_mod
 
 from common import (
     load_config, save_config, server_handshake, pack_frame, pack_video, exe_dir, APP_NAME,
-    recv_msg, send_msg, tune_socket, parse_message, MSG_CTRL, CODEC_H264,
+    recv_msg, send_msg, tune_socket, parse_message, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
+    VIDEO_FLAG_KEY, CODEC_H264, parse_video,
 )
 
 # 采集/静止检测公共件从 screen.py 导入并保持同名（viewer 上传端复用同一实现）
@@ -540,9 +542,12 @@ class HostRuntime:
                 if not c.share_id:
                     continue
                 if isinstance(c.addr, tuple):
-                    addr_txt = "%s:%s" % (c.addr[0], c.addr[1])
+                    host, port = c.addr[0], c.addr[1]
                 else:
-                    addr_txt = str(c.addr)
+                    host, port = str(c.addr), None
+                if host.startswith("::ffff:"):
+                    host = host[7:]  # IPv4-mapped 剥前缀，显示真实 IPv4
+                addr_txt = host if port is None else "%s:%s" % (host, port)
                 rows.append({"id": c.share_id,
                              "name": (c.username or "").strip() or addr_txt,
                              "addr": addr_txt})
@@ -710,6 +715,8 @@ def handle_client(sock, addr, runtime):
         name="client-sender-%s" % addr[0],
         daemon=True,
     ).start()
+    # 新连接入册后补发一次 roster（含本连接在内广播，旧客户端忽略未知 action）
+    runtime.broadcast_roster()
     log.info("客户端接入: %s（%s，当前 %d 个客户端）", addr, username or "未登录", count)
     reason = "断开"
     try:
@@ -734,32 +741,63 @@ def handle_client(sock, addr, runtime):
                 break
             info.note_rx()
             rx_buf += data
-            # 逐条解析缓冲区内完整控制消息（客户端不会回发帧，收到帧视为协议错误）
+            # 逐条解析缓冲区内完整消息：CTRL 即时处理；上行帧（MSG_VIDEO/MSG_FRAME）
+            # 视为共享声明：首帧登记为共享成员并路由给 peer 源订阅者
             protocol_error = False
             while True:
                 consumed, kind, payload = parse_message(rx_buf)
                 if consumed == 0:
                     break
                 rx_buf = rx_buf[consumed:]
-                if kind != MSG_CTRL:
-                    reason = "协议错误（收到帧类型的客户端回发）"
-                    log.warning("客户端 %s %s", addr, reason)
-                    protocol_error = True
-                    break
-                try:
-                    msg = json.loads(payload.decode("utf-8"))
-                except ValueError:
-                    reason = "协议错误（控制消息 JSON 损坏）"
-                    protocol_error = True
-                    break
-                if isinstance(msg, dict) and msg.get("action") == "ping":
-                    # 原样回传时间戳作为测量基准，客户端按 own 时钟算 RTT
-                    send_msg(sock, {"action": "pong", "t": msg.get("t", 0)})
-                elif isinstance(msg, dict) and msg.get("action") == "req_keyframe":
-                    # 观看端请求关键帧（首连/花屏/ABR 重建后）：下一帧强制 IDR 快速恢复
-                    with runtime.slot_lock:
-                        runtime.force_key = True
-                    log.debug("客户端 %s 请求关键帧，已置位强制 IDR", addr)
+                if kind == MSG_VIDEO:
+                    if info.share_id is None:
+                        runtime._register_sharer(sock, info)
+                    try:
+                        _ts, _codec, flags, _nal = parse_video(payload)
+                    except ValueError:
+                        log.warning("客户端 %s 上行视频帧损坏，忽略", addr)
+                        continue
+                    _fwd_member_frame(runtime, info, kind, payload,
+                                      is_key=bool(flags & VIDEO_FLAG_KEY))
+                elif kind == MSG_FRAME:
+                    if info.share_id is None:
+                        runtime._register_sharer(sock, info)
+                    _fwd_member_frame(runtime, info, kind, payload, is_jpeg=True)
+                else:  # MSG_CTRL
+                    try:
+                        msg = json.loads(payload.decode("utf-8"))
+                    except ValueError:
+                        reason = "协议错误（控制消息 JSON 损坏）"
+                        protocol_error = True
+                        break
+                    if isinstance(msg, dict) and msg.get("action") == "ping":
+                        info.send_ctrl(sock, {"action": "pong", "t": msg.get("t", 0)})
+                    elif isinstance(msg, dict) and msg.get("action") == "cap_probe":
+                        info.send_ctrl(sock, {"action": "cap", "multiview": True})
+                    elif isinstance(msg, dict) and msg.get("action") == "watch":
+                        src = msg.get("source") or "local"
+                        if src == "local" or src in _live_share_ids(runtime):
+                            info.watch_source = src
+                            info.need_key = True  # 切换源：重新从关键帧开始收
+                            if src != "local":
+                                member = _sharer_sock(runtime, src)
+                                if member is not None:
+                                    runtime.clients[member].send_ctrl(
+                                        member, {"action": "req_keyframe"})
+                        else:
+                            log.debug("watch 无效源 %r（%s），保持原源 %r",
+                                      src, addr, info.watch_source)
+                    elif isinstance(msg, dict) and msg.get("action") == "req_keyframe":
+                        if info.watch_source.startswith("peer:"):
+                            member = _sharer_sock(runtime, info.watch_source)
+                            if member is not None:
+                                # 转达成员端：其共享会话强制出一帧关键帧
+                                runtime.clients[member].send_ctrl(
+                                    member, {"action": "req_keyframe"})
+                        else:
+                            with runtime.slot_lock:
+                                runtime.force_key = True  # 原逻辑：本地下一帧 IDR
+                            log.debug("客户端 %s 请求关键帧，已置位强制 IDR", addr)
             if protocol_error:
                 break  # 协议错误：立即断开，避免异常字节滞留缓冲区导致内存增长
     except Exception as e:
@@ -819,6 +857,30 @@ def route_frame(runtime, source, frame, is_key=False, is_jpeg=False, send_timeou
                     info.record_sent(len(frame))
                 except OSError:
                     _drop_client(runtime, sock, info, "发送失败")
+
+
+def _live_share_ids(runtime):
+    """当前在册共享成员 id 集合（watch 源校验用）。"""
+    with runtime.clients_lock:
+        return {c.share_id for c in runtime.clients.values() if c.share_id}
+
+
+def _sharer_sock(runtime, share_id):
+    """按共享 id 查成员连接 socket；不存在返回 None。"""
+    with runtime.clients_lock:
+        for s, c in runtime.clients.items():
+            if c.share_id == share_id:
+                return s
+    return None
+
+
+def _fwd_member_frame(runtime, sharer, kind, payload, is_key=False, is_jpeg=False):
+    """把成员上行帧原样重打包后路由给该 peer 源的订阅者。
+
+    帧 payload 格式与下行完全一致，重打包字节序列等价原消息（kind+len+payload）。
+    """
+    raw = bytes((kind,)) + struct.pack(">I", len(payload)) + payload
+    route_frame(runtime, sharer.share_id, raw, is_key=is_key, is_jpeg=is_jpeg)
 
 
 def run_server(runtime):
