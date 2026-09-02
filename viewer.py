@@ -920,6 +920,30 @@ class ViewerApp:
             ]
             save_config(self.cfg)
 
+    def _post_ui(self, fn):
+        """把回调安全调度到主线程（子线程调用，root 未就绪/已销毁时静默丢弃）。"""
+        root = self.root
+        if root is None:
+            return
+        try:
+            root.after(0, fn)
+        except Exception:
+            pass
+
+    def _on_peers_changed(self):
+        """频道 peers 更新回调（主线程）：立即刷新画面源卡片与共享按钮。"""
+        if self.running and self.panel is not None:
+            try:
+                self._panel_refresh_sources()
+            except Exception:
+                pass
+
+    def _panel_target_idx(self):
+        """面板操作目标频道：列表选中行优先，无选中时跟随活动频道。"""
+        if self._panel_selected is not None and self.channels:
+            return min(self._panel_selected, len(self.channels) - 1)
+        return self.active_idx if self.channels else None
+
     # ---------- 设置方法（供面板调用） ----------
 
     def set_display_width(self, v):
@@ -1102,6 +1126,32 @@ class ViewerApp:
                    command=self._panel_switch).pack(side="left", padx=(0, 6))
         ttk.Button(ops, text="删除", style="Panel.TButton",
                    command=self._panel_remove).pack(side="left")
+        self._share_btn = ttk.Button(ops, text="共享本机屏幕", style="Accent.TButton",
+                                     command=self._panel_toggle_share)
+        self._share_btn.pack(side="left", padx=(6, 0))
+
+        # ---------- 画面源区（卡片，MultiView） ----------
+        srccard = ttk.Frame(panel, style="Card.TFrame")
+        srccard.pack(fill="x", padx=14, pady=6)
+        ttk.Label(srccard, text="画面源（双击切换观看）",
+                  style="Section.TLabel").pack(anchor="w", padx=10, pady=(8, 2))
+        src_tree = ttk.Treeview(
+            srccard, columns=("mark", "source", "info"),
+            show="headings", style="Panel.Treeview", height=4,
+        )
+        src_tree.heading("mark", text="")
+        src_tree.heading("source", text="源")
+        src_tree.heading("info", text="说明")
+        src_tree.column("mark", width=64, minwidth=56, stretch=False, anchor="center")
+        src_tree.column("source", width=180, minwidth=140, stretch=True)
+        src_tree.column("info", width=170, minwidth=120, stretch=True)
+        src_tree.tag_configure("src_watching", foreground=COL_ONLINE)
+        src_tree.pack(fill="x", padx=10, pady=(0, 10))
+        src_tree.bind("<<TreeviewSelect>>", self._panel_on_src_select)
+        src_tree.bind("<Double-1>", self._panel_on_src_double)
+        self._src_tree = src_tree
+        self._src_rows = []  # iid -> source id（"local"/"peer:<n>"）对应表
+        self._src_selected = None  # 源行选中（iid）
 
         # ---------- 预览区（卡片） ----------
         pcard = ttk.Frame(panel, style="Card.TFrame")
@@ -1241,6 +1291,8 @@ class ViewerApp:
             tree.selection_set(str(self._panel_selected))
             tree.focus(str(self._panel_selected))
         self._panel_suppress_select = False
+        self._sync_share_button()
+        self._panel_refresh_sources()
         try:
             self.panel.after(500, self._panel_refresh_list)
         except Exception:
@@ -1307,6 +1359,11 @@ class ViewerApp:
         sel = self._tree.selection()
         if sel:
             self._panel_selected = int(sel[0])
+            # 选中目标频道变化后同步源卡片高亮
+            try:
+                self._panel_refresh_sources()
+            except Exception:
+                pass
 
     def _panel_on_double(self, event):
         """双击行：切换到该频道。"""
@@ -1352,6 +1409,131 @@ class ViewerApp:
         self._panel_selected = self.active_idx
         self._panel_known_count = len(self.channels)
         self._panel_set_status("已删除频道：%s" % name)
+
+    # ---------- 面板：画面源列表与共享开关 ----------
+
+    def _target_channel(self):
+        """返回操作目标频道（选中优先，无选中跟随活动频道）。"""
+        idx = self._panel_target_idx()
+        if idx is None or not self.channels or not (0 <= idx < len(self.channels)):
+            return None
+        return self.channels[idx]
+
+    def _sync_share_button(self):
+        """按目标频道的 share_enabled 刷新共享按钮文本/样式。"""
+        if self._share_btn is None or not self.channels:
+            return
+        ch = self._target_channel()
+        on = bool(ch is not None and ch.share_enabled)
+        self._share_btn.configure(
+            text="停止共享" if on else "共享本机屏幕",
+            style="Panel.TButton" if on else "Accent.TButton")
+
+    def _panel_refresh_sources(self):
+        """重建"画面源"卡片行：目标频道的 local + peers，活动频道行加观看标记。"""
+        if self._src_tree is None:
+            return
+        ch = self._target_channel()
+        tree = self._src_tree
+        # 记住选中行对应源 id，重建后恢复（源 id 是 switch_source 的输入）
+        keep = None
+        if self._src_selected is not None and self._src_rows:
+            try:
+                row_idx = int(self._src_selected)
+                if 0 <= row_idx < len(self._src_rows):
+                    keep = self._src_rows[row_idx]
+            except (ValueError, TypeError):
+                keep = None
+        self._src_rows = []
+        rows = []
+        if ch is not None:
+            with ch.lock:
+                peers = list(ch.peers)
+                watching = ch.watch_source
+            active = (0 <= self.active_idx < len(self.channels)
+                      and self.channels[self.active_idx] is ch)
+            # local 行
+            rows.append(("▶ 观看中" if (active and watching == "local") else "",
+                         "本地画面（%s）" % ch.name, "本机共享", "local"))
+            # 队友行
+            for p in peers:
+                sid = p.get("id")
+                rows.append(("▶ 观看中" if (active and watching == sid) else "",
+                             "队友 · %s" % (p.get("name") or sid),
+                             p.get("addr") or "", sid))
+        tree.delete(*tree.get_children())
+        for i, (mark, source, info, sid) in enumerate(rows):
+            tags = ("src_watching",) if mark else ()
+            tree.insert("", "end", iid=str(i),
+                        values=(mark, source, info), tags=tags)
+            self._src_rows.append(sid)
+        if keep is not None and keep in self._src_rows:
+            try:
+                tree.selection_set(str(self._src_rows.index(keep)))
+            except Exception:
+                pass
+
+    def _panel_on_src_select(self, event=None):
+        """单击源行：仅选中（操作目标），不切换观看。"""
+        sel = self._src_tree.selection()
+        self._src_selected = sel[0] if sel else None
+
+    def _panel_on_src_double(self, event):
+        """双击源行：先切活动频道（若目标非活动）再 switch_source。"""
+        item = self._src_tree.identify_row(event.y)
+        if not item or not self.channels:
+            return
+        try:
+            row_idx = int(item)
+            source = self._src_rows[row_idx]
+        except (ValueError, IndexError):
+            return
+        ch = self._target_channel()
+        if ch is None:
+            self._panel_set_status("无可用频道", error=True)
+            return
+        # 目标频道若未在看则先切为活动频道（源切换作用于活动频道）
+        if self.channels[self.active_idx] is not ch:
+            try:
+                idx = self.channels.index(ch)
+            except ValueError:
+                return
+            self.switch_channel(idx)
+            self._panel_selected = idx
+        if not ch.switch_source(source):
+            self._panel_set_status("切换源失败（源不可用或未连接）", error=True)
+            return
+        self._panel_set_status("已观看：%s" % self._describe_source(ch, source))
+        try:
+            self._panel_refresh_sources()
+        except Exception:
+            pass
+
+    def _describe_source(self, ch, source):
+        """把源 id 转展示文本（供状态栏/悬浮窗）。"""
+        if source == "local":
+            return "本地画面（%s）" % ch.name
+        with ch.lock:
+            for p in ch.peers:
+                if p.get("id") == source:
+                    return "队友 · %s" % (p.get("name") or source)
+        return source
+
+    def _panel_toggle_share(self):
+        """共享按钮：开关当前目标频道的屏幕共享。"""
+        ch = self._target_channel()
+        if ch is None:
+            self._panel_set_status("无可用频道", error=True)
+            return
+        on = not ch.share_enabled
+        ok, err = ch.set_share(on)
+        if not ok:
+            self._panel_set_status(err, error=True)
+            self._sync_share_button()
+            return
+        self._panel_set_status(
+            "已开启共享：%s" % ch.name if on else "已停止共享：%s" % ch.name)
+        self._sync_share_button()
 
     # ---------- 面板：底部状态标签 ----------
 
@@ -1798,7 +1980,7 @@ class ViewerApp:
             self._show_text("连接中…")
 
     def _update_status_overlay(self):
-        """刷新悬浮窗状态叠加：活动频道帧率与端到端延迟（无数据显示 "-"）。"""
+        """刷新悬浮窗状态叠加：帧率/延迟，MultiView 下追加观看源名。"""
         if self.status_overlay is None:
             return
         text = "-"
@@ -1808,6 +1990,10 @@ class ViewerApp:
             lat = ch.effective_latency_ms()
             lat_txt = "%dms" % round(lat) if lat > 0 else "-"
             text = "%s · %s" % (fps_txt, lat_txt)
+            with ch.lock:
+                src = ch.watch_source
+            if src != "local":
+                text += " · 源:%s" % self._describe_source(ch, src)
         self.status_overlay.configure(text=text)
 
     def _show_frame(self, frame_bgr, serial=None):
