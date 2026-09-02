@@ -74,5 +74,13 @@ class TestMotionChanged(unittest.TestCase):
         self.assertTrue(changed)
 
 
+class TestEncodeBgrTarget(unittest.TestCase):
+    def test_encode_bgr_caps_size(self):
+        from host import encode_bgr
+        frame = _img(2560, 1440)
+        jpeg, _ = encode_bgr(frame, 1.0, 80, target_width=854)
+        self.assertGreater(len(jpeg), 100)  # 有效 JPEG 输出
+
+
 if __name__ == "__main__":
     unittest.main()
