@@ -32,6 +32,7 @@ from PIL import Image, ImageTk
 import logger
 import splash
 import codec as codec_mod
+import share as share_mod
 from common import (
     APP_NAME,
     APP_VERSION,
@@ -199,6 +200,15 @@ class Channel:
         self.last_frame = None  # BGR numpy 数组或 None，受 self.lock 保护
         self.frame_serial = 0  # 每收到一帧递增，供主界面判断是否需要重绘
         self.lock = threading.Lock()
+        # ---- MultiView 观看组状态 ----
+        self._tx_lock = threading.Lock()      # 本连接所有发送共用（ping/控制/上传帧）
+        self._share_lock = threading.RLock()  # 共享会话启停串行化
+        self.multiview = False                # 对方支持观看组（cap/peers 确认）
+        self._cap_event = threading.Event()   # cap/peers 到达置位（set_share 等待）
+        self.peers = []                       # [{id,name,addr}]，随 self.lock 读写
+        self.watch_source = "local"           # 当前观看源（"local"/"peer:<n>"）
+        self.share_enabled = False            # 用户共享开关（不持久化，每次启动默认关）
+        self._share = None                    # ScreenShareSession 或 None
         self._running = True
         self._active_sock = None  # 当前活动 socket（控制心跳线程与接收线程共享；断线即清空）
         self._fps_times = []  # 1 秒滑动窗口内各帧的时间戳
@@ -258,11 +268,22 @@ class Channel:
                 self._got_key = False
                 # 重连后重建解码器：丢弃旧连接的参考帧，避免新流 P 帧对着旧参考解码出脏画面
                 self._decoder = codec_mod.VideoDecoder(codec=self.cur_codec)
-                # 首连立即请求关键帧：视频流须从关键帧开始解码（避免花屏等待 GOP）
+                # MultiView：重置能力状态并发 cap_probe；host 侧新连接默认 local，
+                # 若上次在观看 peer 源则重新订阅；成功后按需自动重启共享
+                self.multiview = False
+                self._cap_event.clear()
                 try:
-                    send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
+                    with self._tx_lock:
+                        send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
+                        send_msg(sock, {"action": "cap_probe"})
+                        if self.watch_source != "local":
+                            send_msg(sock, {"action": "watch",
+                                            "source": self.watch_source})
                 except (OSError, ValueError):
                     pass
+                threading.Timer(2.0, self._share_sync_after_connect,
+                                args=(sock,)).start()
+                self._notify_owner_peers()
                 rx_buf = b""
                 last_rx = time.monotonic()
                 while self._running:
@@ -338,6 +359,8 @@ class Channel:
                 if self.status != "auth":
                     self.status = "disconnected"
                 self._active_sock = None
+                # 断线瞬间停止共享上传（复用新连接时按开关自动重启）
+                self._stop_share()
                 if sock is not None:
                     try:
                         sock.close()
@@ -365,7 +388,8 @@ class Channel:
             if self._active_sock is not sock:
                 return  # 连接已重建/断开：旧连接的心跳线程退出
             try:
-                send_msg(sock, {"action": "ping", "t": time.time_ns()})
+                with self._tx_lock:
+                    send_msg(sock, {"action": "ping", "t": time.time_ns()})
             except (OSError, ValueError):
                 return  # 连接已断，接收循环会负责重连
 
@@ -376,24 +400,45 @@ class Channel:
             return
         self._key_requested_at = now
         try:
-            send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
+            with self._tx_lock:
+                send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
         except (OSError, ValueError):
             pass
 
     def _handle_ctrl(self, payload):
-        """处理一条控制消息（目前只有 pong）；异常值直接忽略不影响画面。"""
+        """处理一条控制消息（pong/cap/peers/req_keyframe）；未知 action 忽略。"""
         try:
             msg = json.loads(payload)
         except Exception:
             return
         if not isinstance(msg, dict):
             return
-        if msg.get("action") == "pong":
+        action = msg.get("action")
+        if action == "pong":
             t = msg.get("t")
             if isinstance(t, int) and t > 0:
                 rtt_ms = (time.time_ns() - t) / 1_000_000.0
                 if 0 < rtt_ms < 60_000:  # 过滤异常值（>60s 视为脏数据）
                     self.round_trip_ms = rtt_ms
+        elif action == "cap":
+            if msg.get("multiview"):
+                self.multiview = True
+                self._cap_event.set()
+                self._maybe_resume_share()
+        elif action == "peers":
+            rows = msg.get("peers")
+            if isinstance(rows, list):
+                with self.lock:
+                    self.multiview = True
+                    self.peers = [p for p in rows
+                                  if isinstance(p, dict) and isinstance(p.get("id"), str)]
+                self._cap_event.set()
+                self._on_peers_updated()
+                self._maybe_resume_share()
+        elif action == "req_keyframe":
+            # host 转达（别的 viewer 正在观看本机共享）：请求上传器补关键帧
+            self.request_keyframe()
+        # 其余 action 忽略（旧 host 兼容已靠此：cap_probe 无响应即旧版）
 
     def effective_latency_ms(self):
         """展示用延迟：优先 RTT/2（应用层往返，跨机器时钟无关）；无 RTT 时回退 ts 差估算。"""
@@ -538,9 +583,174 @@ class Channel:
             else:
                 self.latency_ms = 0.0
 
+    # ---------- MultiView：共享开关 / 观看源切换 ----------
+
+    def request_keyframe(self):
+        """供接收线程响应 host 转达的 req_keyframe：提示上传器补关键帧。"""
+        with self._share_lock:
+            if self._share is not None:
+                self._share.request_keyframe()
+
+    def set_share(self, on):
+        """开/关本频道屏幕共享。返回 (ok, 提示)；开时校验对方能力（cap 确认）。"""
+        with self._share_lock:
+            if not on:
+                self.share_enabled = False
+                self._stop_share()
+                log.info("频道[%s] 共享已关闭", self.name)
+                return True, ""
+            if self.share_enabled and self._share is not None:
+                return True, ""
+            if not self.multiview:
+                # 能力尚未确认：cap_probe 已随连接发出，等 cap/peers（≤2s）
+                if not self._cap_event.wait(2.0):
+                    return False, "对方不支持共享上传（旧版服务端或无响应）"
+            if self.status != "receiving":
+                return False, "频道未连接，无法开启共享"
+            self.share_enabled = True
+            ok, err = self._start_share()
+            if not ok:
+                self.share_enabled = False
+            return ok, err
+
+    def switch_source(self, source):
+        """切换观看源："local" 或 peers 中的 "peer:<n>"。成功返回 True。"""
+        with self.lock:
+            valid_ids = [p.get("id") for p in self.peers]
+        if source != "local" and source not in valid_ids:
+            log.warning("频道[%s] 源 %r 不在可用列表，拒绝切换", self.name, source)
+            return False
+        with self.lock:
+            if self.watch_source == source:
+                return True
+            self.watch_source = source
+            # 重置解码参考状态：新源从关键帧开始（host 门控 + 本地 _got_key 双保险）
+            self._got_key = False
+            self.video_mode = False
+            self.cur_codec = CODEC_H264
+            self.last_frame = None
+        sock = self._active_sock
+        if sock is None:
+            return False
+        try:
+            with self._tx_lock:
+                send_msg(sock, {"action": "watch", "source": source})
+                if source == "local":
+                    # 本地源由 host 编码线程消费 force_key；看 peer 由 host 转达
+                    send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
+        except (OSError, ValueError):
+            return False
+        log.info("频道[%s] 观看源切换为 %s", self.name, source)
+        return True
+
+    def _start_share(self):
+        """创建并启动上传会话（须持 _share_lock）。返回 (ok, err)。"""
+        sock = self._active_sock
+        if sock is None:
+            return False, "频道未连接"
+        if self._share is not None:
+            try:
+                if self._share.alive:
+                    return True, ""
+                self._share.stop()  # 旧会话已死：清理后重建
+            except Exception:
+                pass
+            self._share = None
+        try:
+            cfg = self.owner.cfg if self.owner is not None else {}
+            session = share_mod.ScreenShareSession(
+                sock, self._tx_lock, cfg, self.name)
+            session.start()
+        except Exception as e:
+            log.warning("频道[%s] 共享启动失败: %s", self.name, e)
+            return False, "共享启动失败: %s" % e
+        self._share = session
+        log.info("频道[%s] 已开始共享本机屏幕", self.name)
+        return True, ""
+
+    def _stop_share(self):
+        """停止并清空共享会话（须持 _share_lock 或由本方法自取）。"""
+        with self._share_lock:
+            if self._share is not None:
+                try:
+                    self._share.stop()
+                except Exception:
+                    pass
+                self._share = None
+
+    def _maybe_resume_share(self):
+        """cap/peers 确认后：若共享开关仍开且无会话则启动（重连/新连接自动恢复）。"""
+        with self._share_lock:
+            if not self.share_enabled or self._share is not None:
+                return
+            if not self.multiview:
+                return
+            ok, err = self._start_share()
+            if not ok:
+                self.share_enabled = False
+                self._notify_share_error(err)
+
+    def _share_sync_after_connect(self, sock):
+        """连接后 2 秒能力确认兜底：cap 未达视为旧 host，自动关共享并提示一次。"""
+        if self._active_sock is not sock:
+            return  # 已重连/断开：旧定时器作废
+        with self._share_lock:
+            if not self.share_enabled:
+                return
+            if self.multiview:
+                ok, err = self._start_share()
+                if not ok:
+                    self.share_enabled = False
+                    self._notify_share_error(err)
+                return
+            self.share_enabled = False
+            log.info("频道[%s] 对方不支持共享上传，已自动关闭共享", self.name)
+        self._notify_share_error("对方不支持共享上传（旧版服务端），共享已自动关闭")
+
+    def _notify_share_error(self, text):
+        """把共享错误提示调度到主线程状态栏（Owner 在且存活时）。"""
+        name = self.name
+        owner = self.owner
+        if owner is None:
+            return
+
+        def _show():
+            try:
+                owner._panel_set_status("频道[%s] %s" % (name, text), error=True)
+            except Exception:
+                pass
+
+        owner._post_ui(_show)
+
+    def _on_peers_updated(self):
+        """peers 更新（接收线程）：观看的 peer 已离线则自动回落 local；通知 owner。"""
+        with self.lock:
+            watching = self.watch_source
+            ids = [p.get("id") for p in self.peers]
+        if watching != "local" and watching not in ids:
+            log.info("频道[%s] 观看源 %s 已离线，自动切回本地画面", self.name, watching)
+            self.switch_source("local")
+            self._notify_share_error("队友已离线，频道[%s]已切回本地画面" % self.name)
+        self._notify_owner_peers()
+
+    def _notify_owner_peers(self):
+        """通知 owner 刷新面板源列表（跨线程经 root.after）。"""
+        owner = self.owner
+        if owner is None:
+            return
+
+        def _refresh():
+            try:
+                owner._on_peers_changed()
+            except Exception:
+                pass
+
+        owner._post_ui(_refresh)
+
     def stop(self):
-        """停止接收线程（daemon 线程，无需 join）。"""
+        """停止接收线程与共享上传（daemon 线程，无需 join）。"""
         self._running = False
+        self._stop_share()
 
 
 class ViewerApp:
