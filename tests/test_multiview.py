@@ -185,6 +185,7 @@ class TestRoster(unittest.TestCase):
         rt = host.HostRuntime.__new__(host.HostRuntime)
         rt.clients = {}
         rt.clients_lock = threading.Lock()
+        rt._roster_lock = threading.Lock()  # 第 55 条：broadcast_roster 串行化锁
         rt._next_share_id = 0
         rt._register_sharer = host.HostRuntime._register_sharer.__get__(rt)
         rt._unregister_sharer = host.HostRuntime._unregister_sharer.__get__(rt)

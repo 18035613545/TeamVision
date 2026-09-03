@@ -10,6 +10,7 @@
 """
 
 import os
+import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -25,6 +26,51 @@ SPLASH_BG_TOP = (20, 20, 31)        # #14141f
 SPLASH_BG_BOTTOM = (30, 30, 46)     # #1e1e2e
 TEXT_PURPLE = (167, 139, 250)       # #a78bfa
 WHITE = (255, 255, 255, 255)
+
+#: 第 99 条：中文字体候选（按优先级）。旧实现硬编码 C:/Windows/Fonts 且只 catch
+#: OSError，缺字体时静默回退 load_default()（仅拉丁字形）→「队友视野」渲染成豆腐块，
+#: 脚本却照报「生成完成」。改为动态系统字体目录 + 多候选 + 回退时告警。
+_FONT_CANDIDATES_BOLD = ("msyhbd.ttc", "msyh.ttc", "simhei.ttf", "simsun.ttc")
+_FONT_CANDIDATES_REGULAR = ("msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc")
+
+
+def _system_font_dir():
+    """系统字体目录：优先 SystemRoot/windir 环境变量，回退 C:/Windows（不再硬编码盘符）。"""
+    sys_root = (os.environ.get("SystemRoot") or os.environ.get("windir")
+                or "C:/Windows")
+    return os.path.join(sys_root, "Fonts")
+
+
+def _load_brand_font(size, bold=True):
+    """加载中文字体（粗体优先 msyhbd）；逐个候选尝试，全失败才回退默认字体并告警。
+
+    第 99 条：回退到 load_default()（仅拉丁字形）时「队友视野」会渲染成方框（豆腐块），
+    旧实现静默回退、脚本照报「生成完成」。这里在回退时向 stderr 打印明确告警，提示中文
+    可能渲染为方框、需安装中文字体后重新生成，避免静默产出坏资源。
+    """
+    font_dir = _system_font_dir()
+    candidates = _FONT_CANDIDATES_BOLD if bold else _FONT_CANDIDATES_REGULAR
+    for name in candidates:
+        try:
+            return ImageFont.truetype(os.path.join(font_dir, name), size)
+        except OSError:
+            continue
+    print("警告：在 %s 未找到任何中文字体（尝试过 %s），回退 Pillow 默认字体——"
+          "splash.png 中的「队友视野」等中文会渲染为方框（豆腐块）。"
+          "请安装微软雅黑/中文字体后重新运行本脚本。"
+          % (font_dir, "、".join(candidates)), file=sys.stderr)
+    return ImageFont.load_default()
+
+
+def _note_overwrite(path):
+    """第 99 条：覆盖已存在的（git 跟踪）资源前打印提示，避免静默 clobber。
+
+    不加 --force/脏检查/备份：资源由本脚本确定性生成且已纳入 git，git diff 即脏检查、
+    git checkout 即还原/备份；这里只补足「非静默」，不阻断既定的再生成工作流。
+    """
+    if os.path.exists(path):
+        print("注意：将覆盖已存在的资源 %s（git 跟踪；git diff 查看变化、"
+              "git checkout -- %s 可还原）" % (path, path), file=sys.stderr)
 
 
 def _diag_gradient(size, top_color, bottom_color):
@@ -89,6 +135,7 @@ def gen_icon():
     sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
     images = [_make_icon(w) for w, _ in sizes]
     path = os.path.join(ASSETS_DIR, "app.ico")
+    _note_overwrite(path)  # 第 99 条：覆盖 git 跟踪资源前提示，不静默 clobber
     # 主图为最大尺寸（256），其余尺寸放入 append_images，由 sizes 指定全部尺寸
     images[-1].save(path, format="ICO", sizes=sizes, append_images=images[:-1])
     return path
@@ -103,14 +150,6 @@ def gen_splash():
     # 居中品牌图形（与图标同风格）
     _draw_scope(draw, w / 2, 92, radius=52, width=6)
 
-    def _font(size, bold=True):
-        """加载微软雅黑（粗体）字体，失败时回退默认字体。"""
-        try:
-            name = "msyhbd.ttc" if bold else "msyh.ttc"
-            return ImageFont.truetype(os.path.join("C:/Windows/Fonts", name), size)
-        except OSError:
-            return ImageFont.load_default()
-
     def _center_text(y, text, font, fill):
         """在 y 处水平居中绘制文本。"""
         bbox = draw.textbbox((0, 0), text, font=font)
@@ -119,11 +158,13 @@ def gen_splash():
         draw.text((x, y), text, font=font, fill=fill)
 
     # 主标题：队友视野（白色，约 48px 粗体）
-    _center_text(170, "队友视野", _font(48), WHITE)
+    _center_text(170, "队友视野", _load_brand_font(48), WHITE)
     # 副标题：SakuraVision v{版本}（浅紫，约 20px，版本取自 common.APP_VERSION）
-    _center_text(235, "SakuraVision v%s" % common.APP_VERSION, _font(20, bold=False), TEXT_PURPLE)
+    _center_text(235, "SakuraVision v%s" % common.APP_VERSION,
+                 _load_brand_font(20, bold=False), TEXT_PURPLE)
 
     path = os.path.join(ASSETS_DIR, "splash.png")
+    _note_overwrite(path)  # 第 99 条：覆盖 git 跟踪资源前提示，不静默 clobber
     img.save(path, format="PNG")
     return path
 

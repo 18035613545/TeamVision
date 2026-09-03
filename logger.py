@@ -12,6 +12,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import tempfile
 import time
 
 from common import exe_dir
@@ -51,29 +52,34 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         self._log_dir = log_dir
         self._today = time.strftime("%Y%m%d")
         super().__init__(
-            os.path.join(log_dir, "app_%s.log" % self._today),
+            self._filename(self._today),
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding="utf-8",
         )
         self._prune_old()
 
-    def _prune_old(self):
-        """清理超出保留天数的历史日志文件（含大小滚动备份 .1/.2 等）。
+    def _filename(self, date):
+        # 第 14 条：文件名含 PID，host 与 viewer 各写各的，避免争用同一文件
+        # 导致 Windows 下滚动改名失败（WinError 32）后 stream=None 永不重开。
+        return os.path.join(self._log_dir, "app_%s_pid%d.log" % (date, os.getpid()))
 
-        按日期分组（app_YYYYMMDD.log 及其备份 app_YYYYMMDD.log.N 属于同一组），
-        只保留最新的 KEEP_DAYS 组，其余整组删除——避免旧日期的备份文件长期累积。
+    def _prune_old(self):
+        """清理超出保留天数的历史日志文件（含大小滚动备份 .1/.2 与各 PID 文件）。
+
+        按日期分组（app_YYYYMMDD_pid*.log 及其备份属于同一日期组），只保留最新的
+        KEEP_DAYS 天，其余整组删除——避免旧日期文件长期累积。兼容旧的无 PID 命名。
         """
         try:
             files = [f for f in os.listdir(self._log_dir)
                      if f.startswith("app_") and ".log" in f]
-            groups = {}  # app_YYYYMMDD -> [文件名列表]
+            groups = {}  # YYYYMMDD -> [文件名列表]
             for name in files:
-                key = name.split(".log", 1)[0]
-                groups.setdefault(key, []).append(name)
+                date = name[4:12]  # app_ 之后的 8 位日期
+                groups.setdefault(date, []).append(name)
             keep_keys = set(sorted(groups)[-_KEEP_DAYS:])
-            for key, names in groups.items():
-                if key in keep_keys:
+            for date, names in groups.items():
+                if date in keep_keys:
                     continue
                 for name in names:
                     try:
@@ -92,7 +98,7 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
                 self.close()
             except Exception:
                 pass
-            self.baseFilename = os.path.join(self._log_dir, "app_%s.log" % today)
+            self.baseFilename = self._filename(today)
             try:
                 self.stream = self._open()
             except Exception:
@@ -137,6 +143,32 @@ def _resolve_level(level_name):
     return _LEVEL_MAP.get(level_name.strip().lower(), logging.INFO)
 
 
+def _writable_log_dir():
+    """返回一个可写的日志目录（第 13 条）。
+
+    安装到 Program Files 后非管理员运行时 exe_dir()/logs 不可写，原代码在 import 期
+    os.makedirs 直接抛 PermissionError，窗口都不出现。这里依次尝试：
+    exe_dir()/logs → %LOCALAPPDATA%/SakuraVision/logs → 临时目录/SakuraVision-logs，
+    对每个候选实际写一个探测文件验证可写，返回第一个可用目录；全不可写返回 None。
+    """
+    candidates = [os.path.join(exe_dir(), "logs")]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(os.path.join(local, "SakuraVision", "logs"))
+    candidates.append(os.path.join(tempfile.gettempdir(), "SakuraVision-logs"))
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".wprobe_%d" % os.getpid())
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("x")
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return None
+
+
 def setup_logger(cfg=None):
     """幂等初始化全局日志并返回名为 "sakura" 的 Logger。
 
@@ -162,16 +194,19 @@ def setup_logger(cfg=None):
         logger.setLevel(level)
         logger.propagate = False
 
-        # 日志目录：与程序资源同目录下的 logs，不存在则创建
-        log_dir = os.path.join(exe_dir(), "logs")
-        os.makedirs(log_dir, exist_ok=True)
-
-        # 文件 handler：按日期命名 + 5MB 大小滚动（跨午夜自动切新日期文件）
-        file_handler = _DateRotatingFileHandler(log_dir)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        )
-        logger.addHandler(file_handler)
+        # 日志目录：探测可写位置（exe_dir/logs 不可写时回退用户本地/临时目录，第 13 条）
+        log_dir = _writable_log_dir()
+        if log_dir is not None:
+            # 文件 handler：按日期+PID 命名 + 5MB 大小滚动（跨午夜自动切新日期文件）
+            try:
+                file_handler = _DateRotatingFileHandler(log_dir)
+                file_handler.setFormatter(
+                    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+                )
+                logger.addHandler(file_handler)
+            except Exception:
+                # 文件日志不可用（权限/占用）：降级为仅控制台，绝不让 import 期崩溃
+                pass
 
         # 控制台 handler：windowed 打包（sys.stdout 为 None）时跳过，仅保留文件日志；
         # 从带管道的终端启动 windowed exe 时 stdout 句柄可能无效（flush 抛 OSError），一并吞掉

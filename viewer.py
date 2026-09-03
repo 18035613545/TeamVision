@@ -44,11 +44,11 @@ from common import (
     recv_msg,
     parse_addr,
     exe_dir,
+    enable_dpi_awareness,
     tune_socket,
     parse_message,
     parse_video,
     MSG_FRAME,
-    MSG_CTRL,
     MSG_VIDEO,
     VIDEO_FLAG_KEY,
     CODEC_H264,
@@ -88,7 +88,10 @@ def _handle_uncaught(exc_type, exc_value, exc_tb):
             pass
 
 
-sys.excepthook = _handle_uncaught
+# 第 79 条：sys.excepthook 的安装移到 main() 里，不在 import 时无条件执行。
+# 否则任何 import viewer 的进程（含单元测试套件）都会被全局换成这个会弹**模态**
+# messagebox 的钩子；测试期间一旦有异常逃逸到解释器顶层，整套件就卡在 GUI 对话框后面。
+# 与 host.py 的 _install_excepthooks()（同样延迟到入口调用）保持一致。
 
 #: 全局热键修饰键
 MOD_ALT = 0x0001
@@ -116,6 +119,15 @@ HOTKEY_DEFS = [
     (HOTKEY_ID_SRC_PREV, VK_UP),
     (HOTKEY_ID_SRC_NEXT, VK_DOWN),
 ]
+
+#: 热键 ID → 可读名称（注册失败时精确告警用，item 41）
+HOTKEY_NAMES = {
+    HOTKEY_ID_TOGGLE: "Ctrl+Alt+X 切换穿透",
+    HOTKEY_ID_PREV: "Ctrl+Alt+← 上一个频道",
+    HOTKEY_ID_NEXT: "Ctrl+Alt+→ 下一个频道",
+    HOTKEY_ID_SRC_PREV: "Ctrl+Alt+↑ 上一个画面源",
+    HOTKEY_ID_SRC_NEXT: "Ctrl+Alt+↓ 下一个画面源",
+}
 
 #: 控制台面板深色主题配色
 COL_BG = "#14141f"          # 窗口背景
@@ -168,6 +180,25 @@ def _dpapi_decrypt(token):
         return None
 
 
+# 第 94 条：回环地址别名，去重时折叠为同一规范主机，避免 localhost 与 127.0.0.1
+# 被判为两个不同频道（进而同一用户在第二个频道触发"用户名已存在"→重复登录死循环）。
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def _canonical_addr(addr):
+    """把地址规范化为 (host_lower, port) 用于去重比较；非法地址抛 ValueError。
+
+    第 94 条：复用 parse_addr 校验端口（非数字/越界/缺端口即抛 ValueError，由调用方在
+    面板/向导显示原因），再按规范形去重——主机名小写、缺省端口补 5700、回环别名折叠为
+    127.0.0.1。不做 DNS 解析：拼写错误等无法连通的主机名只能在连接期暴露，新增时不强校验。
+    """
+    host, port = parse_addr(addr)          # 非法端口/空地址在此抛 ValueError
+    h = (host or "").strip().lower()
+    if h in _LOOPBACK_HOSTS:
+        h = "127.0.0.1"
+    return h, port
+
+
 class Channel:
     """单个画面来源：独立接收线程 + 最新帧缓存（BGR numpy 数组）。"""
 
@@ -180,7 +211,6 @@ class Channel:
         self.auth_msg = ""
         self._prompt_blocked_until = 0.0  # 取消登录后的冷却时刻，避免频繁重连狂弹对话框
         self._password = None  # 本次会话内的明文密码缓存，用于重连自动登录
-        self._cred_result = None  # 主线程对话框结果缓存（由 ViewerApp._process_cred_requests 写入）
         self._auth_probed = False  # 已用空凭据探测过服务端是否需要登录（避免准入关闭时仍弹框）
         self._anon_ok = False  # 已确认服务端准入关闭（匿名放行），重连时直接走 probe 不再弹框
         # 网络/稳定性参数（从 viewer 配置读取，缺省用安全默认值）
@@ -197,6 +227,7 @@ class Channel:
         # H.264/H.265(HEVC) 视频解码（host 视频编码路径）；JPEG 回退仍兼容
         self._decoder = codec_mod.VideoDecoder()
         self._got_key = False          # 是否已收到关键帧（视频解码起点）
+        self._video_unavailable_warned = False  # 第 11 条：解码器不可用只告警一次
         self._key_requested_at = 0.0   # 上次请求关键帧时刻（冷却 0.5s 防刷屏）
         self.video_mode = False        # 当前是否视频编码流（展示用）
         self.cur_codec = CODEC_H264    # 当前视频流编码类型（H.264/HEVC，展示用）
@@ -218,6 +249,7 @@ class Channel:
         self._share = None                    # ScreenShareSession 或 None
         self._running = True
         self._active_sock = None  # 当前活动 socket（控制心跳线程与接收线程共享；断线即清空）
+        self._share_sync_timer = None  # 第 61 条：连接后能力确认兜底定时器（stop 时 cancel）
         self._fps_times = []  # 1 秒滑动窗口内各帧的时间戳
         self._latency_samples = []  # 最近 5 帧延迟样本（微秒），用于滑动平均平滑
         threading.Thread(
@@ -288,16 +320,37 @@ class Channel:
                                             "source": self.watch_source})
                 except (OSError, ValueError):
                     pass
-                threading.Timer(2.0, self._share_sync_after_connect,
-                                args=(sock,)).start()
+                # 第 61 条：定时器设为 daemon 并登记句柄，stop() 时 cancel。否则非守护
+                # 定时器会让解释器退出多等 2 秒，且若在 teardown 后触发会调 _start_share
+                # 在窗口销毁期间新開上传会话、向正在关闭的 socket 发送。重连先 cancel 旧定时器。
+                if self._share_sync_timer is not None:
+                    self._share_sync_timer.cancel()
+                self._share_sync_timer = threading.Timer(
+                    2.0, self._share_sync_after_connect, args=(sock,))
+                self._share_sync_timer.daemon = True
+                self._share_sync_timer.start()
                 self._notify_owner_peers()
-                rx_buf = b""
+                # 第 57 条：rx_buf 用 bytearray，+= 原地扩展（摊还 O(1)），避免攒大帧时
+                # bytes += 的整份重拷退化为 O(n²)。配套 del rx_buf[:consumed] 原地弹出，
+                # parse_message 统一返回 bytes payload，下游解码不受缓冲区类型影响。
+                rx_buf = bytearray()
                 last_rx = time.monotonic()
+                last_media_rx = last_rx  # 最近一次收到画面帧（第 2/12 条用）
                 while self._running:
                     r, _, _ = select.select([sock], [], [], 1.0)
                     if not r:
-                        # 无数据即空闲；超过阈值判定停滞（半开/被墙等场景快速退出重连）
-                        if time.monotonic() - last_rx > self._read_idle_s:
+                        now_m = time.monotonic()
+                        # 第 12 条：超过 1 秒无画面帧则衰减 fps，避免死频道锁存旧帧率
+                        if now_m - last_media_rx > 1.0:
+                            self._note_no_media()
+                        # 第 2 条：连接活着（pong 在流）但长时间收不到画面帧 → 主动请求
+                        # 关键帧，打破「need_key 门控 + 仅解码失败才请求 + pong 击败停滞
+                        # 检测」三者叠加导致的画面永久定格（状态仍显示 receiving）。
+                        if (self.status == "receiving"
+                                and now_m - last_media_rx > self._read_idle_s):
+                            self._request_keyframe(sock)
+                        # 完全无任何数据（含 pong）超过阈值：判定连接停滞，退出重连
+                        if now_m - last_rx > self._read_idle_s:
                             raise ConnectionError(
                                 "%.0f 秒未收到数据，判定连接停滞" % self._read_idle_s)
                         continue
@@ -306,59 +359,45 @@ class Channel:
                         raise ConnectionError("连接关闭")
                     last_rx = time.monotonic()
                     rx_buf += chunk
-                    # 解析缓冲区中所有完整消息；帧只保留最新一份，控制消息即时处理
-                    latest = None  # (kind, ts, data)
+                    # 解析缓冲区中所有完整消息。第 7 条：JPEG 各帧独立可解，只留最新一份；
+                    # H.264/HEVC 必须按序解码批次内全部帧以维持参考帧链（丢中间帧会花屏/
+                    # 拖影直到下一个关键帧），故视频帧收集成有序列表逐帧喂解码器。
+                    latest_jpeg = None       # (ts, jpeg_bytes)
+                    video_batch = []         # [(ts, codec, flags, nal)]，按到达顺序
                     while True:
                         consumed, kind, payload = parse_message(rx_buf)
                         if consumed == 0:
                             break
-                        rx_buf = rx_buf[consumed:]
+                        del rx_buf[:consumed]
                         if kind == MSG_VIDEO:
                             try:
                                 ts, codec, flags, nal = parse_video(payload)
                             except ValueError:
                                 continue
-                            latest = (MSG_VIDEO, ts, (codec, flags, nal))
+                            video_batch.append((ts, codec, flags, nal))
                         elif kind == MSG_FRAME:
                             if len(payload) < 8:
                                 log.warning("频道[%s] 帧 payload 过短，跳过", self.name)
                                 continue
                             (ts,) = struct.unpack(">Q", payload[:8])
-                            latest = (MSG_FRAME, ts, payload[8:])
+                            latest_jpeg = (ts, payload[8:])
                         else:  # MSG_CTRL
                             self._handle_ctrl(payload)
-                    if latest is not None:
-                        kind, ts, data = latest
-                        if kind == MSG_VIDEO:
-                            codec, flags, nal = data
-                            if codec != self.cur_codec:
-                                # 编码切换（H.264 <-> HEVC）：重建解码器并从关键帧重新开始
-                                self._decoder.set_codec(codec)
-                                self.cur_codec = codec
-                                self._got_key = False
-                                self._request_keyframe(sock)
-                            if flags & VIDEO_FLAG_KEY:
-                                self._got_key = True
-                                self.video_mode = True
-                            frames = self._decoder.decode(nal)
-                            if frames and self._got_key:
-                                # 仅在收到关键帧后显示：重连/编码切换后首个关键帧前的
-                                # P 帧可能对旧参考解码出脏画面，一律丢弃并请求关键帧
-                                self._store_frame(frames[-1], ts)
-                                self._retry_delay = 0.0
-                            else:
-                                # 缺参考帧（未收到关键帧/丢关键帧）：请求关键帧快速恢复
-                                self._request_keyframe(sock)
-                        else:  # MSG_FRAME（JPEG 回退路径）
-                            self.video_mode = False
-                            frame = cv2.imdecode(
-                                np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR
-                            )
-                            if frame is not None:
-                                self._store_frame(frame, ts)
-                                self._retry_delay = 0.0
-                            else:
-                                log.warning("频道[%s] 帧解码失败，跳过该帧", self.name)
+                    if video_batch:
+                        last_media_rx = time.monotonic()  # 收到画面帧（第 2/12 条）
+                        self._decode_video_batch(sock, video_batch)
+                    elif latest_jpeg is not None:
+                        last_media_rx = time.monotonic()  # 收到画面帧（第 2/12 条）
+                        ts, data = latest_jpeg
+                        self.video_mode = False
+                        frame = cv2.imdecode(
+                            np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR
+                        )
+                        if frame is not None:
+                            self._store_frame(frame, ts)
+                            self._retry_delay = 0.0
+                        else:
+                            log.warning("频道[%s] 帧解码失败，跳过该帧", self.name)
             except Exception as exc:
                 self._active_sock = None
                 log.warning("频道[%s] 连接断开: %s", self.name, exc)
@@ -412,6 +451,53 @@ class Channel:
         except (OSError, ValueError):
             pass
 
+    def _decode_video_batch(self, sock, batch):
+        """按到达顺序解码一批 H.264/HEVC 帧（第 7 条）。
+
+        旧路径对一个 recv 批次只解码最新一帧、丢弃中间帧——对 JPEG 无害（各帧独立），
+        对 H.264 会打断参考帧链：被跳过的 NAL 不喂解码器，后续 P 帧对错误参考解码出
+        花屏/拖影，直到下一个关键帧（约 2 秒）才清。这里把批次内全部 NAL 依序喂给
+        有状态解码器以维持参考链，只把最后一帧成功解码的结果存为显示帧。
+        """
+        if not self._decoder.available:
+            # 第 11 条：缺 PyAV/FFmpeg，解码器恒返回空。不再谎报 video_mode/_got_key
+            # （否则面板显示 HEVC·某某但永远「连接中…」），只记一次 error，等待 JPEG
+            # 帧或用户处理。
+            if not self._video_unavailable_warned:
+                self._video_unavailable_warned = True
+                log.error(
+                    "频道[%s] 视频解码器不可用（缺 PyAV/FFmpeg），"
+                    "无法解码 H.264/HEVC 流；请安装 pyav 依赖",
+                    self.name)
+            self.video_mode = False
+            self._got_key = False
+            return
+        last_frame = None
+        last_ts = 0
+        for ts, codec, flags, nal in batch:
+            if codec != self.cur_codec:
+                # 编码切换（H.264 <-> HEVC）：重建解码器并从关键帧重新开始
+                self._decoder.set_codec(codec)
+                self.cur_codec = codec
+                self._got_key = False
+                self._request_keyframe(sock)
+            if flags & VIDEO_FLAG_KEY:
+                self._got_key = True
+                self.video_mode = True
+            frames = self._decoder.decode(nal)
+            if frames and self._got_key:
+                # 仅在收到关键帧后显示：重连/编码切换后首个关键帧前的 P 帧可能对旧参考
+                # 解码出脏画面，一律丢弃并请求关键帧。批次内逐帧喂解码器维持参考链，
+                # 但只把最后一帧存为显示帧（显示最新画面，避免冗余重绘）。
+                last_frame = frames[-1]
+                last_ts = ts
+            else:
+                # 缺参考帧（未收到关键帧/丢关键帧/批次内有缺口）：请求关键帧快速恢复
+                self._request_keyframe(sock)
+        if last_frame is not None:
+            self._store_frame(last_frame, last_ts)
+            self._retry_delay = 0.0
+
     def _handle_ctrl(self, payload):
         """处理一条控制消息（pong/cap/peers/req_keyframe）；未知 action 忽略。"""
         try:
@@ -445,6 +531,19 @@ class Channel:
         elif action == "req_keyframe":
             # host 转达（别的 viewer 正在观看本机共享）：请求上传器补关键帧
             self.request_keyframe()
+        elif action == "watch_reject":
+            # 第 9 条：host 拒绝切源（订阅自身/源已失效）。本地已提交的新源未生效，
+            # 回落 local（host 永不拒绝 local），避免状态栏长期谎报「源:队友·X」。
+            # 仅当被拒源仍等于当前 watch_source 时才回落，免得清掉更晚发起的切源。
+            rej = msg.get("source")
+            with self.lock:
+                watching = self.watch_source
+            if isinstance(rej, str) and rej == watching and watching != "local":
+                log.info("频道[%s] host 拒绝观看源 %s（reason=%s），切回本地画面",
+                         self.name, rej, msg.get("reason"))
+                if self.switch_source("local"):
+                    self._notify_share_error(
+                        "无法观看该队友，频道[%s]已切回本地画面" % self.name)
         # 其余 action 忽略（旧 host 兼容已靠此：cap_probe 无响应即旧版）
 
     def effective_latency_ms(self):
@@ -508,7 +607,21 @@ class Channel:
                 log.info("频道[%s] 以用户 %s 登录成功", self.name, user or "匿名(准入关闭)")
                 return True
             msg = reply.get("msg", "")
-            if msg in ("用户名已存在", "用户名或密码错误", "账号不存在"):
+            # 第 29 条：host 现在要求登录（此前可能匿名放行过）。复位 _anon_ok 让下一轮
+            # 真正弹框询问凭据，而不是无限发空 probe → "需要登录" → 重连（只能重启 viewer）。
+            if msg == "需要登录":
+                self._anon_ok = False
+                self._auth_probed = True
+                self.auth_msg = "需要登录"
+                continue
+            # 第 28 条：注册时用户名被占用并不代表已保存的登录凭据失效，绝不能据此清空
+            # 凭据（原 bug：点“注册”输了个已占用的名字，该频道有效的登录凭据被抹掉）。
+            if action == "register" and msg == "用户名已存在":
+                self._prompt_blocked_until = time.time() + 30
+                self.auth_msg = "注册失败：用户名已被占用，请换一个或直接登录"
+                log.warning("频道[%s] 注册用户名已被占用：%s", self.name, user)
+                return False
+            if msg in ("用户名或密码错误", "账号不存在"):
                 self._prompt_blocked_until = time.time() + 30
                 self.auth_msg = "认证失败：%s" % msg
                 # 凭据失效（改密/账号删除等）：清除缓存，重连时重新询问，避免无限重试旧凭据
@@ -550,13 +663,15 @@ class Channel:
             time.sleep(0.1)
         else:
             return None
+        # 第 93 条：结果走"每请求独立 box"，不再用频道上的共享 _cred_result 槽——
+        # 超时返回后用户才提交时，结果只写进这个已被放弃的 box，绝不会串给下一次请求。
+        box = {}
         done = threading.Event()
-        owner._cred_requests.put((self, done))
+        owner._cred_requests.put((self, done, box))
         done.wait(timeout=120)
         if not done.is_set():
             return None
-        result = getattr(self, "_cred_result", None)
-        self._cred_result = None
+        result = box.get("result")
         if result is None or "error" in result or "value" not in result:
             return None
         return result.get("value")
@@ -590,6 +705,19 @@ class Channel:
             else:
                 self.latency_ms = 0.0
 
+    def _note_no_media(self):
+        """超过 1 秒未收到画面帧：按当前时刻衰减 fps 显示（第 12 条）。
+
+        fps 仅在 _store_frame 里重算，断流后窗口里的旧时间戳不会被剪掉，
+        导致死频道仍显示 30fps。这里主动剪枝并把 fps 归零，使「画面静止」
+        与「对方已死」在帧率显示上可区分。"""
+        now = time.monotonic()
+        with self.lock:
+            cutoff = now - 1.0
+            while self._fps_times and self._fps_times[0] <= cutoff:
+                self._fps_times.pop(0)
+            self.fps = float(len(self._fps_times))
+
     # ---------- MultiView：共享开关 / 观看源切换 ----------
 
     def request_keyframe(self):
@@ -615,7 +743,7 @@ class Channel:
                         pass
                 log.info("频道[%s] 共享已关闭", self.name)
                 return True, ""
-            if self.share_enabled and self._share is not None:
+            if self.share_enabled and self._share is not None and self._share.alive:
                 return True, ""
             if not self.multiview:
                 # 能力尚未确认：cap_probe 已随连接发出，等 cap/peers（≤2s）
@@ -630,7 +758,13 @@ class Channel:
             return ok, err
 
     def switch_source(self, source):
-        """切换观看源："local" 或 peers 中的 "peer:<n>"。成功返回 True。"""
+        """切换观看源："local" 或 peers 中的 "peer:<n>"。成功返回 True。
+
+        第 9 条：保持「先提交本地状态、再发包」的顺序——本地解码器/_got_key 必须在
+        host 开始转发新源帧前就绪，否则接收线程会对未重建的解码器喂新源数据。但发包
+        失败必须回滚 watch_source，否则它停在未生效的新源、状态栏谎报「源:队友·X」，
+        而 host 仍在转发原源（local）画面。
+        """
         with self.lock:
             valid_ids = [p.get("id") for p in self.peers]
         if source != "local" and source not in valid_ids:
@@ -639,14 +773,22 @@ class Channel:
         with self.lock:
             if self.watch_source == source:
                 return True
+            prev_source = self.watch_source  # 第 9 条：发包失败时回滚到此源
             self.watch_source = source
             # 重置解码参考状态：新源从关键帧开始（host 门控 + 本地 _got_key 双保险）
             self._got_key = False
             self.video_mode = False
             self.cur_codec = CODEC_H264
+            # 第 1 条：cur_codec 强设为 H264 后必须同步重建解码器，否则从 HEVC 源
+            # 切到 H.264 源时旧 HEVC 解码器被喂 H.264 数据 → 解码恒失败 → 永久黑屏。
+            self._decoder = codec_mod.VideoDecoder(codec=CODEC_H264)
             self.last_frame = None
+            # 第 8 条：清 last_frame 的同时递增 frame_serial，强制 poll 重绘，
+            # 否则「有无新帧」判据认为没变化，画面会停留在上一个人至少一个 GOP。
+            self.frame_serial += 1
         sock = self._active_sock
         if sock is None:
+            self._revert_source(prev_source)  # 第 9 条：未发包，回滚避免谎报
             return False
         try:
             with self._tx_lock:
@@ -655,9 +797,22 @@ class Channel:
                     # 本地源由 host 编码线程消费 force_key；看 peer 由 host 转达
                     send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
         except (OSError, ValueError):
+            self._revert_source(prev_source)  # 第 9 条：发包失败，回滚避免谎报
             return False
         log.info("频道[%s] 观看源切换为 %s", self.name, source)
         return True
+
+    def _revert_source(self, prev_source):
+        """第 9 条：切源发包失败后把 watch_source 回滚到原源，避免状态栏谎报。
+
+        只回滚 watch_source（状态栏「源:…」正是读它）；提交时已做的解码门控重置
+        （_got_key=False、重建解码器、清 last_frame）保持不变即可——发包失败意味着
+        连接已断（sock 为 None 或 sendall 抛 OSError），此刻并无画面流到达，悬浮窗
+        显示空帧才是诚实状态；连接恢复后由原源下一个关键帧重新起解、自然重绘。
+        """
+        with self.lock:
+            self.watch_source = prev_source
+        log.info("频道[%s] 切源失败，已回滚到原源 %s", self.name, prev_source)
 
     def _start_share(self):
         """创建并启动上传会话（须持 _share_lock）。返回 (ok, err)。"""
@@ -697,8 +852,10 @@ class Channel:
     def _maybe_resume_share(self):
         """cap/peers 确认后：若共享开关仍开且无会话则启动（重连/新连接自动恢复）。"""
         with self._share_lock:
-            if not self.share_enabled or self._share is not None:
+            if not self.share_enabled:
                 return
+            if self._share is not None and self._share.alive:
+                return  # 会话仍活着，无需恢复
             if not self.multiview:
                 return
             ok, err = self._start_share()
@@ -708,8 +865,10 @@ class Channel:
 
     def _share_sync_after_connect(self, sock):
         """连接后 2 秒能力确认兜底：cap 未达视为旧 host，自动关共享并提示一次。"""
-        if self._active_sock is not sock:
-            return  # 已重连/断开：旧定时器作废
+        # 第 61 条：stop()/request_stop() 置 _running=False 后，即便定时器未及时 cancel
+        # 也必须作废，绝不在 teardown 之后新開上传会话。
+        if not self._running or self._active_sock is not sock:
+            return  # 已停止/已重连/断开：旧定时器作废
         with self._share_lock:
             if not self.share_enabled:
                 return
@@ -763,9 +922,26 @@ class Channel:
 
         owner._post_ui(_refresh)
 
+    def request_stop(self):
+        """第 60 条：非阻塞地请求停止——置接收线程标志 + 给共享会话发停止信号，但不 join。
+
+        退出时先对所有频道 request_stop（各上传线程并发收尾），再逐个 stop（此时 join
+        基本即刻返回），把 N 个共享频道的 2N 秒串行冻结压到约 2 秒。
+        """
+        self._running = False
+        with self._share_lock:
+            if self._share is not None:
+                self._share.signal_stop()
+
     def stop(self):
         """停止接收线程与共享上传（daemon 线程，无需 join）。"""
         self._running = False
+        # 第 61 条：cancel 能力确认兜底定时器并清 _active_sock，杜绝退出后定时器触发
+        # _share_sync_after_connect → _start_share 在 teardown 期间新開上传会话。
+        if self._share_sync_timer is not None:
+            self._share_sync_timer.cancel()
+            self._share_sync_timer = None
+        self._active_sock = None
         self._stop_share()
 
 
@@ -802,10 +978,16 @@ class ViewerApp:
         self._photo = None
         self._last_frame_serial = -1
         self._last_channel_idx = -1
+        # 第 98 条：绘制路径缓存——位置只取决于窗口尺寸（=照片尺寸），尺寸未变时跳过
+        # 每帧的 update_idletasks + winfo 查询 + geometry 下发；状态文本未变时跳过 reconfigure。
+        self._last_pos_size = None    # 上次定位所用的 (display_width, new_h)
+        self._last_status_text = None  # 上次写入状态叠加的文本
         self.drag_offset = None
+        self._drag_start_root = None
         self.user_moved = False
         self._mainloop_ready = threading.Event()  # mainloop 真正启动后置位，供接收线程安全调度 UI
         self._cred_requests = queue.Queue()  # 认证对话框请求队列（接收线程入队，主线程 poll 处理）
+        self._cred_busy = False  # 第 93 条：认证对话框互斥标志，强制"每次只一个"，杜绝 wait_window 嵌套期间再叠一个
         self._channels_lock = threading.RLock()  # 保护频道列表与配置持久化（接收线程也会写凭据）
         self.root = None
         self.label = None
@@ -813,6 +995,8 @@ class ViewerApp:
         self.menu = None
         self.hwnd = None
         self.panel = None
+        self._share_toggle_busy = False  # 第 60 条：共享开关异步执行期间的重入护栏
+        self._save_after_id = None  # 第 64 条：viewer 配置去抖落盘的 root.after 句柄
 
     # ---------- 生命周期 ----------
 
@@ -839,6 +1023,11 @@ class ViewerApp:
             self.root.mainloop()
         finally:
             self.running = False
+            self._flush_pending_save()  # 第 64 条：兜底落盘去抖期间未写出的 viewer 配置
+            # 第 60 条：两阶段停止——先并发给所有频道发停止信号（非阻塞），再逐个 join，
+            # 避免 N 个共享频道各 join 2 秒串行冻结退出（详见 quit）。
+            for ch in self.channels:
+                ch.request_stop()
             for ch in self.channels:
                 ch.stop()
             try:
@@ -849,6 +1038,11 @@ class ViewerApp:
     def quit(self):
         """退出：停止所有频道、退出主循环并销毁窗口。"""
         self.running = False
+        self._flush_pending_save()  # 第 64 条：兜底落盘去抖期间未写出的 viewer 配置
+        # 第 60 条：两阶段停止——先并发给所有频道发停止信号（非阻塞），再逐个 join。
+        # 否则每个 ch.stop() 的 share.stop() 各 join 2 秒，N 个共享频道串行冻结主线程 2N 秒。
+        for ch in self.channels:
+            ch.request_stop()
         for ch in self.channels:
             ch.stop()
         try:
@@ -867,19 +1061,36 @@ class ViewerApp:
         if not self.channels:
             return
         self.active_idx = max(0, min(i, len(self.channels) - 1))
+        # item 42：活动频道变化后让面板选中跟随，否则源卡片/预览/共享按钮仍停在旧频道，
+        # 而 Ctrl+Alt+↑/↓ 切的是 active_idx 的观看源 → 面板显示的频道与实际操作的频道不一致
+        self._panel_selected = self.active_idx
         log.info("切换到频道[%s] %s",
                  self.channels[self.active_idx].name,
                  self.channels[self.active_idx].addr)
         self._refresh_overlay()
+        if getattr(self, "panel", None) is not None:
+            try:
+                self._panel_refresh_sources()
+                self._sync_share_button()
+            except Exception:
+                log.debug("切换频道后面板刷新失败", exc_info=True)
 
     def add_channel(self, name, addr):
-        """新增频道：校验地址非空且不重复，写回配置，返回新频道下标。"""
+        """新增频道：校验地址合法且不重复（按规范形去重），写回配置，返回新频道下标。"""
         addr = (addr or "").strip()
         if not addr:
             raise ValueError("频道地址不能为空")
+        # 第 94 条：先校验+规范化新地址（端口非法即抛 ValueError，由调用方显示原因，
+        # 避免垃圾地址落盘后接收线程无限重试只显"断开"）；再按规范形去重，杜绝
+        # localhost:5700 与 127.0.0.1:5700 并存触发同用户重复登录死循环。
+        new_canon = _canonical_addr(addr)
         with self._channels_lock:
             for ch in self.channels:
-                if ch.addr == addr:
+                try:
+                    ch_canon = _canonical_addr(ch.addr)
+                except ValueError:
+                    continue   # 既有频道地址非法（历史遗留落盘）：不参与去重，也不阻断新增
+                if ch_canon == new_canon:
                     raise ValueError("频道地址已存在: %s" % addr)
             name = (name or "").strip() or ("频道%d" % (len(self.channels) + 1))
             self.channels.append(Channel(name, addr, owner=self))
@@ -934,10 +1145,62 @@ class ViewerApp:
                 }
                 for ch in self.channels
             ]
-            save_config(self.cfg)
+            save_config(self.cfg, "viewer")
+
+    def _schedule_save(self):
+        """合并短时间内的多次 viewer 配置写入（第 64 条）。
+
+        ttk.Scale 的 command 在拖动过程中连续触发，若每次都 save_config 整份 JSON
+        （写 tmp + os.replace）会造成几十到上百次全盘写、拖动卡顿。这里改为去抖：
+        每次改动重置一个 0.5s 定时器，只在停手后落盘一次。所有调用方（面板
+        Scale/Checkbutton 回调、root.after 调度的热键）均在主线程，root.after 可直连。
+        退出时由 _flush_pending_save 兜底，避免最后一次改动丢失。
+        """
+        root = self.root
+        if root is None:
+            return
+        if self._save_after_id is not None:
+            try:
+                root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+        try:
+            self._save_after_id = root.after(500, self._flush_save)
+        except Exception:
+            self._save_after_id = None
+
+    def _flush_save(self):
+        """立即落盘待写的 viewer 配置（去抖到期或退出兜底时调用）。"""
+        self._save_after_id = None
+        try:
+            save_config(self.cfg, "viewer")
+        except Exception:
+            log.debug("保存 viewer 配置失败", exc_info=True)
+
+    def _flush_pending_save(self):
+        """退出兜底：取消未到期的去抖定时器并立即落盘，避免最后一次改动丢失。"""
+        if self._save_after_id is None:
+            return
+        root = self.root
+        if root is not None:
+            try:
+                root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+        self._flush_save()
 
     def _post_ui(self, fn):
-        """把回调安全调度到主线程（子线程调用，root 未就绪/已销毁时静默丢弃）。"""
+        """把回调安全调度到主线程（子线程调用，root 未就绪/已销毁/退出中静默丢弃）。
+
+        第 92 条：除 root 为空外，还拦截「mainloop 未就绪」与「已进入退出」两种状态。
+        退出瞬间从外部线程调进已销毁的 Tcl 解释器不只是抛异常——可能崩溃/挂起，
+        末尾的 except 兜不住。热键线程与诊断线程必须改走这里，而非直接 root.after。
+        """
+        if not self.running:
+            return
+        ready = getattr(self, "_mainloop_ready", None)
+        if ready is not None and not ready.is_set():
+            return
         root = self.root
         if root is None:
             return
@@ -965,7 +1228,7 @@ class ViewerApp:
     def set_display_width(self, v):
         self.display_width = max(1, int(v))
         self.cfg["viewer"]["display_width"] = self.display_width
-        save_config(self.cfg)
+        self._schedule_save()  # 第 64 条：拖动滑块时去抖落盘，画面重绘仍即时
         self._refresh_overlay()
 
     def set_alpha(self, v):
@@ -975,13 +1238,13 @@ class ViewerApp:
         except Exception:
             pass
         self.cfg["viewer"]["alpha"] = self.alpha
-        save_config(self.cfg)
+        self._schedule_save()  # 第 64 条：拖动滑块时去抖落盘，透明度调整仍即时
 
     def set_click_through(self, b):
         self.click_through = bool(b)
         self.apply_click_through()
         self.cfg["viewer"]["click_through"] = self.click_through
-        save_config(self.cfg)
+        self._schedule_save()  # 第 64 条：去抖落盘，穿透切换的 win32 效果仍即时
 
     def set_panel_topmost(self, b):
         self.panel_topmost = bool(b)
@@ -991,7 +1254,7 @@ class ViewerApp:
             except Exception:
                 pass
         self.cfg["viewer"]["panel_topmost"] = self.panel_topmost
-        save_config(self.cfg)
+        self._schedule_save()  # 第 64 条：去抖落盘，置顶切换仍即时
 
     # ---------- tkinter 悬浮窗 ----------
 
@@ -1021,7 +1284,7 @@ class ViewerApp:
         root.bind("<Escape>", lambda e: self.quit())
 
         self.menu = tk.Menu(root, tearoff=0)
-        self.menu.add_command(label="切换鼠标穿透", command=self.toggle_click_through)
+        self.menu.add_command(label="切换鼠标穿透 (Ctrl+Alt+X)", command=self.toggle_click_through)
         self.menu.add_command(label="退出", command=self.quit)
 
         self.label.bind("<Button-3>", self._on_right_click)
@@ -1275,109 +1538,166 @@ class ViewerApp:
         if self.panel_topmost:
             self.panel.attributes("-topmost", True)
 
+    def _panel_visible(self):
+        """面板是否真实可见：withdraw（隐藏）后 winfo_viewable() 为假。
+
+        隐藏时周期刷新应跳过加锁拷贝/cvtColor/resize/重建 Treeview 等重活，
+        避免不可见地白烧 CPU；但仍需续排定时器，待重新显示后自动恢复。
+        查询失败时按"可见"处理，宁可多刷一次也不要让刷新链断掉。
+        """
+        if self.panel is None:
+            return False
+        try:
+            return bool(self.panel.winfo_viewable())
+        except Exception:
+            return True
+
     # ---------- 面板：列表/预览刷新（均为主线程 after 调度） ----------
 
     def _panel_refresh_list(self):
         """每 500ms 重建频道列表：状态点、帧率、活动行高亮，保留选中行。"""
         if not self.running or self.panel is None:
             return
-        snapshot = self.get_channels_snapshot()
-        n = len(snapshot)
-        if n != self._panel_known_count:
-            # 行数变化：选中重置为活动频道
-            self._panel_selected = self.active_idx if n else None
-            self._panel_known_count = n
-        tree = self._tree
-        self._panel_suppress_select = True
-        tree.delete(*tree.get_children())
-        for i, item in enumerate(snapshot):
-            tags = ["st_%s" % item["status"]]
-            if i == self.active_idx:
-                tags.insert(0, "row_active")
-            latency = item["latency"]
-            name_txt = item["name"]
-            if item.get("video"):
-                codec_tag = "HEVC" if item.get("codec") == CODEC_HEVC else "H264"
-                name_txt = codec_tag + "·" + name_txt
-            tree.insert("", "end", iid=str(i),
-                        values=("●", name_txt, item["addr"],
-                                "%d" % round(item["fps"]),
-                                "-" if latency <= 0 else "%d" % round(latency)),
-                        tags=tags)
-        if self._panel_selected is not None and n and 0 <= self._panel_selected < n:
-            tree.selection_set(str(self._panel_selected))
-            tree.focus(str(self._panel_selected))
-        self._panel_suppress_select = False
-        self._sync_share_button()
-        self._panel_refresh_sources()
+        if not self._panel_visible():
+            # 面板隐藏：跳过重建（不可见时白烧 CPU），但续排定时器待显示后恢复
+            try:
+                self.panel.after(500, self._panel_refresh_list)
+            except Exception:
+                pass
+            return
         try:
-            self.panel.after(500, self._panel_refresh_list)
+            snapshot = self.get_channels_snapshot()
+            n = len(snapshot)
+            if n != self._panel_known_count:
+                # 行数变化：选中重置为活动频道
+                self._panel_selected = self.active_idx if n else None
+                self._panel_known_count = n
+            tree = self._tree
+            # item 40：全删全建会把滚动位置拽回顶部；重建前记下顶部可见比例，重建后恢复
+            try:
+                y_top = tree.yview()[0]
+            except Exception:
+                y_top = 0.0
+            self._panel_suppress_select = True
+            tree.delete(*tree.get_children())
+            for i, item in enumerate(snapshot):
+                tags = ["st_%s" % item["status"]]
+                if i == self.active_idx:
+                    tags.insert(0, "row_active")
+                latency = item["latency"]
+                name_txt = item["name"]
+                if item.get("video"):
+                    codec_tag = "HEVC" if item.get("codec") == CODEC_HEVC else "H264"
+                    name_txt = codec_tag + "·" + name_txt
+                tree.insert("", "end", iid=str(i),
+                            values=("●", name_txt, item["addr"],
+                                    "%d" % round(item["fps"]),
+                                    "-" if latency <= 0 else "%d" % round(latency)),
+                            tags=tags)
+            if self._panel_selected is not None and n and 0 <= self._panel_selected < n:
+                tree.selection_set(str(self._panel_selected))
+                tree.focus(str(self._panel_selected))
+            if y_top:
+                try:
+                    tree.yview("moveto", y_top)
+                except Exception:
+                    pass
+            self._panel_suppress_select = False
+            self._sync_share_button()
+            self._panel_refresh_sources()
         except Exception:
-            pass
+            # 第 91 条：原本 tree.delete/insert、selection_set、_sync_share_button、
+            # _panel_refresh_sources 全裸奔，任一抛异常（如 Treeview 内部 Tcl 错误）会在末尾
+            # 续排 after 之前逃出本函数 → 列表刷新永久停更（fps/状态陈旧、源列表不再更新），
+            # 而悬浮窗仍在动 → 程序看着「半活」。对照 _show_frame 本就有 try 兜底。
+            log.warning("频道列表刷新失败，跳过本次（定时器续排，不停更）", exc_info=True)
+        finally:
+            # 异常路径下也复位选中抑制标志，避免 tree.insert/selection_set 中途抛出后
+            # _panel_suppress_select 卡在 True 致用户点击行永久失效（_panel_on_select 被屏蔽）。
+            self._panel_suppress_select = False
+            try:
+                self.panel.after(500, self._panel_refresh_list)
+            except Exception:
+                pass
 
     def _panel_refresh_preview(self):
         """每 200ms 刷新预览区：显示选中（默认活动）频道的最近一帧缩放图。"""
         if not self.running or self.panel is None:
             return
-        idx = self._panel_selected if self._panel_selected is not None else self.active_idx
-        frame = None
-        name = None
-        status = None
-        serial = 0
-        changed = True
-        if self.channels and 0 <= idx < len(self.channels):
-            ch = self.channels[idx]
-            name, status = ch.name, ch.status
-            with ch.lock:
-                serial = ch.frame_serial
-            changed = (idx != self._panel_last_idx or serial != self._panel_last_serial)
-            if changed:
-                with ch.lock:
-                    if ch.last_frame is not None:
-                        frame = ch.last_frame.copy()
-        if frame is not None:
-            if changed:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(rgb)
-                w, h = img.size
-                if w > 0 and h > 0:
-                    # 等比缩放到宽度 320；过高时按高度上限 165 收缩，防止面板被撑开
-                    new_w, new_h = 320, max(1, int(round(h * 320.0 / w)))
-                    if new_h > 165:
-                        new_w, new_h = max(1, int(round(w * 165.0 / h))), 165
-                    img = img.resize((new_w, new_h), Image.BILINEAR)
-                    photo = ImageTk.PhotoImage(img)
-                    # 先让 label 指向新图再释放旧引用：否则旧 Tk 图像在 label 仍显示时
-                    # 被删除，随后的 configure 可能报 "image ... doesn't exist"
-                    self._preview_label.configure(image=photo, text="")
-                    self._panel_photo = photo
-                    self._panel_last_serial = serial
-                    self._panel_last_idx = idx
-        else:
-            # 仅当目标频道确无可用画面（未在线/首帧未到）才清空预览；
-            # 流静止（serial 未变）但频道仍在线时保留上一帧，避免画面反复闪空
-            clear = True
-            if self.channels and 0 <= idx < len(self.channels):
-                with self.channels[idx].lock:
-                    clear = (self.channels[idx].status != "receiving"
-                             or self.channels[idx].last_frame is None)
-            if clear:
-                self._panel_last_serial = -1
-                self._panel_last_idx = -1
-                # 先让 label 脱离旧图像再释放引用（同上，避免删除仍在显示的图像）
-                self._preview_label.configure(image=None, text="暂无画面")
-                self._panel_photo = None
-        # 预览小字：频道名称与状态
-        if name is None:
-            self._preview_info.configure(text="", fg=COL_DIM)
-        else:
-            self._preview_info.configure(
-                text="%s · %s" % (name, STATUS_TEXT.get(status, status)),
-                fg=STATUS_COLOR.get(status, COL_DIM))
+        if not self._panel_visible():
+            # 面板隐藏：跳过加锁拷贝/cvtColor/resize/PhotoImage，但续排定时器待显示后恢复
+            try:
+                self.panel.after(200, self._panel_refresh_preview)
+            except Exception:
+                pass
+            return
         try:
-            self.panel.after(200, self._panel_refresh_preview)
+            idx = self._panel_selected if self._panel_selected is not None else self.active_idx
+            frame = None
+            name = None
+            status = None
+            serial = 0
+            changed = True
+            if self.channels and 0 <= idx < len(self.channels):
+                ch = self.channels[idx]
+                name, status = ch.name, ch.status
+                with ch.lock:
+                    serial = ch.frame_serial
+                changed = (idx != self._panel_last_idx or serial != self._panel_last_serial)
+                if changed:
+                    with ch.lock:
+                        if ch.last_frame is not None:
+                            frame = ch.last_frame.copy()
+            if frame is not None:
+                if changed:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(rgb)
+                    w, h = img.size
+                    if w > 0 and h > 0:
+                        # 等比缩放到宽度 320；过高时按高度上限 165 收缩，防止面板被撑开
+                        new_w, new_h = 320, max(1, int(round(h * 320.0 / w)))
+                        if new_h > 165:
+                            new_w, new_h = max(1, int(round(w * 165.0 / h))), 165
+                        img = img.resize((new_w, new_h), Image.BILINEAR)
+                        photo = ImageTk.PhotoImage(img)
+                        # 先让 label 指向新图再释放旧引用：否则旧 Tk 图像在 label 仍显示时
+                        # 被删除，随后的 configure 可能报 "image ... doesn't exist"
+                        self._preview_label.configure(image=photo, text="")
+                        self._panel_photo = photo
+                        self._panel_last_serial = serial
+                        self._panel_last_idx = idx
+            else:
+                # 仅当目标频道确无可用画面（未在线/首帧未到）才清空预览；
+                # 流静止（serial 未变）但频道仍在线时保留上一帧，避免画面反复闪空
+                clear = True
+                if self.channels and 0 <= idx < len(self.channels):
+                    with self.channels[idx].lock:
+                        clear = (self.channels[idx].status != "receiving"
+                                 or self.channels[idx].last_frame is None)
+                if clear:
+                    self._panel_last_serial = -1
+                    self._panel_last_idx = -1
+                    # 先让 label 脱离旧图像再释放引用（同上，避免删除仍在显示的图像）
+                    self._preview_label.configure(image=None, text="暂无画面")
+                    self._panel_photo = None
+            # 预览小字：频道名称与状态
+            if name is None:
+                self._preview_info.configure(text="", fg=COL_DIM)
+            else:
+                self._preview_info.configure(
+                    text="%s · %s" % (name, STATUS_TEXT.get(status, status)),
+                    fg=STATUS_COLOR.get(status, COL_DIM))
         except Exception:
-            pass
+            # 第 91 条：cvtColor/fromarray/resize/PhotoImage/configure 原全裸奔，一帧异常形状
+            # （如解码出灰度 (H,W) 而非 (H,W,3)、或通道数不符）的图像会让 cv2.cvtColor 抛异常，
+            # 在末尾续排 after 之前逃出 → 预览永久停更（fps/状态陈旧），而悬浮窗仍动 →「半活」。
+            # 对照 _show_frame 本就有 try 兜底。兜底后异常被记录、本次跳过，finally 续排定时器。
+            log.warning("面板预览刷新失败，跳过本次（定时器续排，不停更）", exc_info=True)
+        finally:
+            try:
+                self.panel.after(200, self._panel_refresh_preview)
+            except Exception:
+                pass
 
     # ---------- 面板：列表交互 ----------
 
@@ -1490,6 +1810,11 @@ class ViewerApp:
                 rows.append(("▶ 观看中" if (active and watching == sid) else "",
                              "队友 · %s" % (p.get("name") or sid),
                              p.get("addr") or "", sid))
+        # item 40：同样全删全建，记下滚动比例，重建后恢复，避免源列表被拽回顶部
+        try:
+            y_top = tree.yview()[0]
+        except Exception:
+            y_top = 0.0
         tree.delete(*tree.get_children())
         for i, (mark, source, info, sid) in enumerate(rows):
             tags = ("src_watching",) if mark else ()
@@ -1499,6 +1824,11 @@ class ViewerApp:
         if keep is not None and keep in self._src_rows:
             try:
                 tree.selection_set(str(self._src_rows.index(keep)))
+            except Exception:
+                pass
+        if y_top:
+            try:
+                tree.yview("moveto", y_top)
             except Exception:
                 pass
 
@@ -1549,20 +1879,41 @@ class ViewerApp:
         return source
 
     def _panel_toggle_share(self):
-        """共享按钮：开关当前目标频道的屏幕共享。"""
+        """共享按钮：开关当前目标频道的屏幕共享。
+
+        第 60 条：set_share 可能阻塞主线程（未确认能力时 _cap_event.wait(2.0)，关闭时
+        share.stop() 的 join(2.0)）→ 悬浮窗 poll/面板刷新/对话框整体冻结约 2 秒。改为在
+        工作线程执行 set_share，完成后用 _post_ui 回主线程更新状态与按钮；执行期间用
+        _share_toggle_busy 护栏忽略重复点击。set_share/_start_share 无 Tk 亲和，可安全离线执行。
+        """
         ch = self._target_channel()
         if ch is None:
             self._panel_set_status("无可用频道", error=True)
             return
-        on = not ch.share_enabled
-        ok, err = ch.set_share(on)
-        if not ok:
-            self._panel_set_status(err, error=True)
-            self._sync_share_button()
+        if self._share_toggle_busy:
             return
-        self._panel_set_status(
-            "已开启共享：%s" % ch.name if on else "已停止共享：%s" % ch.name)
-        self._sync_share_button()
+        on = not ch.share_enabled
+        self._share_toggle_busy = True
+        self._panel_set_status("正在%s共享…" % ("开启" if on else "停止"))
+
+        def work():
+            try:
+                ok, err = ch.set_share(on)
+            except Exception as e:  # 兜底：异常不应让护栏卡死
+                ok, err = False, "共享切换失败: %s" % e
+            finally:
+                self._share_toggle_busy = False
+
+            def done():
+                if not ok:
+                    self._panel_set_status(err, error=True)
+                else:
+                    self._panel_set_status(
+                        "已开启共享：%s" % ch.name if on else "已停止共享：%s" % ch.name)
+                self._sync_share_button()
+            self._post_ui(done)
+
+        threading.Thread(target=work, name="share-toggle", daemon=True).start()
 
     # ---------- 面板：底部状态标签 ----------
 
@@ -1605,6 +1956,16 @@ class ViewerApp:
                  bg=COL_CARD, fg=COL_FG, font=("Microsoft YaHei", 10)).pack(pady=(12, 0))
         tk.Label(body, text="https://doc.natfrp.com/", bg=COL_CARD, fg=COL_ACCENT,
                  font=("Microsoft YaHei", 9)).pack(pady=(4, 0))
+        tk.Label(body, text="全局热键", bg=COL_CARD, fg=COL_FG,
+                 font=("Microsoft YaHei", 10, "bold")).pack(pady=(14, 2))
+        for line in (
+            "Ctrl+Alt+X：切换鼠标穿透（穿透开启后右键菜单失效，用它恢复控制台）",
+            "Ctrl+Alt+← / →：切换上一个 / 下一个频道",
+            "Ctrl+Alt+↑ / ↓：切换上一个 / 下一个画面源",
+            "Alt+1…9：直达对应频道（可在配置 hotkeys.direct 关闭）",
+        ):
+            tk.Label(body, text=line, bg=COL_CARD, fg=COL_DIM, anchor="w",
+                     justify="left", font=("Microsoft YaHei", 9)).pack(fill="x", padx=24)
         tk.Button(body, text="关闭", bg=COL_CTRL, fg=COL_FG,
                   activebackground="#3a3a52", activeforeground=COL_FG,
                   relief="flat", padx=18, pady=4,
@@ -1694,6 +2055,8 @@ class ViewerApp:
     def _maybe_run_wizard(self):
         """首次使用向导：无频道且服务端地址为默认值时引导填写共享端地址（同步模态）。"""
         viewer_cfg = self.cfg["viewer"]
+        if viewer_cfg.get("wizard_done"):
+            return
         if viewer_cfg.get("channels"):
             return
         if (viewer_cfg.get("server_addr") or "") != "127.0.0.1:5700":
@@ -1729,10 +2092,14 @@ class ViewerApp:
 
         def _confirm():
             added, failed = self._wizard_apply(entry.get("1.0", "end"))
+            self.cfg["viewer"]["wizard_done"] = True
+            save_config(self.cfg, "viewer")
             log.info("首次使用向导完成：新增 %d 个频道，跳过 %d 行", added, failed)
             win.destroy()
 
         def _skip():
+            self.cfg["viewer"]["wizard_done"] = True
+            save_config(self.cfg, "viewer")
             log.info("用户跳过了首次使用向导")
             win.destroy()
 
@@ -1784,10 +2151,8 @@ class ViewerApp:
             except Exception as exc:
                 log.warning("诊断过程异常：%s", exc)
                 lines = ["诊断过程异常：%s" % exc]
-            try:
-                self.root.after(0, lambda: self._show_diag_report(lines, btn))
-            except Exception:
-                pass
+            # 第 92 条：改走 _post_ui，退出瞬间不再调进已销毁的 Tcl 解释器。
+            self._post_ui(lambda: self._show_diag_report(lines, btn))
 
         threading.Thread(target=worker, name="viewer-diag", daemon=True).start()
 
@@ -1804,7 +2169,12 @@ class ViewerApp:
         except Exception as exc:
             lines.append("本机网络（阿里 DNS 223.5.5.5）→ 失败：%s" % exc)
         # 各频道连通性与握手
-        for ch in self.channels:
+        # 第 92 条：在 _channels_lock 下取快照（list 复制），避免主线程增删频道时
+        # 工作线程遍历到一半列表被改（IndexError / 报告已不存在的频道）。
+        # 锁只护引用复制，循环体里的网络 I/O（3s 超时）在锁外执行，不阻塞主线程增删。
+        with self._channels_lock:
+            channels = list(self.channels)
+        for ch in channels:
             t0 = time.monotonic()
             try:
                 host, port = parse_addr(ch.addr)
@@ -1940,26 +2310,40 @@ class ViewerApp:
     def _process_cred_requests(self):
         """主线程：处理认证对话框请求队列（接收线程只入队，由主线程直接建窗以避免
         跨线程建模态对话框导致的键盘输入无法到达问题）。每次只处理一个请求。"""
+        # 第 93 条：_cred_busy 强制"每次只一个"——_credentials_dialog 的 wait_window 会开
+        # 嵌套主循环，poll 的 after(15) 在嵌套期间照常触发本函数；若无此互斥，第二个频道
+        # 的请求会在第一个模态框上再叠一个。忙时直接返回，请求留在队列里待空闲再处理。
+        if self._cred_busy:
+            return
         try:
-            ch, done = self._cred_requests.get_nowait()
+            ch, done, box = self._cred_requests.get_nowait()
         except queue.Empty:
             return
+        self._cred_busy = True
         result = {}
         try:
             result["value"] = self._credentials_dialog(ch.name)
         except Exception as e:
             result["error"] = e
-        ch._cred_result = result
+        finally:
+            self._cred_busy = False
+        # 结果写进本请求专属 box（非频道共享槽），与 done 配对，杜绝跨请求串结果。
+        box["result"] = result
         done.set()
 
     def poll(self):
         """主循环轮询：每 15ms 检查活动频道是否有新帧。"""
         if not self.running:
             return
+        # item 46：先重排下一次 poll，再处理可能阻塞的认证对话框。
+        # _credentials_dialog 的 wait_window 会开嵌套主循环，若此时尚未排定下一个 poll
+        # 定时器，嵌套期间悬浮窗就停止绘制（画面/fps/延迟定格最长 120s），而面板刷新链
+        # 仍在跑，造成面板与悬浮窗互相矛盾。提前重排可让悬浮窗在对话框期间继续刷新
+        # （嵌套循环照常触发 after 定时器），且每次只排一个后继，不会形成定时器风暴。
+        self.root.after(15, self.poll)
         self._process_cred_requests()
         if not self.channels:
             self._show_text("无频道")
-            self.root.after(15, self.poll)
             return
         channel = self.channels[self.active_idx]
         with channel.lock:
@@ -1967,7 +2351,6 @@ class ViewerApp:
         if self._last_channel_idx == self.active_idx and self._last_frame_serial == serial:
             # 没有新帧：只更新叠加状态，避免反复复制/缩放/绘制同一画面
             self._update_status_overlay()
-            self.root.after(15, self.poll)
             return
         frame = None
         with channel.lock:
@@ -1983,7 +2366,6 @@ class ViewerApp:
                 self._show_text("需要登录")
             else:
                 self._show_text("连接中…")
-        self.root.after(15, self.poll)
 
     def _refresh_overlay(self):
         """切换频道后立即刷新悬浮窗（不等待下一个 poll 周期）。"""
@@ -2023,6 +2405,11 @@ class ViewerApp:
                 src = ch.watch_source
             if src != "local":
                 text += " · 源:%s" % self._describe_source(ch, src)
+        # 第 98 条：poll 每 15ms + 每帧都会调本函数，文本多数周期不变；
+        # 未变时跳过 configure（仍走 Tcl 命令派发/选项查询，与解码/贴图抢主线程）。
+        if text == self._last_status_text:
+            return
+        self._last_status_text = text
         self.status_overlay.configure(text=text)
 
     def _show_frame(self, frame_bgr, serial=None):
@@ -2051,7 +2438,13 @@ class ViewerApp:
                 self._last_frame_serial = serial
                 self._last_channel_idx = self.active_idx
             if not self.user_moved:
-                self._position_top_right()
+                # 第 98 条：窗口位置只取决于尺寸（=照片 display_width×new_h）；尺寸未变
+                # 则跳过每帧的 update_idletasks + winfo 查询 + geometry 下发（60fps 下纯冗余，
+                # 与解码/贴图抢主线程和 DWM）。尺寸变化（源分辨率/显示宽度变更）才重新定位。
+                size_key = (self.display_width, new_h)
+                if size_key != self._last_pos_size:
+                    self._position_top_right()
+                    self._last_pos_size = size_key
         except Exception:
             log.warning("画面绘制失败，跳过该帧", exc_info=True)
 
@@ -2066,6 +2459,9 @@ class ViewerApp:
         self.has_frame = False
         self._last_text = text
         self.label.configure(image=None, text=text)
+        # 第 98 条：内容切到文字占位、窗口尺寸随之改变 → 作废照片尺寸定位缓存，
+        # 使下一帧画面恢复时必定重新定位（否则会沿用照片尺寸旧位置而错位）。
+        self._last_pos_size = None
         if not self.user_moved:
             self._position_top_right()
 
@@ -2078,15 +2474,23 @@ class ViewerApp:
             self.menu.grab_release()
 
     def _on_drag_start(self, event):
-        self.user_moved = True
+        # item 43：按下时不立即置 user_moved，仅记录偏移与按下点；
+        # 真正拖动（位移超过阈值）后才永久关闭自动贴右上角，避免单击误触发
         self.drag_offset = (
             event.x_root - self.root.winfo_x(),
             event.y_root - self.root.winfo_y(),
         )
+        self._drag_start_root = (event.x_root, event.y_root)
 
     def _on_drag_move(self, event):
         if self.drag_offset is None:
             return
+        if not self.user_moved and self._drag_start_root is not None:
+            dx = event.x_root - self._drag_start_root[0]
+            dy = event.y_root - self._drag_start_root[1]
+            if abs(dx) < 4 and abs(dy) < 4:
+                return  # 视为点击抖动，尚未真正拖动
+            self.user_moved = True
         x = event.x_root - self.drag_offset[0]
         y = event.y_root - self.drag_offset[1]
         self.root.geometry("+%d+%d" % (x, y))
@@ -2095,20 +2499,42 @@ class ViewerApp:
         self.click_through = not self.click_through
         self.apply_click_through()
         self.cfg["viewer"]["click_through"] = self.click_through
-        save_config(self.cfg)
+        self._schedule_save()  # 第 64 条：去抖落盘，穿透切换的 win32 效果仍即时
         if self.click_through:
             log.info("鼠标穿透已开启，按 Ctrl+Alt+X 可关闭")
         else:
             log.info("鼠标穿透已关闭，可拖动窗口，右键菜单/Esc 可用")
 
     def apply_click_through(self):
-        """设置/清除 WS_EX_LAYERED | WS_EX_TRANSPARENT 实现鼠标穿透。"""
+        """设置/清除 WS_EX_TRANSPARENT（穿透）与 WS_EX_LAYERED（穿透或半透明所需）。
+
+        WS_EX_LAYERED 不能与 Tk 的 -alpha 互相踩踏：只要开启穿透或 alpha<1.0
+        就必须保持 LAYERED，并在每次切换后重新写入 alpha，否则分层窗口会失去
+        透明属性（关掉穿透后变全不透明）或在 alpha==1.0 时根本不渲染。
+        """
+        try:
+            alpha = float(getattr(self, "alpha", 1.0))
+        except (TypeError, ValueError):
+            alpha = 1.0
+        alpha = max(0.0, min(1.0, alpha))
+        need_layered = bool(self.click_through) or alpha < 1.0
         ex_style = win32gui.GetWindowLong(self.hwnd, win32con.GWL_EXSTYLE)
         if self.click_through:
-            ex_style |= win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+            ex_style |= win32con.WS_EX_TRANSPARENT
         else:
-            ex_style &= ~(win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
+            ex_style &= ~win32con.WS_EX_TRANSPARENT
+        if need_layered:
+            ex_style |= win32con.WS_EX_LAYERED
+        else:
+            ex_style &= ~win32con.WS_EX_LAYERED
         win32gui.SetWindowLong(self.hwnd, win32con.GWL_EXSTYLE, ex_style)
+        if need_layered:
+            try:
+                win32gui.SetLayeredWindowAttributes(
+                    self.hwnd, 0, int(round(alpha * 255)), win32con.LWA_ALPHA,
+                )
+            except Exception:
+                log.debug("SetLayeredWindowAttributes 失败", exc_info=True)
         win32gui.SetWindowPos(
             self.hwnd, 0, 0, 0, 0, 0,
             win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
@@ -2125,18 +2551,26 @@ class ViewerApp:
     def _hotkey_loop(self):
         user32 = ctypes.windll.user32
         registered = []
+        failed = []
         for hid, vk in HOTKEY_DEFS:
             if user32.RegisterHotKey(None, hid, MOD_CONTROL | MOD_ALT, vk):
                 registered.append(hid)
+            else:
+                failed.append(HOTKEY_NAMES.get(hid, "热键ID %d" % hid))
         direct_enabled = bool(self.cfg["viewer"].get("hotkeys", {}).get("direct", True))
         if direct_enabled:
             for i in range(9):
                 hid = HOTKEY_ID_DIRECT_BASE + i
                 if user32.RegisterHotKey(None, hid, MOD_ALT, VK_1 + i):
                     registered.append(hid)
+                else:
+                    failed.append("Alt+%d 直达频道" % (i + 1))
         if not registered:
-            log.warning("全局热键注册失败")
+            log.warning("全局热键全部注册失败（可能已被其他程序占用）：%s",
+                        "、".join(failed) if failed else "未知")
             return
+        if failed:
+            log.warning("部分全局热键注册失败（可能已被其他程序占用）：%s", "、".join(failed))
         try:
             msg = ctypes.wintypes.MSG()
             while self.running:
@@ -2147,18 +2581,18 @@ class ViewerApp:
                     continue
                 try:
                     if msg.wParam == HOTKEY_ID_TOGGLE:
-                        self.root.after(0, self.toggle_click_through)
+                        self._post_ui(self.toggle_click_through)
                     elif msg.wParam == HOTKEY_ID_PREV:
-                        self.root.after(0, self._step_channel, -1)
+                        self._post_ui(lambda: self._step_channel(-1))
                     elif msg.wParam == HOTKEY_ID_NEXT:
-                        self.root.after(0, self._step_channel, 1)
+                        self._post_ui(lambda: self._step_channel(1))
                     elif msg.wParam == HOTKEY_ID_SRC_PREV:
-                        self.root.after(0, self._step_source, -1)
+                        self._post_ui(lambda: self._step_source(-1))
                     elif msg.wParam == HOTKEY_ID_SRC_NEXT:
-                        self.root.after(0, self._step_source, 1)
+                        self._post_ui(lambda: self._step_source(1))
                     elif HOTKEY_ID_DIRECT_BASE <= msg.wParam < HOTKEY_ID_DIRECT_BASE + 9:
-                        self.root.after(0, self.switch_channel,
-                                        msg.wParam - HOTKEY_ID_DIRECT_BASE)
+                        self._post_ui(lambda idx=msg.wParam - HOTKEY_ID_DIRECT_BASE:
+                                      self.switch_channel(idx))
                 except Exception:
                     pass
         finally:
@@ -2207,6 +2641,10 @@ class ViewerApp:
 
 
 def main():
+    # 第 79 条：仅在作为 GUI 应用运行时安装兜底 excepthook（覆盖 load_config /
+    # ViewerApp 构造等位于下方 try 之外、异常会逃逸到解释器顶层的启动阶段）。
+    # 不在 import 时安装，避免劫持测试套件等仅 import viewer 的进程的全局错误处理。
+    sys.excepthook = _handle_uncaught
     parser = argparse.ArgumentParser(description="FPS 画面观看端（TCP 客户端 + 置顶悬浮窗）")
     parser.add_argument(
         "--addr", help="服务端地址 host:port，可覆盖配置文件中的 viewer.server_addr"
@@ -2217,8 +2655,10 @@ def main():
     logger.setup_logger(cfg)
     if args.addr:
         cfg["viewer"]["server_addr"] = args.addr
-        save_config(cfg)
+        save_config(cfg, "viewer")
         log.info("已使用命令行地址 %s 并写入配置", args.addr)
+
+    enable_dpi_awareness()
 
     app = ViewerApp(cfg)
     try:

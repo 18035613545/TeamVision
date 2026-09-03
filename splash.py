@@ -67,6 +67,7 @@ def _build(win):
 
 def _show_on_root(root):
     """在既有 root 上创建置顶无边框 Toplevel，2 秒后自动销毁，不阻塞。"""
+    win = None
     try:
         win = tk.Toplevel(root)
         win.overrideredirect(True)
@@ -75,7 +76,14 @@ def _show_on_root(root):
         _center(win)
         root.after(SPLASH_MS, win.destroy)
     except Exception:
-        pass
+        # 第 86 条：配置中途抛异常时，已建好的无边框置顶 Toplevel 既未销毁也没排定销毁，
+        # 会留下一个关不掉（无关闭按钮、不在任务栏、置顶）的幽灵窗口，只能杀进程。
+        # 与 show_splash(root=None) 路径一致：失败即销毁，静默降级不留残窗。
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
 
 def show_splash(root=None):

@@ -51,12 +51,14 @@ class ScreenShareSession:
         probe_fps = max(1, int(still_cfg.get("probe_fps", 5)))
         self._probe_interval = 1.0 / probe_fps
         still_frames = max(1, int(still_cfg.get("still_frames", 3)))
-        self._quiet_ms = still_frames * self._probe_interval
+        self._quiet_s = still_frames * self._probe_interval  # 单位秒（第 87 条：旧名 _ms 名不副实）
         self._point_thr = int(still_cfg.get("point_thr", 10))
         self._ratio_thr = float(still_cfg.get("ratio_thr", 0.005))
         self._cap = capture
         self._cap_owned = capture is None
         self._encoder = None
+        self._enc_retry_at = 0.0   # 第 53 条：编码器构造失败后的负缓存退避时刻
+        self._enc_backoff = 1.0    # 退避秒数，指数增长封顶 30s
         self._thread = None
 
     # ---------- 生命周期 ----------
@@ -71,12 +73,26 @@ class ScreenShareSession:
         self._thread.start()
         return self
 
+    def signal_stop(self):
+        """第 60 条：仅置停止标志、不 join（非阻塞）。
+
+        退出时先对所有频道并发 signal_stop，让各上传线程同时开始收尾，再逐个 join；
+        否则 stop() 的 join(2.0) 串行执行，N 个共享频道最多冻结主线程 2N 秒（「关不掉」）。
+        """
+        self._stop.set()
+
     def stop(self):
         """停止上传线程并释放采集/编码资源（幂等，最多等 2 秒）。"""
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        self.signal_stop()
+        th = self._thread
+        self._thread = None
+        if th is not None:
+            th.join(timeout=2.0)
+            if th.is_alive():
+                # 第 97 条：线程仍阻塞在 sendall（超时 5s > join 2s）时不在此处关闭
+                # 采集/编码资源，避免在运行中的线程脚下抽掉 cap/encoder；
+                # 资源由线程自身 finally（_run 末尾）释放。
+                return
         self._close_resources()
 
     def request_keyframe(self):
@@ -96,11 +112,20 @@ class ScreenShareSession:
             except Exception as e:
                 log.error("频道[%s] 共享采集初始化失败，已停止: %s", self._name, e)
                 return
+        # 第 5 条：采集器构造可能"成功"但无任何可用后端（dxgi 与 mss 都挂时句柄置 None），
+        # 此后 grab() 恒返回 None，会话空转（每秒约 100 次无效采集且什么都不上传）。
+        # 直接报错停止，由 Channel 层提示用户，而不是静默假活。
+        if not getattr(self._cap, "working", True):
+            log.error("频道[%s] 共享采集器无可用后端（dxgi/mss 均失败），已停止", self._name)
+            self._close_resources()
+            return
         interval = 1.0 / self._fps
         still_ref = None
         quiet_since = None
         in_still = False
         consecutive_errors = 0
+        consecutive_none = 0
+        none_rebuild_at = max(10, self._fps * 5)  # 连续约 5 秒空帧则尝试重建采集器
         last_frame = None   # 最近一次成功发送的缩放后 BGR（静止补帧/强制 IDR 用）
         last_packed = None  # 最近一次发送的完整消息字节（JPEG 补帧用）
         last_is_video = False
@@ -108,9 +133,9 @@ class ScreenShareSession:
             while not self._stop.is_set():
                 t0 = time.perf_counter()
                 ts_us = int(time.time() * 1_000_000)
+                # 第 3 条：不在此处清除 key_evt。只有真正补出关键帧/发送成功后才清除，
+                # 避免 host 转达的唯一一次请求在 bgr=None/采集异常/静止无缓存路径上被丢掉。
                 key_wanted = self._key_evt.is_set()
-                if key_wanted:
-                    self._key_evt.clear()
                 try:
                     bgr = self._cap.grab()
                 except Exception as e:
@@ -134,11 +159,29 @@ class ScreenShareSession:
                 if bgr is None:
                     if consecutive_errors > 0:
                         consecutive_errors = 0
-                    # 采集空帧（dxgi 无新帧）：响应关键帧请求后短等再巡
+                    consecutive_none += 1
+                    # 第 5 条：采集器持续返回空帧（后端运行中死亡）→ 达阈值尝试重建并上报
+                    if (self._cap_owned and consecutive_none >= none_rebuild_at):
+                        log.error("频道[%s] 共享采集连续 %d 帧无画面，尝试重建采集器",
+                                  self._name, consecutive_none)
+                        try:
+                            self._cap.close()
+                        except Exception:
+                            pass
+                        try:
+                            self._cap = CaptureManager(
+                                self._backend, self._monitor, self._region)
+                            log.info("频道[%s] 共享采集器已重建", self._name)
+                        except Exception as e2:
+                            log.error("频道[%s] 共享采集器重建失败: %s", self._name, e2)
+                        consecutive_none = 0
+                    # 采集空帧（dxgi 无新帧）：响应关键帧请求后短等再巡；成功才清事件
                     if key_wanted and last_packed is not None:
                         self._send_key_response(last_frame, last_packed, last_is_video)
+                        self._key_evt.clear()
                     time.sleep(min(0.01, interval))
                     continue
+                consecutive_none = 0
                 changed = True
                 if self._still_enabled:
                     try:
@@ -150,20 +193,23 @@ class ScreenShareSession:
                         changed, still_ref = True, downsample_frame(bgr)
                     in_still, quiet_since = still_gate_update(
                         in_still, quiet_since, changed,
-                        time.perf_counter(), self._quiet_ms)
+                        time.perf_counter(), self._quiet_s)
                 if changed:
                     if consecutive_errors > 0:
                         consecutive_errors = 0
                     res = self._encode_send(bgr, ts_us, force_key=key_wanted)
                     if res is not None:
                         last_frame, last_packed, last_is_video = res
+                        if key_wanted:
+                            self._key_evt.clear()  # 第 3 条：已成功补帧，消费请求
                     elapsed = time.perf_counter() - t0
                     if interval - elapsed > 0:
                         time.sleep(interval - elapsed)
                     continue
-                # 无有效变化：静止时按探测间隔巡检；请求关键帧则补帧响应
+                # 无有效变化：静止时按探测间隔巡检；请求关键帧则补帧响应（成功才清事件）
                 if key_wanted and last_packed is not None:
                     self._send_key_response(last_frame, last_packed, last_is_video)
+                    self._key_evt.clear()
                 wait = self._probe_interval if in_still else interval
                 elapsed = time.perf_counter() - t0
                 if wait - elapsed > 0:
@@ -190,38 +236,52 @@ class ScreenShareSession:
 
     def _encode_send(self, bgr, ts_us, force_key=False):
         """缩放→编码→发送一帧；返回 (缩放后BGR, 完整消息字节, 是否视频) 或 None。"""
-        w, h = calc_output_size(bgr.shape[1], bgr.shape[0], 1.0, self._target_width)
-        if self._encoder is not None and not self._encoder.available:
-            try:
-                self._encoder.close()
-            except Exception:
-                pass
-            self._encoder = None
-        if self._encoder is None and self._encoder_sel != "jpeg":
-            enc = codec_mod.VideoEncoder(
-                w, h, self._fps, self._bitrate, self._keyint,
-                self._encoder_sel, self._preset)
-            if enc.available:
-                self._encoder = enc
-                log.info("频道[%s] 共享编码器: %s（%dx%d，%d Kbps）",
-                         self._name, enc.name, w, h, self._bitrate // 1000)
-        frame = bgr
-        if (w, h) != (bgr.shape[1], bgr.shape[0]):
-            frame = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
-        if self._encoder is not None:
-            res = self._encoder.encode(frame, raw_ts=ts_us, force_key=force_key)
-            if res is None:
-                return None
-            nal, is_key, _ms, out_ts = res
-            msg = pack_video(nal, out_ts, is_key, codec=self._encoder.codec_id)
+        try:
+            w, h = calc_output_size(bgr.shape[1], bgr.shape[0], 1.0, self._target_width)
+            if self._encoder is not None and not self._encoder.available:
+                try:
+                    self._encoder.close()
+                except Exception:
+                    pass
+                self._encoder = None
+            # 第 53 条：编码器构造失败后负缓存退避，避免每帧都新建 VideoEncoder
+            # （4 次 av.Codec 查找 + 4 次 open + 最多 4 条告警，30 次/秒打满 CPU 刷爆日志）
+            now = time.monotonic()
+            if (self._encoder is None and self._encoder_sel != "jpeg"
+                    and now >= self._enc_retry_at):
+                enc = codec_mod.VideoEncoder(
+                    w, h, self._fps, self._bitrate, self._keyint,
+                    self._encoder_sel, self._preset)
+                if enc.available:
+                    self._encoder = enc
+                    self._enc_backoff = 1.0
+                    log.info("频道[%s] 共享编码器: %s（%dx%d，%d Kbps）",
+                             self._name, enc.name, w, h, self._bitrate // 1000)
+                else:
+                    # 构造失败：指数退避（1→2→4→…→30s 封顶），期间走 JPEG 回退
+                    self._enc_retry_at = now + self._enc_backoff
+                    self._enc_backoff = min(30.0, self._enc_backoff * 2)
+            frame = bgr
+            if (w, h) != (bgr.shape[1], bgr.shape[0]):
+                frame = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
+            if self._encoder is not None:
+                res = self._encoder.encode(frame, raw_ts=ts_us, force_key=force_key)
+                if res is None:
+                    return None
+                nal, is_key, _ms, out_ts = res
+                msg = pack_video(nal, out_ts, is_key, codec=self._encoder.codec_id)
+                if not self._send_msg(msg):
+                    return None
+                return frame, msg, True
+            jpeg, _ms = encode_bgr(bgr, 1.0, self._quality, self._target_width)
+            msg = pack_frame(jpeg, ts_us)
             if not self._send_msg(msg):
                 return None
-            return frame, msg, True
-        jpeg, _ms = encode_bgr(bgr, 1.0, self._quality, self._target_width)
-        msg = pack_frame(jpeg, ts_us)
-        if not self._send_msg(msg):
+            return frame, msg, False
+        except Exception as e:
+            # 第 4 条：编码/发送路径任何异常都不应静默杀死上传线程；跳过本帧并记日志
+            log.warning("频道[%s] 共享编码发送异常（已跳过本帧）: %s", self._name, e)
             return None
-        return frame, msg, False
 
     def _send_key_response(self, last_frame, last_packed, last_is_video):
         """静止/空闲期关键帧请求响应：视频=强制 IDR；JPEG=重发缓存帧。"""
@@ -248,11 +308,24 @@ class ScreenShareSession:
         self._send_msg(last_packed)  # JPEG：重发自包含缓存帧
 
     def _send_msg(self, msg):
-        """经共享写锁发送完整消息；失败置停止位（连接已断由 Channel 层善后）。"""
+        """经共享写锁发送完整消息；失败置停止位（连接已断由 Channel 层善后）。
+
+        第 96 条：sendall 必须有界，否则死连接上会无限阻塞、拖垮 stop() 的 join
+        （见第 97 条）；但本 socket 同时被接收线程 select/recv 复用，viewer 已特意
+        置回阻塞（None，viewer.py:294）。旧实现每帧 settimeout(5.0) 且从不还原 →
+        跨线程未同步地永久改掉共享 socket 的超时不变量（_stop_share 后仍停在 5.0）。
+        改为：在写锁内保存原超时、仅为本次 sendall 临时设 5.0、finally 还原。超时只
+        在 sendall 期间生效，发送之间恢复阻塞；接收线程 select 门控 recv 不受影响，
+        其它发送方（ping/req_keyframe）也回到 viewer 设定的阻塞基线。
+        """
         try:
             with self._tx:
-                self._sock.settimeout(5.0)
-                self._sock.sendall(msg)
+                prev = self._sock.gettimeout()
+                try:
+                    self._sock.settimeout(5.0)
+                    self._sock.sendall(msg)
+                finally:
+                    self._sock.settimeout(prev)
             return True
         except OSError as e:
             log.warning("频道[%s] 共享发送失败，已停止: %s", self._name, e)

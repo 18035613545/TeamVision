@@ -37,9 +37,13 @@ from PIL import ImageChops, ImageGrab, ImageStat
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(ROOT, "config.json")
-PY = r"F:/conda/envs/fps-screen/python.exe"
+# 第 78 条：PY/PORT/坐标原先全硬编码，换机器或端口被占即失败。改为可被环境变量覆盖，
+# 默认值保持本机原配置不变（仍可用 fps-screen python 直接跑）。注意：坐标编码的是本机
+# 显示布局假设（无遮挡条带/不与采样点重叠），仅覆盖坐标不能让脚本在任意分辨率下正确运行
+# ——它本质是单机手动 GUI 验收工具（驱动真实鼠标、非 unittest discover 收集），并非 CI 用例。
+PY = os.environ.get("E2E_PYTHON", r"F:/conda/envs/fps-screen/python.exe")
 HOST = PY  # 调用方须用 fps-screen python 运行本脚本
-PORT = 5792
+PORT = int(os.environ.get("E2E_PORT", "5792"))
 APP_TITLE = "SakuraVision"
 
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
@@ -47,8 +51,8 @@ SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0010
 MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
 SW_HIDE, SW_SHOW = 0, 5
 
-PANEL_POS = (989, 60)   # 两 viewer 面板共用此屏位（右侧无遮挡条带），交互前置顶
-B_FLOAT_POS = (60, 620)  # B 悬浮窗停靠位（左下，置顶可见，不与面板/采样点重叠）
+PANEL_POS = tuple(int(v) for v in os.environ.get("E2E_PANEL_POS", "989,60").split(","))   # 两 viewer 面板共用此屏位（右侧无遮挡条带），交互前置顶
+B_FLOAT_POS = tuple(int(v) for v in os.environ.get("E2E_B_FLOAT_POS", "60,620").split(","))  # B 悬浮窗停靠位（左下，置顶可见，不与面板/采样点重叠）
 
 u32 = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
@@ -547,6 +551,14 @@ def dump_failure(e):
 def main():
     print("== E2E multiview: 备份并改写 config.json ==", flush=True)
     backup = CONFIG + ".e2e_bak"
+    # 第 77 条：原 shutil.copy2(CONFIG, backup) 不在 try 内，全新克隆（config.json
+    # 未跟踪、不存在）会直接抛 FileNotFoundError 崩在这里（_run 读 CONFIG 同样会崩）。
+    # 改为先判存在并给出可操作提示，避免丑陋 traceback。
+    if not os.path.exists(CONFIG):
+        print("config.json 不存在（全新克隆？）。本测试需基于既有配置运行；"
+              "请先启动一次 fps-host.exe / fps-viewer.exe 生成默认 config.json 后重试。",
+              flush=True)
+        sys.exit(2)
     shutil.copy2(CONFIG, backup)
     code = 1
     try:
@@ -565,12 +577,23 @@ def main():
                 p.kill()
             except Exception:
                 pass
+        restored = False
         try:
             if os.path.exists(backup):
                 shutil.copy2(backup, CONFIG)
+                restored = True
                 print("config.json 已恢复原状", flush=True)
         except Exception as e:
             print("config.json 恢复失败: %s" % e, flush=True)
+        # 第 77 条：仅在确认恢复成功后删除备份——备份含明文 frp token，不应长期留在仓库目录；
+        # 恢复失败时保留备份，作为手动还原的唯一副本。（SIGKILL/断电无法在进程内兜底，
+        # 但此时 gitignored 的 .e2e_bak 仍在磁盘上，可手动还原。）
+        if restored:
+            try:
+                os.remove(backup)
+                print("已删除临时备份 config.json.e2e_bak", flush=True)
+            except Exception as e:
+                print("临时备份删除失败（可手动删除 config.json.e2e_bak）: %s" % e, flush=True)
     sys.exit(code)
 
 
@@ -735,15 +758,12 @@ def _run():
         evidence.append("%s:%s -> %s" % (tag, pat, bool(m)))
     print("证据行:", "；".join(evidence), flush=True)
 
-    fails = [d for st, d in results if st == "FAIL"]
+    # 第 78 条：本脚本是「快速失败」设计——任一步骤不达标即 raise AssertionError，由 main()
+    # 捕获并以退出码 1 表达失败；results 只会被 append "PASS"，从无 "FAIL"。故能执行到此处即
+    # 代表全部步骤通过。原先的 fails 过滤 / RESULT:FAIL 分支 / return False 永不可达，是死代码，已移除。
     print("=" * 60, flush=True)
-    if not fails:
-        print("RESULT: PASS（%d 项） 日志目录 %s" % (len(results), LOG_DIR), flush=True)
-        return True
-    print("RESULT: FAIL（%d 项失败） 日志目录 %s" % (len(fails), LOG_DIR), flush=True)
-    for d in fails:
-        print("  FAIL: %s" % d, flush=True)
-    return False
+    print("RESULT: PASS（%d 项） 日志目录 %s" % (len(results), LOG_DIR), flush=True)
+    return True
 
 
 def assert_changed(c0, c1, desc, results):

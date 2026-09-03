@@ -60,6 +60,9 @@ def list_monitors():
 class HostConsole:
     """共享端图形控制台窗口。"""
 
+    #: 日志区最大保留行数（第 58 条）：超出从顶部删除，避免多小时会话 Tcl text 内存无上限增长
+    _MAX_LOG_LINES = 2000
+
     def __init__(self, runtime):
         self.runtime = runtime
         self.monitors = list_monitors()
@@ -73,7 +76,8 @@ class HostConsole:
         self._log_handler = _LogQueueHandler()
         logging.getLogger(logger_mod.LOGGER_NAME).addHandler(self._log_handler)
         self.root.after(250, self._drain_log)
-        self.root.after(500, self._poll)
+        # 第 37 条：_poll() 自身会 after(500) 重排，这里不再额外排一次，避免双刷新链
+        # （旧实现客户端表格每 500ms 被全删全建两次 → 可见闪烁 + 与推流线程抢锁翻倍）。
         self._poll()
 
     # ---------- 界面搭建 ----------
@@ -193,18 +197,16 @@ class HostConsole:
 
         # ---------- 客户端区 ----------
         client_card = self._card(self.root, "已连接观看端")
-        tree = ttk.Treeview(client_card, columns=("user", "addr", "uptime", "rtt", "rate", "total"),
+        tree = ttk.Treeview(client_card, columns=("user", "addr", "uptime", "rate", "total"),
                             show="headings", height=4)
         tree.heading("user", text="用户")
         tree.heading("addr", text="地址")
         tree.heading("uptime", text="已连接")
-        tree.heading("rtt", text="延迟")
         tree.heading("rate", text="速率")
         tree.heading("total", text="累计流量")
         tree.column("user", width=80, minwidth=60, stretch=False, anchor="center")
         tree.column("addr", width=150, stretch=True)
         tree.column("uptime", width=70, stretch=False, anchor="center")
-        tree.column("rtt", width=60, stretch=False, anchor="center")
         tree.column("rate", width=80, stretch=False, anchor="center")
         tree.column("total", width=90, stretch=False, anchor="center")
         tree.pack(fill="x", padx=10, pady=(2, 8))
@@ -255,8 +257,9 @@ class HostConsole:
         footer = tk.Frame(self.root, bg=COL_BG)
         footer.pack(fill="x", padx=14, pady=(4, 12))
         self._status_var = tk.StringVar(value="就绪")
-        tk.Label(footer, textvariable=self._status_var, bg=COL_BG, fg=COL_DIM,
-                 font=("Microsoft YaHei", 9)).pack(side="left")
+        self._status_label = tk.Label(footer, textvariable=self._status_var, bg=COL_BG,
+                                      fg=COL_DIM, font=("Microsoft YaHei", 9))
+        self._status_label.pack(side="left")
         self._button(footer, "退出", self._on_quit, accent=True).pack(side="right")
 
     # ---------- 工具 ----------
@@ -288,7 +291,7 @@ class HostConsole:
         # 顶部地址编辑后也同步到配置与 frpc 区，避免只复制不保存
         frp = self.runtime.cfg["host"].setdefault("frp", {})
         frp["public_addr"] = addr
-        save_config(self.runtime.cfg)
+        save_config(self.runtime.cfg, "host")
         self._frp_addr_var.set(addr)
         self.root.clipboard_clear()
         self.root.clipboard_append(addr)
@@ -300,7 +303,7 @@ class HostConsole:
         frp["token"] = self._frp_token_var.get().strip()
         frp["tunnel_ids"] = self._frp_tunnel_var.get().strip()
         frp["public_addr"] = self._frp_addr_var.get().strip()
-        save_config(self.runtime.cfg)
+        save_config(self.runtime.cfg, "host")
         ok, msg = self.runtime.frp.start()
         self._set_status(msg, error=not ok)
 
@@ -319,14 +322,18 @@ class HostConsole:
         if txt:
             try:
                 parts = [int(x.strip()) for x in txt.replace("，", ",").split(",")]
-                if len(parts) == 4 and all(p >= 0 for p in parts):
+                # 第 33 条：宽/高必须为正，否则 0,0,0,0 之类会让 mss 每帧抛错、画面冻结
+                if (len(parts) == 4 and parts[0] >= 0 and parts[1] >= 0
+                        and parts[2] > 0 and parts[3] > 0):
                     region = {"left": parts[0], "top": parts[1],
                               "width": parts[2], "height": parts[3]}
                 else:
-                    self._set_status("区域格式错误：应为 左,上,宽,高（4 个非负整数）", error=True)
+                    self._set_status(
+                        "区域格式错误：应为 左,上,宽,高（左/上≥0，宽/高须为正整数）", error=True)
                     return
             except Exception:
-                self._set_status("区域格式错误：应为 左,上,宽,高（4 个非负整数）", error=True)
+                self._set_status(
+                    "区域格式错误：应为 左,上,宽,高（左/上≥0，宽/高须为正整数）", error=True)
                 return
         backend = self._backend_var.get().strip().lower() or "mss"
         self.runtime.update_capture(monitor=monitor, region=region, backend=backend)
@@ -359,7 +366,7 @@ class HostConsole:
         host["scale"] = scale
         host.setdefault("perf", {})["adaptive"] = bool(self._adaptive_var.get())
         host.setdefault("auth", {})["enabled"] = bool(self._auth_var.get())
-        save_config(self.runtime.cfg)
+        save_config(self.runtime.cfg, "host")
         with self.runtime.slot_lock:
             self.runtime.slot["fps"] = fps
             self.runtime.slot["quality"] = quality
@@ -378,41 +385,67 @@ class HostConsole:
 
     def _set_status(self, text, error=False):
         self._status_var.set(text)
+        # 第 34 条：error=True 时状态文字标红，让校验失败与成功提示在外观上可区分
+        try:
+            self._status_label.configure(fg=COL_OFFLINE if error else COL_DIM)
+        except Exception:
+            pass
 
     # ---------- 轮询刷新 ----------
 
     def _drain_log(self):
+        # 第 38 条：insert/see 的 TclError 不再逃逸中断日志链（旧实现只捕 queue.Empty）；
+        # 第 58 条：超过 _MAX_LOG_LINES 行从顶部删除，防多小时会话 Tcl text 内存无上限增长。
         try:
             while True:
-                line = self._log_handler.queue.get_nowait()
+                try:
+                    line = self._log_handler.queue.get_nowait()
+                except queue.Empty:
+                    break
                 self._log_text.configure(state="normal")
                 self._log_text.insert("end", line + "\n")
+                line_count = int(self._log_text.index("end-1c").split(".")[0])
+                if line_count > self._MAX_LOG_LINES:
+                    self._log_text.delete(
+                        "1.0", "%d.0" % (line_count - self._MAX_LOG_LINES + 1))
                 self._log_text.see("end")
                 self._log_text.configure(state="disabled")
-        except queue.Empty:
-            pass
-        try:
-            self.root.after(250, self._drain_log)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("日志区刷新忽略: %s", e)
+        finally:
+            try:
+                self.root.after(250, self._drain_log)
+            except Exception:
+                pass
 
     def _poll(self):
+        # 第 38 条：_refresh 移入 try、重排放入 finally——一次刷新异常不再让轮询链永久停摆
+        # （旧实现 _refresh 在 try 外抛错后 after 不执行，控制台从此停在旧值，看似卡死）。
         try:
             snap = self.runtime.get_snapshot()
+            if snap is not None:
+                self._refresh(snap)
         except Exception as e:
-            snap = None
-            log.warning("状态快照失败: %s", e)
-        if snap is not None:
-            self._refresh(snap)
-        try:
-            self.root.after(500, self._poll)
-        except Exception:
-            pass
+            log.warning("状态刷新失败: %s", e)
+        finally:
+            try:
+                self.root.after(500, self._poll)
+            except Exception:
+                pass
 
     def _refresh(self, snap):
-        # 服务状态
-        self._srv_status.configure(text="监听 0.0.0.0:%d · 已启动 · 准入%s" % (
-            snap["port"], "开启" if snap["auth_enabled"] else "关闭"))
+        # 服务状态（第 18 条：绑定失败时显示真实错误，不再无条件报“已启动”）
+        if snap.get("startup_error"):
+            self._srv_status.configure(
+                text="服务启动失败：%s" % snap["startup_error"], fg=COL_OFFLINE)
+        elif snap.get("server_up"):
+            self._srv_status.configure(
+                text="监听 %s:%d · 已启动 · 准入%s" % (
+                    snap.get("bound_addr", "0.0.0.0"),
+                    snap["port"], "开启" if snap["auth_enabled"] else "关闭"),
+                fg=COL_ONLINE)
+        else:
+            self._srv_status.configure(text="服务未启动", fg=COL_DIM)
         # frpc 状态
         if snap["frp_running"]:
             self._frp_status.configure(text="运行中", fg=COL_ONLINE)
@@ -422,12 +455,10 @@ class HostConsole:
         tree = self._client_tree
         tree.delete(*tree.get_children())
         for i, c in enumerate(snap["clients"]):
-            rtt_ms = c.get("rtt_ms") or 0
             tree.insert("", "end", iid=str(i), values=(
                 c.get("username") or "—",
                 c["addr"],
                 self._fmt_uptime(c["uptime_s"]),
-                "%.0f ms" % rtt_ms if rtt_ms > 0 else "-",
                 "%.0f KB/s" % c["rate_kbps"],
                 "%.1f MB" % c["total_mb"],
             ))

@@ -1,9 +1,17 @@
-mss>=9.0.1
-opencv-python>=4.8.1
-numpy>=1.24.0
-pillow>=10.0.0
-pywin32>=306
+# 第 70 条：原文件全是无上限的 `>=`，全新环境装出来是「ABI 轮盘赌」——
+# 典型如 numpy>=1.24 允许 2.x 配 opencv-python>=4.8.1，而 4.10 之前的 opencv wheel
+# 与 numpy 2.x 不兼容，冻结/源码运行都可能崩在 import。这里给每个依赖补上下限+上限，
+# 下限锚定到与实测兼容的版本、上限挡住下一个大版本（破坏性变更通常发生在大版本）。
+# 注释里的「实测」= 本项目实际跑通 H.264/NVENC 的 fps-screen 环境版本（2026-09-03）。
+mss>=9.0.1,<11              # 实测 10.2.0
+opencv-python>=4.10,<6      # 实测 5.0.0.93；>=4.10 是首个提供 numpy2 兼容 wheel 的系列
+numpy>=1.26,<3              # 实测 2.2.6；与 opencv>=4.10 配对安全
+pillow>=10.0.0,<13          # 实测 12.3.0
+pywin32>=306,<400           # 实测 312
 # H.264 视频编码（host.codec.encoder!="jpeg"）：NVENC 硬件/x264 软件，带宽比 JPEG 降 5-20 倍
-av>=12.0.0
-# 可选：DXGI 硬件采集后端（host.capture.backend="dxgi"），游戏独占全屏场景建议安装
-dxcam>=0.0.5
+av>=12.0.0,<18              # 实测 17.1.0
+# 可选 DXGI 硬件采集后端（host.capture.backend="dxgi"）：dxcam **不从 PyPI 装**。
+# PyPI 上的 dxcam 只有滞后的 0.0.5，与项目实测/已 vendor 的 0.3.0（GitHub ra1nty/DXcam）
+# 不是同一个东西；`pip install dxcam` 会把错的 0.0.5 装进 conda。dxcam 与其依赖 comtypes
+# 一律按 docs/部署操作文档.md §7.3/§7.4 的 vendoring 步骤离线装入 .\vendor（--no-deps）。
+# 因此这里不列 dxcam/comtypes——实测 conda 环境本就不含二者（dxgi 由 vendor 提供）。

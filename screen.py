@@ -30,7 +30,10 @@ def downsample_frame(bgr, step=STILL_STEP):
 def motion_changed(ref, cur, point_thr=10, ratio_thr=0.005):
     """判定两帧抽稀图之间是否有“有效变化”，返回 (changed, 最新参考小图)。
 
-    变点：采样点三通道平均绝对差 > point_thr；变点占比 > ratio_thr 判定有变化。
+    变点：逐通道绝对差 > point_thr 的「通道元素」计数；该计数占全部通道元素
+    （H×W×3）的比例 > ratio_thr 判定有变化。第 87 条：实际按**通道元素**而非像素
+    计数——单通道变化的像素只贡献 1/3，故 ratio_thr 比「按像素」语义严格约 3 倍
+    （旧 docstring 误称“三通道平均绝对差”，与 count_nonzero(diff>thr)/diff.size 不符，已更正）。
     参考图仅在判定有变化（或形状不匹配）时更新：缓慢渐变会因累计帧差自动触发，
     无需定期刷新。异常按“有变化”处理（错误取向=宁可多发一帧，不可画面冻结）。
     """
@@ -44,18 +47,20 @@ def motion_changed(ref, cur, point_thr=10, ratio_thr=0.005):
     return False, ref
 
 
-def still_gate_update(in_still, quiet_since, changed, now, quiet_ms):
-    """静止闸门状态机：连续无变化满 quiet_ms 判定静止；任何变化帧立即复位并恢复发送。
+def still_gate_update(in_still, quiet_since, changed, now, quiet_s):
+    """静止闸门状态机：连续无变化满 quiet_s（秒）判定静止；任何变化帧立即复位并恢复发送。
 
     返回 (in_still, quiet_since)。quiet_since = 最近一次变化帧之后的连续无变化起始
     时刻（None = 上一帧有变化）。仅“连续”无变化累计：打字/低频更新等间歇内容不会
     因零星停顿跨帧累计误入静止；时刻需与调用方同一单调时钟（time.perf_counter）。
+    第 87 条：本参数单位是**秒**（与 perf_counter 同单位）；旧名 quiet_ms 名不副实，
+    若按毫秒传值闸门会灵敏 1000 倍，故更名 quiet_s 消除歧义。
     """
     if changed:
         return False, None
     if quiet_since is None:
         quiet_since = now
-    elif not in_still and now - quiet_since >= quiet_ms:
+    elif not in_still and now - quiet_since >= quiet_s:
         in_still = True
     return in_still, quiet_since
 
@@ -63,13 +68,16 @@ def still_gate_update(in_still, quiet_since, changed, now, quiet_ms):
 def calc_output_size(src_w, src_h, scale, target_width=0):
     """计算实际编码输出尺寸：先按 scale 缩放，再受 target_width 上限压制。
 
-    target_width<=0 不压制；宽高向下对齐到偶数（H.264/HEVC 要求）。"""
+    target_width<=0 不压制；宽高向下对齐到偶数（H.264/HEVC 要求），且恒 >= 2，
+    避免 target_width=1 等极小值产生宽度 0 导致 cv2.resize 抛异常（第 88 条）。"""
     w = max(2, int(round(src_w * scale)))
     h = max(2, int(round(src_h * scale)))
     if target_width and target_width > 0 and w > target_width:
-        w = int(target_width)
+        w = max(2, int(target_width))
         h = max(2, int(round(src_h * w / src_w)))
-    return w - (w % 2), h - (h % 2)
+    w -= w % 2
+    h -= h % 2
+    return max(2, w), max(2, h)
 
 
 def encode_bgr(bgr, scale, quality, target_width=0):
@@ -134,8 +142,10 @@ class CaptureManager:
         self.close()
         self._open()
 
-    def effective_backend(self):
-        return self._effective
+    @property
+    def working(self):
+        """是否至少有一个可用采集后端；dxgi 与 mss 均失败时为 False（第 5 条）。"""
+        return self._camera is not None or self._mss is not None
 
     def grab(self):
         """采集一帧，返回 BGR numpy 数组；失败或无新帧返回 None。"""

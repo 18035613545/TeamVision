@@ -6,7 +6,7 @@
   encoder_sel 决定候选链：auto 自动优先硬件（HEVC→H.264），无硬件回退软件，
   hevc 显式优先 HEVC，nvenc/x264 保持 H.264 语义
 - 低延迟参数：无 B 帧、NVENC tune=ull/zerolatency + delay=0（每帧输入立即出包，
-  消除恒定 2 帧编码缓冲）、CBR 码率
+  消除恒定 2 帧编码缓冲）、码率控制（默认 VBR，可配 CBR）
 - 码率自适应（ABR）：set_bitrate() 变化超阈值时重建编码器，重建后首帧强制关键帧
   （顺带重置参考帧，避免解码端花屏）
 - 强制关键帧（关键帧请求）：frame.pict_type = I
@@ -59,10 +59,9 @@ _CODEC_BY_NAME = {
     "h264_nvenc": CODEC_H264, "libx264": CODEC_H264,
 }
 
-
-def av_available():
-    """PyAV 是否可用（提供 H.264/HEVC 编解码能力）。"""
-    return _AV_AVAILABLE
+#: 连续编码失败达到该次数后永久标记编码器不可用（available=False），
+#: 调用方据此回退逐帧 JPEG，避免「无限重建 + 自报健康 + 观看端永久定格」（第 6 条）
+_ENCODE_FAIL_LIMIT = 10
 
 
 class VideoEncoder:
@@ -72,7 +71,7 @@ class VideoEncoder:
     """
 
     def __init__(self, width, height, fps, bitrate, keyint=30,
-                 encoder_sel="auto", preset=""):
+                 encoder_sel="auto", preset="", rate_control="vbr"):
         self._w = int(width)
         self._h = int(height)
         self._fps = max(1, int(fps))
@@ -80,6 +79,7 @@ class VideoEncoder:
         self._keyint = max(1, int(keyint))
         self._encoder_sel = encoder_sel
         self._preset = (preset or "").strip()
+        self._rate_control = (rate_control or "vbr").strip().lower()
         self._ctx = None
         # 编码线程与 ABR 性能线程共享同一实例：用锁串行化 encode/set_bitrate/set_fps，
         # 避免并发重建上下文（set_bitrate 触发 _recreate）与编码操作互相踩踏
@@ -89,6 +89,9 @@ class VideoEncoder:
         self.frame_sent = 0      # 累计输出的帧数
         self._rebuilt_at_frame = 0  # 最近一次重建成功时的 frame_sent（用于判定关键帧是否需要重建）
         self._last_bitrate = 0
+        self._encode_failures = 0   # 连续编码失败计数（第 6 条：超限则永久标记不可用）
+        self._permafailed = False   # 编码器彻底失效，available 恒 False，调用方回退 JPEG
+        self._closed = False        # close() 后禁止 set_bitrate/encode 复活（第 52 条）
         self._recreate(self._bitrate)
 
     # ---------- 内部 ----------
@@ -111,21 +114,25 @@ class VideoEncoder:
         return usable
 
     def _build_options(self, name, bitrate):
-        """按编码器生成低延迟 + CBR 选项。"""
+        """按编码器生成低延迟 + 码率控制选项（NVENC 默认 VBR，可配 CBR）。"""
         b = max(64, int(bitrate))
         bufsize = max(128, int(b * 0.5))
         if name in ("h264_nvenc", "hevc_nvenc"):
             preset = self._preset or _NVENC_PRESET
+            rc = self._rate_control if self._rate_control in ("cbr", "vbr") else "vbr"
+            maxrate = str(b) if rc == "cbr" else str(int(b * 1.5))
+            bufsize = str(b) if rc == "cbr" else str(b)
             return {
                 "preset": preset,
                 "tune": "ull",
                 "zerolatency": "1",
                 "delay": "0",  # 关闭编码器帧缓冲：每帧输入立即出包，消除恒定 2 帧延迟
                 "repeat_headers": "1",  # 每个关键帧前重复 SPS/PPS：观看端重连/重建解码器后可从任意关键帧起解
-                "rc": "cbr",
+                "forced-idr": "1",  # 让 pict_type=I 在既有上下文上原地产生真 IDR，无需重建编码器（第 47 条）
+                "rc": rc,
                 "b": str(b),
-                "maxrate": str(b),
-                "bufsize": str(bufsize),
+                "maxrate": maxrate,
+                "bufsize": bufsize,
             }
         if name == "libx265":
             preset = self._preset or _X265_PRESET
@@ -134,8 +141,11 @@ class VideoEncoder:
                 "b": str(b),
                 "maxrate": str(b),
                 "bufsize": str(bufsize),
+                # frame-threads=1：消除 libx265 的 4 帧流水线延迟。实测未加时首包要到第 4
+                # 次 encode() 输入才出现（≈133ms@30fps），且 _close_ctx 不 drain 会扔掉这 4 帧；
+                # 加上后首包提前到第 0 次输入、每帧立即出包、重建时管线残留归零。
                 "x265-params": (
-                    "keyint=%d:min-keyint=%d:scenecut=0:bframes=0:rc-lookahead=0"
+                    "keyint=%d:min-keyint=%d:scenecut=0:bframes=0:rc-lookahead=0:frame-threads=1"
                     % (self._keyint, self._keyint)),
             }
         preset = self._preset or _X264_PRESET
@@ -168,6 +178,8 @@ class VideoEncoder:
 
     def _recreate(self, bitrate):
         """关闭旧上下文并按新码率重建；返回是否成功。"""
+        if self._permafailed or self._closed:
+            return False
         self._close_ctx()
         self._last_bitrate = int(bitrate)
         names = self._pick_encoder()
@@ -184,12 +196,17 @@ class VideoEncoder:
         return False
 
     def _close_ctx(self):
-        if self._ctx is not None:
-            try:
-                self._ctx.close()
-            except Exception:
-                pass
-            self._ctx = None
+        # PyAV 17 的 CodecContext 没有 close()：先解引用让 GC 释放 NVENC 会话，
+        # 仅当底层确实提供 close 时才调用（兼容旧版 PyAV），不再假装关闭。
+        ctx = self._ctx
+        self._ctx = None
+        if ctx is not None:
+            close = getattr(ctx, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
     # ---------- 对外 ----------
 
@@ -197,7 +214,7 @@ class VideoEncoder:
     def available(self):
         """当前是否有可用的视频编码器。"""
         with self._lock:
-            return self._ctx is not None
+            return self._ctx is not None and not self._permafailed
 
     @property
     def bitrate(self):
@@ -226,15 +243,15 @@ class VideoEncoder:
         - raw_ts：采集时刻微秒，透传为该帧 packet.pts（含编码缓冲延迟的精确时间戳）
         - force_key：强制本帧为关键帧（关键帧请求/重建后重置参考帧响应）。
 
-        NVENC 等硬件编码器无法在既有上下文上用 pict_type 强制 IDR，故强制关键帧时
-        若上下文已编码过帧则重建（重建后首帧必为 IDR 且带 SPS/PPS），保证观看端
-        任何时刻重连/请求关键帧都能起解；软件编码器（x264/x265）仍用 pict_type 兜底。
+        强制关键帧通过 NVENC 的 forced-idr=1 选项 + frame.pict_type=I 在既有上下文上
+        原地产生真 IDR（实测支持），无需重建编码器；软件编码器（x264/x265）同样用
+        pict_type=I 兜底。重建只发生在帧尺寸变化或码率调整超阈值时。
         """
         with self._lock:
             return self._encode_locked(bgr, raw_ts, force_key)
 
     def _encode_locked(self, bgr, raw_ts=None, force_key=False):
-        if self._ctx is None:
+        if self._closed or self._permafailed or self._ctx is None:
             return None
         if bgr is None or bgr.size == 0:
             return None
@@ -246,11 +263,8 @@ class VideoEncoder:
             self._recreate(self._last_bitrate)
             if self._ctx is None:
                 return None
-        if force_key and self.frame_sent > self._rebuilt_at_frame:
-            # 旧上下文无法可靠强制 IDR：重建后首帧即关键帧（H.264/HEVC NVENC 通用）
-            self._recreate(self._last_bitrate)
-            if self._ctx is None:
-                return None
+        # 第 47 条：forced-idr=1 已让 pict_type=I 在既有上下文上原地产生真 IDR，
+        # 无需为强制关键帧重建编码器（重建带来 93-110ms NVENC 拆装 + 码率尖峰自激振荡）
         start = time.perf_counter()
         try:
             frame = av.VideoFrame.from_ndarray(bgr, format="bgr24")
@@ -258,12 +272,23 @@ class VideoEncoder:
             if force_key:
                 frame.pict_type = PictureType.I
             pkts = list(self._ctx.encode(frame))
-        except Exception:
-            # 编码异常（如驱动错误）：尝试重建后放弃本帧，避免卡死
+        except Exception as e:
+            # 第 6 条：连续编码失败计数；超限则永久标记不可用并回退 JPEG，
+            # 不再无限重建（原行为：每次异常都重建且 available 恒 True → 观看端永久定格）
+            self._encode_failures += 1
+            if self._encode_failures >= _ENCODE_FAIL_LIMIT:
+                self._permafailed = True
+                self._close_ctx()
+                self.name = ""
+                log_note("视频编码器连续 %d 次编码失败，永久标记不可用并回退 JPEG: %s"
+                         % (self._encode_failures, e))
+                return None
             self._recreate(self._last_bitrate)
             return None
         if not pkts:
+            # pre-roll（如 libx265 流水线延迟）：本帧无输出，不计入失败
             return None
+        self._encode_failures = 0
         encode_ms = (time.perf_counter() - start) * 1000.0
         pkt = pkts[-1]  # 低延迟下每次 encode 至多输出一帧；取最新
         self.frame_sent += 1
@@ -282,12 +307,15 @@ class VideoEncoder:
         """
         bps = max(64, int(bps))
         with self._lock:
+            if self._closed or self._permafailed:
+                return False  # 第 52 条：已关闭/已失效，禁止复活
             if self._ctx is not None and abs(bps - self._last_bitrate) <= self._last_bitrate * hysteresis:
                 return False
             return self._recreate(bps)
 
     def close(self):
         with self._lock:
+            self._closed = True
             self._close_ctx()
             self.name = ""
 
@@ -307,6 +335,11 @@ class VideoDecoder:
 
     def _decoder_name(self):
         return {CODEC_H264: "h264", CODEC_HEVC: "hevc"}.get(self._codec, "h264")
+
+    @property
+    def available(self):
+        """解码器上下文是否可用（缺 PyAV 或打开失败时为 False，第 11 条）。"""
+        return self._ctx is not None
 
     def _init_ctx(self):
         if not _AV_AVAILABLE:

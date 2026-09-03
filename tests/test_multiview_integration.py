@@ -204,6 +204,12 @@ class TestHubMultiView(unittest.TestCase):
             b.sendall(pack_video(b"KEY", keyframe=True, codec=CODEC_H264))
             recv_kinds(a, timeout=2.0)
             send_msg(a, {"action": "watch", "source": "peer:1"})
+            # 同步点：host 处理 alice 的 watch 时，先置 watch_source=peer:1 再向成员
+            # bob 转达 req_keyframe（host.py watch 分支，同线程顺序保证）。排空 bob 的
+            # 这条 req_keyframe 即确认 alice 已订阅 peer:1，再让 bob 发 JPEG；否则 watch
+            # 与 JPEG 分属 host 两个线程、无先后保证，满载套件下 JPEG 可能在 alice 仍为
+            # local 时被路由而丢弃 → 偶发收不到（与 test_watch_peer_* 同款同步手法）。
+            recv_kinds(b, timeout=2.0)
             # need_key 尚未满足时 JPEG 直达
             b.sendall(pack_frame(_jpeg()))
             msgs = recv_kinds(a, timeout=3.0)
@@ -267,6 +273,52 @@ class TestHubMultiView(unittest.TestCase):
                             "watch 无效源后仍应接收 local 帧")
         finally:
             a.close()
+
+    def test_watch_invalid_source_emits_reject(self):
+        """第 9 条：无效源不再只写 debug 日志，而是回 watch_reject(reason=invalid)，
+        让观看端立即回落而非谎报「源:队友·X」；local 帧仍照常下发。"""
+        a = join_hub(self.hub.port, name="alice")
+        try:
+            send_msg(a, {"action": "watch", "source": "peer:99"})
+            msgs = recv_kinds(a, timeout=4.0)
+            rejects = [m for m in ctrls(msgs) if m.get("action") == "watch_reject"]
+            self.assertTrue(rejects, "无效源应收到 watch_reject 回包")
+            self.assertEqual(rejects[0].get("source"), "peer:99")
+            self.assertEqual(rejects[0].get("reason"), "invalid")
+            self.assertTrue(any(k == MSG_FRAME for k, _ in msgs),
+                            "回绝的同时仍应继续接收 local 帧")
+        finally:
+            a.close()
+
+    def test_watch_self_emits_reject(self):
+        """第 9 条：成员订阅自身 share_id → watch_reject(reason=self)。此前只 log.debug，
+        而自身仍在 roster，观看端离线回落永不触发 → 状态栏永不自纠。"""
+        b = join_hub(self.hub.port, name="bob")
+        try:
+            b.sendall(pack_video(b"KEY", keyframe=True, codec=CODEC_H264))
+            recv_kinds(b, timeout=2.0)  # 排空 roster/local，确认已登记为 peer:1
+            send_msg(b, {"action": "watch", "source": "peer:1"})  # 订阅自身
+            msgs = recv_kinds(b, timeout=3.0)
+            rejects = [m for m in ctrls(msgs) if m.get("action") == "watch_reject"]
+            self.assertTrue(rejects, "订阅自身应收到 watch_reject 回包")
+            self.assertEqual(rejects[0].get("source"), "peer:1")
+            self.assertEqual(rejects[0].get("reason"), "self")
+        finally:
+            b.close()
+
+    def test_watch_valid_source_no_reject(self):
+        """第 9 条阳性对照：合法 peer 源走接受分支，绝不回 watch_reject。"""
+        a = join_hub(self.hub.port, name="alice")
+        b = join_hub(self.hub.port, name="bob")
+        try:
+            b.sendall(pack_video(b"KEY", keyframe=True, codec=CODEC_H264))
+            recv_kinds(a, timeout=2.0)  # 排空 roster，确认 peer:1 在册
+            send_msg(a, {"action": "watch", "source": "peer:1"})
+            msgs = recv_kinds(a, timeout=2.0)
+            rejects = [m for m in ctrls(msgs) if m.get("action") == "watch_reject"]
+            self.assertEqual(rejects, [], "合法源不应被回绝")
+        finally:
+            a.close(); b.close()
 
     def test_req_keyframe_routes_to_watched_peer(self):
         a = join_hub(self.hub.port, name="alice")

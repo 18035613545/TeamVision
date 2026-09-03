@@ -15,6 +15,9 @@ dist/
 # ---- 运行期生成 / 可能含凭据 ----
 logs/
 config.json
+# 第 77 条：e2e_multiview.py 会把真实 config.json 备份成 config.json.e2e_bak，
+# 其中可能含明文 frp token；必须忽略，否则 git add -A 会把 token 提交进仓库。
+*.e2e_bak
 accounts.json
 frpc.exe
 

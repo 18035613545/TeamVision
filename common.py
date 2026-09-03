@@ -51,8 +51,11 @@ APP_COPYRIGHT = "Copyright © 2026 SakuraVision Team"
 #: 配置读写全局锁（防止多线程同时 save_config 导致丢失更新）
 _config_lock = threading.Lock()
 
-#: 单条消息 payload 长度上限（64MB，含帧 JPEG 与控制消息，防恶意长度头）
-MAX_PAYLOAD = 64 * 1024 * 1024
+#: 单条消息 payload 长度上限（32MB，含帧 JPEG 与控制消息，防恶意长度头）。
+#: 第 57 条：原 64MB 远高于任何合法帧——8K/33MP 满熵 JPEG 约 8~15MB，H.264/HEVC
+#: 关键帧 <1MB，控制 JSON <1MB。降到 32MB 仍留足余量，同时把每连接最坏缓冲内存
+#: 直接砍半（解析在攒满声明长度前不会返回，长度头越大占用越久）。
+MAX_PAYLOAD = 32 * 1024 * 1024
 
 #: 默认配置
 DEFAULT_CONFIG = {
@@ -110,7 +113,9 @@ DEFAULT_CONFIG = {
         },
         "auth": {
             "enabled": False,  # 默认关闭准入（向后兼容）：旧客户端/无配置环境可直接观看
-            "auth_timeout": 60
+            # 认证阶段「总时限」（第 23 条防 slowloris）；须大于观看端登录框等待（120s），
+            # 否则用户还在输入 host 就先断开、明明输对却登录失败（第 31 条）。
+            "auth_timeout": 150
         }
     },
     "viewer": {
@@ -119,6 +124,7 @@ DEFAULT_CONFIG = {
         "alpha": 0.9,
         "click_through": True,
         "channels": [],
+        "wizard_done": False,
         "panel_topmost": True,
         "hotkeys": {
             "direct": True
@@ -208,60 +214,26 @@ def parse_message(buf):
         raise ValueError("非法消息长度: %d" % length)
     if len(buf) < 5 + length:
         return 0, None, None
-    return 5 + length, kind, buf[5:5 + length]
+    # 第 57 条：rx_buf 改用 bytearray 后切片会是 bytearray，而 pack_video/pack_frame
+    # 做 bytes(...) + payload，bytes + bytearray 抛 TypeError。统一转 bytes，保证
+    # 中继路径（host 转发上行帧）与缓冲区类型无关。
+    return 5 + length, kind, bytes(buf[5:5 + length])
 
 
-def recv_msg(sock):
-    """接收一条控制消息并解析为 dict；连接关闭/数据不完整/收到帧时抛异常。"""
-    header = recv_exact(sock, 5)
+def recv_msg(sock, deadline=None):
+    """接收一条控制消息并解析为 dict；连接关闭/数据不完整/收到帧时抛异常。
+
+    deadline 给定时，整条消息（头 + 体）的接收受总时限约束（第 23 条防 slowloris）。
+    """
+    header = recv_exact(sock, 5, deadline)
     kind = header[0]
     if kind != MSG_CTRL:
         raise ConnectionError("预期控制消息，实际收到消息类型 %d" % kind)
     (length,) = struct.unpack(">I", header[1:5])
     if length <= 0 or length > MAX_PAYLOAD:
         raise ConnectionError("非法的控制消息长度: %d" % length)
-    data = recv_exact(sock, length)
+    data = recv_exact(sock, length, deadline)
     return json.loads(data.decode("utf-8"))
-
-
-def recv_frame(sock):
-    """接收一帧消息，返回 (时间戳微秒, JPEG 字节)；收到控制消息时抛异常。"""
-    header = recv_exact(sock, 5)
-    kind = header[0]
-    if kind != MSG_FRAME:
-        raise ConnectionError("预期画面帧，实际收到消息类型 %d" % kind)
-    (length,) = struct.unpack(">I", header[1:5])
-    if length < 8 or length > MAX_PAYLOAD:
-        raise ConnectionError("非法的帧长度: %d" % length)
-    data = recv_exact(sock, length)
-    (ts,) = struct.unpack(">Q", data[:8])
-    return ts, data[8:]
-
-
-def recv_message(sock):
-    """接收任意消息，返回 ("frame", ts, jpeg) / ("video", payload, None) / ("ctrl", obj, None)。
-
-    供复用流逐条解析三种消息类型；video payload 为原始视频帧 payload（含 ts/flags/NAL），
-    调用方用 parse_video 解包。
-    """
-    header = recv_exact(sock, 5)
-    kind = header[0]
-    (length,) = struct.unpack(">I", header[1:5])
-    if kind not in (MSG_FRAME, MSG_CTRL, MSG_VIDEO):
-        raise ConnectionError("非法的消息类型: %d" % kind)
-    if length <= 0 or length > MAX_PAYLOAD:
-        raise ConnectionError("非法的消息长度: %d" % length)
-    payload = recv_exact(sock, length)
-    if kind == MSG_FRAME:
-        if length < 8:
-            raise ConnectionError("帧 payload 不足 8 字节")
-        (ts,) = struct.unpack(">Q", payload[:8])
-        return "frame", ts, payload[8:]
-    if kind == MSG_VIDEO:
-        if length < 10:
-            raise ConnectionError("视频帧 payload 不足 10 字节")
-        return "video", payload, None
-    return "ctrl", json.loads(payload.decode("utf-8")), None
 
 
 def tune_socket(sock, sndbuf=None, rcvbuf=None, keepalive=True, keepalive_idle=60):
@@ -290,20 +262,38 @@ def tune_socket(sock, sndbuf=None, rcvbuf=None, keepalive=True, keepalive_idle=6
         except OSError:
             keepalive_idle = 0
         if keepalive_idle > 0:
-            for optname, default in (("TCP_KEEPIDLE", None), ("TCP_KEEPINTVL", None),
-                                     ("TCP_KEEPCNT", None)):
+            # 第 59 条：三个选项语义不同，不能全取 keepalive_idle。
+            # KEEPIDLE=首次探测前空闲秒数；KEEPINTVL=探测间隔；KEEPCNT=探测次数。
+            # 原 `default or keepalive_idle`（default 恒 None）使 INTVL=CNT=60，
+            # 需约 1 小时才判定半开连接。改为 idle + 3 次 × ~10 秒间隔 ≈ 90 秒内判定。
+            intvl = max(1, int(keepalive_idle) // 6)
+            cnt = 3
+            for optname, value in (("TCP_KEEPIDLE", int(keepalive_idle)),
+                                   ("TCP_KEEPINTVL", intvl),
+                                   ("TCP_KEEPCNT", cnt)):
                 if hasattr(socket, optname):
                     try:
-                        sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, optname), default or keepalive_idle)
+                        sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, optname), value)
                     except OSError:
                         pass
 
 
-def recv_exact(sock, n):
-    """从套接字循环接收恰好 n 字节；连接提前关闭时抛出 ConnectionError。"""
+def recv_exact(sock, n, deadline=None):
+    """从套接字循环接收恰好 n 字节；连接提前关闭时抛出 ConnectionError。
+
+    deadline（time.monotonic() 时刻）给定时，强制整次接收的总墙钟上限：每次 recv 前
+    把超时收紧到剩余时间，剩余耗尽抛 socket.timeout。用于认证阶段防 slowloris——
+    否则攻击者声称一个超长 payload 后每 (timeout-1) 秒喂 1 字节，单次 recv_exact 即可
+    无限期占用线程（每次 recv 都在 per-recv 超时内返回，永不触发超时）。
+    """
     chunks = []
     remaining = n
     while remaining > 0:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("接收总时限已耗尽")
+            sock.settimeout(left)
         chunk = sock.recv(remaining)
         if not chunk:
             raise ConnectionError("连接提前关闭，收到的数据不完整")
@@ -352,6 +342,42 @@ def parse_addr(addr_str, default_port=5700):
     return addr_str, default_port
 
 
+def enable_dpi_awareness():
+    """声明进程 DPI 感知，避免高 DPI 下 DWM 位图拉伸导致画面发虚。
+
+    按优先级尝试三种 API（旧系统缺失某一项时自动降级），非 Windows 直接返回。
+    必须在创建任何窗口之前调用一次。返回是否成功声明，绝不抛异常。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+    except Exception:
+        return False
+    # 1) Per-Monitor V2：SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4)
+    try:
+        user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return True
+    except Exception:
+        pass
+    # 2) Per-Monitor：shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE = 2) == S_OK(0)
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return True
+    except Exception:
+        pass
+    # 3) 传统系统级：user32.SetProcessDPIAware()
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def exe_dir():
     """返回程序资源所在目录：PyInstaller 冻结运行时为可执行文件所在目录，否则为本文件所在目录。"""
     if getattr(sys, "frozen", False):
@@ -365,9 +391,19 @@ def _config_path():
 
 
 def _deep_merge(base, override):
-    """递归深合并两个字典：override 覆盖 base，base 中缺失的键自动补上。"""
+    """递归深合并两个字典：override 覆盖 base，base 中缺失的键自动补上。
+
+    第 76 条：override 中显式为 None 的值视为「未指定，沿用默认」而跳过，不覆盖 base。
+    否则 config.json 里 `"fps": null` 会让 `host.get("fps", 60)` 返回 None（键存在、
+    值为 null，.get 不取默认）→ `slot["fps"]=None` → 采集线程 `1.0/fps_now` 抛异常；
+    `"backend": null` 同理会构造 `CaptureManager(None, ...)`。唯一以 null 为合法值的
+    键是 host.capture.region（默认即 None=全屏），保留 base 的 None 与 null 覆盖等价，
+    第 32 条 region=None「清空回全屏」语义不变。
+    """
     result = copy.deepcopy(base)
     for key, value in override.items():
+        if value is None:
+            continue
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = _deep_merge(result[key], value)
         else:
@@ -377,22 +413,77 @@ def _deep_merge(base, override):
 
 def load_config():
     """加载配置：config.json 不存在时先写入 DEFAULT_CONFIG 再返回其深拷贝；
-    存在时读取并与 DEFAULT_CONFIG 做递归深合并后返回合并结果。"""
+    存在时读取并与 DEFAULT_CONFIG 做递归深合并后返回合并结果。
+
+    第 16 条：文件损坏（非法 JSON / 顶层非字典 / 合并异常）时不再抛出原始
+    traceback 让程序起不来，而是把损坏文件重命名留存、回退默认配置并重新落盘。
+    """
     path = _config_path()
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
         return copy.deepcopy(DEFAULT_CONFIG)
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return _deep_merge(DEFAULT_CONFIG, cfg)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("config.json 顶层不是对象（实际 %s）" % type(cfg).__name__)
+        return _deep_merge(DEFAULT_CONFIG, cfg)
+    except Exception as e:
+        _recover_corrupt_config(path, e)
+        return copy.deepcopy(DEFAULT_CONFIG)
 
 
-def save_config(cfg):
-    """以 ensure_ascii=False、indent=2 原子写回 config.json（先写临时文件再替换）。"""
+def _recover_corrupt_config(path, exc):
+    """第 16 条：损坏的 config.json 重命名留存 + 回写默认配置 + 尽力告警。
+
+    重命名为 config.json.corrupt-<时间戳> 便于用户手动找回原设置；随后写一份干净
+    的默认配置，保证下次启动可用。日志用惰性 import（common 被 logger 反向依赖），
+    任何失败都静默吞掉——恢复路径本身绝不能再抛异常。
+    """
+    backup = "%s.corrupt-%d" % (path, int(time.time()))
+    try:
+        os.replace(path, backup)
+    except OSError:
+        backup = None
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    try:
+        import logger
+        suffix = "，原文件已留存为 %s" % os.path.basename(backup) if backup else ""
+        logger.get_logger().warning("config.json 损坏（%s），已回退默认配置%s", exc, suffix)
+    except Exception:
+        pass
+
+
+def save_config(cfg, section=None):
+    """以 ensure_ascii=False、indent=2 原子写回 config.json（先写临时文件再替换）。
+
+    第 17 条：host 与 viewer 同目录同时运行，各持完整配置快照并整文件回写，会用
+    陈旧快照静默还原对方刚改的设置（用户感知“设置老是自己消失”）。传入 section
+    （如 "host"/"viewer"）时改为读-改-写：重新读取磁盘上的最新配置，只把本进程拥有
+    的 section 覆盖上去再落盘，从而保留另一进程的 section。section=None 时维持原
+    整文件回写行为。
+    """
     path = _config_path()
     tmp = path + ".tmp"
     with _config_lock:
+        out = cfg
+        if section is not None:
+            base = {}
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        base = json.load(f)
+                    if not isinstance(base, dict):
+                        base = {}
+                except Exception:
+                    base = {}
+            base[section] = cfg.get(section)
+            out = base
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(out, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
