@@ -96,18 +96,25 @@ MOD_CONTROL = 0x0002
 #: 按键
 VK_X = 0x58
 VK_LEFT = 0x25
+VK_UP = 0x26
 VK_RIGHT = 0x27
+VK_DOWN = 0x28
 VK_1 = 0x31
 WM_HOTKEY = 0x0312
-#: 各热键独立 ID：1=Ctrl+Alt+X 切换穿透，2=Ctrl+Alt+← 上一个频道，3=Ctrl+Alt+→ 下一个频道
+#: 各热键独立 ID：1=Ctrl+Alt+X 切换穿透，2=Ctrl+Alt+← 上一个频道，3=Ctrl+Alt+→ 下一个频道，
+#: 4=Ctrl+Alt+↑ 上一个画面源，5=Ctrl+Alt+↓ 下一个画面源
 HOTKEY_ID_TOGGLE = 1
 HOTKEY_ID_PREV = 2
 HOTKEY_ID_NEXT = 3
+HOTKEY_ID_SRC_PREV = 4
+HOTKEY_ID_SRC_NEXT = 5
 HOTKEY_ID_DIRECT_BASE = 10  # Alt+1..9 直达频道：ID = 10..18
 HOTKEY_DEFS = [
     (HOTKEY_ID_TOGGLE, VK_X),
     (HOTKEY_ID_PREV, VK_LEFT),
     (HOTKEY_ID_NEXT, VK_RIGHT),
+    (HOTKEY_ID_SRC_PREV, VK_UP),
+    (HOTKEY_ID_SRC_NEXT, VK_DOWN),
 ]
 
 #: 控制台面板深色主题配色
@@ -824,7 +831,7 @@ class ViewerApp:
         log.info("频道列表：")
         for i, ch in enumerate(self.channels):
             log.info("  [%d] %s -> %s", i, ch.name, ch.addr)
-        log.info("控制台：Ctrl+Alt+←/→ 切换频道，Ctrl+Alt+X 切换鼠标穿透")
+        log.info("控制台：Ctrl+Alt+←/→ 切换频道，Ctrl+Alt+↑/↓ 切换画面源，Ctrl+Alt+X 切换鼠标穿透")
         # 置位后接收线程才能安全调用 root.after 弹认证对话框（避免 mainloop 未启动时
         # 从子线程调用 Tk 触发 RuntimeError，导致对话框永远不弹出）
         self._mainloop_ready.set()
@@ -1085,9 +1092,10 @@ class ViewerApp:
         header.pack(fill="x", padx=14, pady=(12, 4))
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(anchor="w")
         if bool(self.cfg["viewer"].get("hotkeys", {}).get("direct", True)):
-            hint = "Ctrl+Alt+←/→ 切换   Alt+1..9 直达   Ctrl+Alt+X 穿透"
+            hint = ("Ctrl+Alt+←/→ 换频道   Ctrl+Alt+↑/↓ 换画面源   "
+                    "Alt+1..9 直达   Ctrl+Alt+X 穿透")
         else:
-            hint = "Ctrl+Alt+←/→ 切换   Ctrl+Alt+X 穿透"
+            hint = "Ctrl+Alt+←/→ 换频道   Ctrl+Alt+↑/↓ 换画面源   Ctrl+Alt+X 穿透"
         ttk.Label(header, text=hint,
                   style="Subtitle.TLabel").pack(anchor="w", pady=(2, 0))
 
@@ -1142,7 +1150,7 @@ class ViewerApp:
         # ---------- 画面源区（卡片，MultiView） ----------
         srccard = ttk.Frame(panel, style="Card.TFrame")
         srccard.pack(fill="x", padx=14, pady=6)
-        ttk.Label(srccard, text="画面源（双击切换观看）",
+        ttk.Label(srccard, text="画面源（双击或 Ctrl+Alt+↑/↓ 切换观看）",
                   style="Section.TLabel").pack(anchor="w", padx=10, pady=(8, 2))
         src_tree = ttk.Treeview(
             srccard, columns=("mark", "source", "info"),
@@ -2107,7 +2115,7 @@ class ViewerApp:
             | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
         )
 
-    # ---------- 全局热键（Ctrl+Alt+X 穿透 / Ctrl+Alt+←→ 切换频道） ----------
+    # ---------- 全局热键（Ctrl+Alt+X 穿透 / Ctrl+Alt+←→ 切频道 / Ctrl+Alt+↑↓ 切画面源） ----------
 
     def start_hotkey(self):
         threading.Thread(
@@ -2144,6 +2152,10 @@ class ViewerApp:
                         self.root.after(0, self._step_channel, -1)
                     elif msg.wParam == HOTKEY_ID_NEXT:
                         self.root.after(0, self._step_channel, 1)
+                    elif msg.wParam == HOTKEY_ID_SRC_PREV:
+                        self.root.after(0, self._step_source, -1)
+                    elif msg.wParam == HOTKEY_ID_SRC_NEXT:
+                        self.root.after(0, self._step_source, 1)
                     elif HOTKEY_ID_DIRECT_BASE <= msg.wParam < HOTKEY_ID_DIRECT_BASE + 9:
                         self.root.after(0, self.switch_channel,
                                         msg.wParam - HOTKEY_ID_DIRECT_BASE)
@@ -2156,6 +2168,42 @@ class ViewerApp:
     def _step_channel(self, delta):
         """按步长切换频道（-1 上一个 / +1 下一个），越界时 clamp。"""
         self.switch_channel(self.active_idx + delta)
+
+    def _step_source(self, delta):
+        """按步长循环切换活动频道的画面源（-1 上一个 / +1 下一个），到头回绕。
+
+        源顺序为 本地画面 → 队友1 → 队友2 → …；无队友共享时不切换，仅提示。
+        """
+        if not self.channels or not (0 <= self.active_idx < len(self.channels)):
+            return
+        ch = self.channels[self.active_idx]
+        with ch.lock:
+            sources = ["local"] + [p.get("id") for p in ch.peers if p.get("id")]
+            current = ch.watch_source
+        if len(sources) < 2:
+            log.debug("频道[%s] 无可切换的队友画面", ch.name)
+            if self.panel is not None:
+                self._panel_set_status("暂无可切换的队友画面（需队友先共享）")
+            return
+        try:
+            cur_idx = sources.index(current)
+        except ValueError:
+            cur_idx = 0  # 当前源已失效（队友退出但回落尚未生效）：从本地画面起算
+        target = sources[(cur_idx + delta) % len(sources)]
+        if not ch.switch_source(target):
+            if self.panel is not None:
+                self._panel_set_status("切换画面源失败（源不可用或未连接）", error=True)
+            return
+        desc = self._describe_source(ch, target)
+        log.info("频道[%s] 热键切换画面源：%s", ch.name, desc)
+        # 不调 _refresh_overlay：切源已清空 last_frame，强制重绘会刷出"连接中…"假状态；
+        # 悬浮窗由 poll 在新源首个关键帧到达时重绘，状态行每 15ms 更新即可给出反馈
+        if self.panel is not None:
+            self._panel_set_status("已观看：%s" % desc)
+            try:
+                self._panel_refresh_sources()
+            except Exception:
+                pass
 
 
 def main():
