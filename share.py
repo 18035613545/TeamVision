@@ -47,7 +47,7 @@ class ScreenShareSession:
         self._bitrate = int(codec_cfg.get("bitrate_kbps", 2500)) * 1000
         self._keyint = max(1, int(codec_cfg.get("keyint", 60)))
         self._preset = codec_cfg.get("preset", "") or ""
-        self._still_enabled = bool(still_cfg.get("enabled", True))
+        self._still_enabled = bool(still_cfg.get("enabled", False))
         probe_fps = max(1, int(still_cfg.get("probe_fps", 5)))
         self._probe_interval = 1.0 / probe_fps
         still_frames = max(1, int(still_cfg.get("still_frames", 3)))

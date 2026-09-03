@@ -912,9 +912,10 @@ def run_server(runtime):
     quality_min = perf_cfg.get("quality_min", 40)
     scale_min = perf_cfg.get("scale_min", 0.6)
     fps_min = max(1, perf_cfg.get("fps_min", 15))
-    # 静止检测配置（perf.still，全部可配；enabled=false 关闭后行为与旧版一致）
+    # 静止检测配置（perf.still，全部可配；默认关闭——开启后小的锐利局部变化
+    # 会被整屏面积比判据误判为静止，帧率被压到 probe_fps）
     still_cfg = perf_cfg.get("still", {})
-    still_enabled = bool(still_cfg.get("enabled", True))
+    still_enabled = bool(still_cfg.get("enabled", False))
     still_probe_interval = 1.0 / max(1, int(still_cfg.get("probe_fps", 5)))
     still_frames = max(1, int(still_cfg.get("still_frames", 3)))
     point_thr = int(still_cfg.get("point_thr", 10))
