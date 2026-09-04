@@ -5,11 +5,15 @@ from PyInstaller.utils.hooks import collect_all
 # 收集 PyAV（FFmpeg DLL 位于 av.libs）：H.264 视频解码
 _av_datas, _av_binaries, _av_hiddenimports = collect_all('av')
 
+# 启动图 splash.png 内嵌进 exe：splash.py 冻结时从 sys._MEIPASS/assets 读取，
+# 程序自带启动图，不再依赖 exe 同级的 assets 目录。
+_splash_datas = [('assets/splash.png', 'assets')]
+
 a = Analysis(
     ['viewer.py'],
     pathex=[],
     binaries=_av_binaries,
-    datas=_av_datas,
+    datas=_av_datas + _splash_datas,
     hiddenimports=_av_hiddenimports,
     hookspath=[],
     hooksconfig={},

@@ -25,10 +25,9 @@ Source: "dist\fps-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\fps-viewer.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\frpc.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "assets\app.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
-; 第 74 条：splash.png 是 splash.py 从 exe_dir()/assets/splash.png 读取的启动图，
-; 冻结运行时 exe_dir()={app}，故必须随包安装到 {app}\assets，否则安装版静默降级为纯文字启动画面。
-; 它是仓库已提交资源（构建期必然存在），故不加 skipifsourcedoesntexist——缺失就该让 ISCC 报错。
-Source: "assets\splash.png"; DestDir: "{app}\assets"; Flags: ignoreversion
+; 启动图 splash.png 已由 spec 的 datas 内嵌进 exe（splash.py 冻结时从 sys._MEIPASS/assets 读取），
+; 程序自带启动图，不再需要随包安装到 {app}\assets，故此处不再列 splash.png。
+; app.ico 仍随包安装到 {app}\assets，供下方 [Icons] 快捷方式与 UninstallDisplayIcon 使用。
 
 [Icons]
 Name: "{group}\队友视野-共享端"; Filename: "{app}\fps-host.exe"; IconFilename: "{app}\assets\app.ico"
