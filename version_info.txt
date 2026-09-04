@@ -22,7 +22,7 @@ VSVersionInfo(
            StringStruct(u'FileDescription', u'队友视野 - FPS 队友实时画面传输程序'),
            StringStruct(u'FileVersion', u'1.3.0'),
            StringStruct(u'InternalName', u'TeamVision'),
-           StringStruct(u'LegalCopyright', u'Copyright (c) 2026 TeamVision Team · by 西琳'),
+           StringStruct(u'LegalCopyright', u'Copyright (c) 2026 TeamVision Team · by 西琳 · 禁止商业用途'),
            StringStruct(u'OriginalFilename', u'TeamVision.exe'),
            StringStruct(u'ProductName', u'队友视野 TeamVision'),
            StringStruct(u'ProductVersion', u'1.3.0')])
