@@ -47,6 +47,8 @@ VIDEO_FLAG_KEY = 0x01
 APP_NAME = "队友视野"
 APP_VERSION = "1.3.0"
 APP_COPYRIGHT = "Copyright © 2026 SakuraVision Team"
+#: 作者署名（显示于启动画面与 exe 版本信息）
+APP_AUTHOR = "by 西琳"
 
 #: 配置读写全局锁（防止多线程同时 save_config 导致丢失更新）
 _config_lock = threading.Lock()

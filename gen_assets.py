@@ -25,6 +25,7 @@ BRAND_COLOR_BOTTOM = (91, 33, 182)  # #5b21b6 深紫
 SPLASH_BG_TOP = (20, 20, 31)        # #14141f
 SPLASH_BG_BOTTOM = (30, 30, 46)     # #1e1e2e
 TEXT_PURPLE = (167, 139, 250)       # #a78bfa
+TEXT_DIM = (138, 138, 154)          # #8a8a9a 署名等弱化文字
 WHITE = (255, 255, 255, 255)
 
 #: 第 99 条：中文字体候选（按优先级）。旧实现硬编码 C:/Windows/Fonts 且只 catch
@@ -162,6 +163,10 @@ def gen_splash():
     # 副标题：SakuraVision v{版本}（浅紫，约 20px，版本取自 common.APP_VERSION）
     _center_text(235, "SakuraVision v%s" % common.APP_VERSION,
                  _load_brand_font(20, bold=False), TEXT_PURPLE)
+    # 作者署名：底部居中（暗灰，约 15px，取自 common.APP_AUTHOR）
+    author = getattr(common, "APP_AUTHOR", "by 西琳")
+    if author:
+        _center_text(266, author, _load_brand_font(15, bold=False), TEXT_DIM)
 
     path = os.path.join(ASSETS_DIR, "splash.png")
     _note_overwrite(path)  # 第 99 条：覆盖 git 跟踪资源前提示，不静默 clobber

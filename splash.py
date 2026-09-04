@@ -23,6 +23,7 @@ SPLASH_MS = 2000
 #: 深色主题配色
 _BG = "#14141f"
 _FG = "#e6e6ef"
+_DIM = "#8a8a9a"
 
 
 def _splash_path():
@@ -35,6 +36,11 @@ def _brand_text():
     name = getattr(common, "APP_NAME", "队友视野")
     ver = getattr(common, "APP_VERSION", "1.0.0")
     return "%s v%s" % (name, ver)
+
+
+def _author_text():
+    """返回作者署名文字（common.APP_AUTHOR 缺失时回退默认值）。"""
+    return getattr(common, "APP_AUTHOR", "by 西琳")
 
 
 def _center(win):
@@ -62,7 +68,9 @@ def _build(win):
         except Exception:
             pass
     tk.Label(win, text=_brand_text(), bg=_BG, fg=_FG,
-             font=("Microsoft YaHei", 22, "bold")).pack(fill="both", expand=True)
+             font=("Microsoft YaHei", 22, "bold")).pack(expand=True, pady=(0, 4))
+    tk.Label(win, text=_author_text(), bg=_BG, fg=_DIM,
+             font=("Microsoft YaHei", 11)).pack(pady=(0, 24))
 
 
 def _show_on_root(root):

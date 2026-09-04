@@ -18,11 +18,11 @@ VSVersionInfo(
       [
         StringTable(
           u'080404b0',
-          [StringStruct(u'CompanyName', u'SakuraVision'),
+          [StringStruct(u'CompanyName', u'SakuraVision · by 西琳'),
            StringStruct(u'FileDescription', u'队友视野 - FPS 队友实时画面传输程序'),
            StringStruct(u'FileVersion', u'1.3.0'),
            StringStruct(u'InternalName', u'SakuraVision'),
-           StringStruct(u'LegalCopyright', u'Copyright (c) 2026 SakuraVision Team'),
+           StringStruct(u'LegalCopyright', u'Copyright (c) 2026 SakuraVision Team · by 西琳'),
            StringStruct(u'OriginalFilename', u'SakuraVision.exe'),
            StringStruct(u'ProductName', u'队友视野 SakuraVision'),
            StringStruct(u'ProductVersion', u'1.3.0')])
