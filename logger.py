@@ -148,14 +148,14 @@ def _writable_log_dir():
 
     安装到 Program Files 后非管理员运行时 exe_dir()/logs 不可写，原代码在 import 期
     os.makedirs 直接抛 PermissionError，窗口都不出现。这里依次尝试：
-    exe_dir()/logs → %LOCALAPPDATA%/SakuraVision/logs → 临时目录/SakuraVision-logs，
+    exe_dir()/logs → %LOCALAPPDATA%/TeamVision/logs → 临时目录/TeamVision-logs，
     对每个候选实际写一个探测文件验证可写，返回第一个可用目录；全不可写返回 None。
     """
     candidates = [os.path.join(exe_dir(), "logs")]
     local = os.environ.get("LOCALAPPDATA")
     if local:
-        candidates.append(os.path.join(local, "SakuraVision", "logs"))
-    candidates.append(os.path.join(tempfile.gettempdir(), "SakuraVision-logs"))
+        candidates.append(os.path.join(local, "TeamVision", "logs"))
+    candidates.append(os.path.join(tempfile.gettempdir(), "TeamVision-logs"))
     for d in candidates:
         try:
             os.makedirs(d, exist_ok=True)

@@ -160,8 +160,8 @@ def gen_splash():
 
     # 主标题：队友视野（白色，约 48px 粗体）
     _center_text(170, "队友视野", _load_brand_font(48), WHITE)
-    # 副标题：SakuraVision v{版本}（浅紫，约 20px，版本取自 common.APP_VERSION）
-    _center_text(235, "SakuraVision v%s" % common.APP_VERSION,
+    # 副标题：TeamVision v{版本}（浅紫，约 20px，版本取自 common.APP_VERSION）
+    _center_text(235, "TeamVision v%s" % common.APP_VERSION,
                  _load_brand_font(20, bold=False), TEXT_PURPLE)
     # 作者署名：底部居中（暗灰，约 15px，取自 common.APP_AUTHOR）
     author = getattr(common, "APP_AUTHOR", "by 西琳")

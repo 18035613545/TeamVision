@@ -46,7 +46,7 @@ VIDEO_FLAG_KEY = 0x01
 #: 品牌与应用信息
 APP_NAME = "队友视野"
 APP_VERSION = "1.3.0"
-APP_COPYRIGHT = "Copyright © 2026 SakuraVision Team"
+APP_COPYRIGHT = "Copyright © 2026 TeamVision Team"
 #: 作者署名（显示于启动画面与 exe 版本信息）
 APP_AUTHOR = "by 西琳"
 

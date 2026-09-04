@@ -44,7 +44,7 @@ CONFIG = os.path.join(ROOT, "config.json")
 PY = os.environ.get("E2E_PYTHON", r"F:/conda/envs/fps-screen/python.exe")
 HOST = PY  # 调用方须用 fps-screen python 运行本脚本
 PORT = int(os.environ.get("E2E_PORT", "5792"))
-APP_TITLE = "SakuraVision"
+APP_TITLE = "TeamVision"
 
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
 SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0010

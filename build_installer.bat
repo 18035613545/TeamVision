@@ -54,10 +54,10 @@ if errorlevel 1 goto :failed
 echo.
 echo ============================================
 if "%HAS_FRPC%"=="1" (
-    echo   安装包已生成：dist\ 下的 SakuraVision-Setup-*.exe
+    echo   安装包已生成：dist\ 下的 TeamVision-Setup-*.exe
     echo   已包含 frpc.exe —— 支持公网/樱花 frp 隧道共享。
 ) else (
-    echo   安装包已生成：dist\ 下的 SakuraVision-Setup-*.exe
+    echo   安装包已生成：dist\ 下的 TeamVision-Setup-*.exe
     echo   未包含 frpc.exe —— 仅局域网直连共享，公网 frp 隧道不可用。
 )
 echo   版本号同 installer.iss 的 OutputBaseFilename

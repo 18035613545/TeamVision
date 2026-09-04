@@ -1,15 +1,15 @@
-; 队友视野 SakuraVision v1.3.0 安装脚本 (Inno Setup 6)
+; 队友视野 TeamVision v1.3.0 安装脚本 (Inno Setup 6)
 ; 使用方法: 运行 build_installer.bat，或手动执行 ISCC.exe installer.iss
 
 [Setup]
 AppId={{A7D3F9E1-5B2C-4E8A-9D1F-6C4B0A2E8F11}
-AppName=队友视野 SakuraVision
+AppName=队友视野 TeamVision
 AppVersion=1.3.0
-AppPublisher=SakuraVision Team
-DefaultDirName={autopf}\SakuraVision
+AppPublisher=TeamVision Team
+DefaultDirName={autopf}\TeamVision
 DefaultGroupName=队友视野
 OutputDir=dist
-OutputBaseFilename=SakuraVision-Setup-1.3.0
+OutputBaseFilename=TeamVision-Setup-1.3.0
 SetupIconFile=assets\app.ico
 UninstallDisplayIcon={app}\fps-viewer.exe
 Compression=lzma2
@@ -44,5 +44,5 @@ Type: files; Name: "{app}\accounts.json.corrupt-*"
 Type: files; Name: "{app}\config.json"
 Type: files; Name: "{app}\config.json.corrupt-*"
 Type: filesandordirs; Name: "{app}\logs"
-; 第 13 条：安装目录不可写时 logger 回退到 %LOCALAPPDATA%\SakuraVision\logs，一并清理。
-Type: filesandordirs; Name: "{localappdata}\SakuraVision"
+; 第 13 条：安装目录不可写时 logger 回退到 %LOCALAPPDATA%\TeamVision\logs，一并清理。
+Type: filesandordirs; Name: "{localappdata}\TeamVision"
