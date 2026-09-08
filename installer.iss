@@ -6,7 +6,14 @@ AppId={{A7D3F9E1-5B2C-4E8A-9D1F-6C4B0A2E8F11}
 AppName=队友视野 TeamVision
 AppVersion=1.3.0
 AppPublisher=TeamVision Team
-DefaultDirName={autopf}\TeamVision
+; 第 102 条：默认改为**用户级安装**（{localappdata}\Programs，无需管理员）。
+; 原来装到 {autopf}（= C:\Program Files）时，非管理员运行时既写不了 config.json
+; （改设置"改了没反应"、首次启动直接 PermissionError），也写不了 accounts.json
+; （注册失败）。用户级安装目录天然可写，同时免去 UAC 提权。
+; 配合 common.data_dir() 的回退：即使有人手动装到 Program Files，配置/账户/日志
+; 也会落到 %LOCALAPPDATA%\TeamVision 而不是静默失败。
+DefaultDirName={localappdata}\Programs\TeamVision
+PrivilegesRequired=lowest
 DefaultGroupName=队友视野
 OutputDir=dist
 OutputBaseFilename=TeamVision-Setup-1.3.0

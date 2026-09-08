@@ -22,6 +22,7 @@ hermetic：用 ViewerApp.__new__ 绕开 Tk/线程；网络用 mock.patch 屏蔽�
 """
 import ast
 import os
+import queue
 import threading
 import unittest
 from unittest import mock
@@ -55,6 +56,8 @@ def _app(running=True, ready=True, root="auto"):
     if ready:
         a._mainloop_ready.set()
     a.root = _FakeRoot() if root == "auto" else root
+    # 第 108 条（B14）：_post_ui 改为只入队，回调由主线程 poll 里的 _drain_ui_queue 执行
+    a._ui_queue = queue.SimpleQueue()
     return a
 
 
@@ -64,12 +67,14 @@ class TestPostUiGuards(unittest.TestCase):
         a = _app(running=False, ready=True)
         a._post_ui(lambda: None)
         self.assertEqual(a.root.after_calls, [])
+        self.assertTrue(a._ui_queue.empty())
 
     def test_drops_when_mainloop_not_ready(self):
         # 未就绪：mainloop 还没 set → 丢弃，避免在 root 真正可用前抢跑。
         a = _app(running=True, ready=False)
         a._post_ui(lambda: None)
         self.assertEqual(a.root.after_calls, [])
+        self.assertTrue(a._ui_queue.empty())
 
     def test_drops_when_root_none(self):
         a = _app(running=True, ready=True, root=None)
@@ -77,19 +82,22 @@ class TestPostUiGuards(unittest.TestCase):
         self.assertIsNone(a.root)
 
     def test_schedules_when_ready_and_running(self):
-        # 正控：running=True + ready + root 在 → 正常 root.after(0, fn)。
+        # 正控：running=True + ready → 回调入队，且**不**从工作线程碰 Tk；
+        # 主线程 _drain_ui_queue 执行它（第 108 条 / B14）。
         a = _app(running=True, ready=True)
-        fn = lambda: None
-        a._post_ui(fn)
-        self.assertEqual(len(a.root.after_calls), 1)
-        self.assertEqual(a.root.after_calls[0][0], 0)
-        self.assertIs(a.root.after_calls[0][1], fn)
+        calls = []
+        a._post_ui(lambda: calls.append("x"))
+        self.assertEqual(a.root.after_calls, [])
+        self.assertEqual(calls, [])
+        a._drain_ui_queue()
+        self.assertEqual(calls, ["x"])
 
     def test_swallows_after_exception(self):
-        # root.after 抛异常（Tcl 已销毁）→ _post_ui 静默吞掉，不冒泡进子线程。
+        # root 的 Tcl 已销毁（after 会抛）也不影响入队——_post_ui 不再触碰 root。
         a = _app(running=True, ready=True)
         a.root.raise_on_after = True
         a._post_ui(lambda: None)          # 不应抛
+        self.assertFalse(a._ui_queue.empty())
 
 
 # ============ Fix 2/3: 热键/诊断改走 _post_ui（AST 结构断言）============

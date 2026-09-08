@@ -36,6 +36,10 @@ where iscc >nul 2>nul
 if not errorlevel 1 set "ISCC=iscc"
 if not defined ISCC if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not defined ISCC if exist "C:\Program Files\Inno Setup 6\ISCC.exe" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
+rem 第 101 条：Inno Setup 6 默认是「仅为我安装」→ 装在 %LOCALAPPDATA%\Programs\Inno Setup 6，
+rem 上面两个 Program Files 路径都不存在。旧脚本因此误报「未检测到 Inno Setup 6」，
+rem 即使用户已装好也打包不出安装包。补上用户级安装目录。
+if not defined ISCC if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 
 if not defined ISCC (
     echo.

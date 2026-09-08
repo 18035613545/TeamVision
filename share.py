@@ -13,13 +13,11 @@ ScreenShareSession 在独立线程内完成 采集→静止门控→编码→发
 import threading
 import time
 
-import cv2
-
 import logger
-import codec as codec_mod
+import pipeline
 from common import pack_frame, pack_video
 from screen import (CaptureManager, downsample_frame, motion_changed,
-                    still_gate_update, calc_output_size, encode_bgr)
+                    still_gate_update)
 
 log = logger.get_logger()
 
@@ -56,9 +54,13 @@ class ScreenShareSession:
         self._ratio_thr = float(still_cfg.get("ratio_thr", 0.005))
         self._cap = capture
         self._cap_owned = capture is None
-        self._encoder = None
-        self._enc_retry_at = 0.0   # 第 53 条：编码器构造失败后的负缓存退避时刻
-        self._enc_backoff = 1.0    # 退避秒数，指数增长封顶 30s
+        # 第 110 条（阶段 2）：编码器生命周期与 JPEG 回退改由 pipeline.FrameEncoder
+        # 统一提供——与 host.py 共用同一实现（含第 53 条构造失败负缓存退避）。
+        self._fe = pipeline.FrameEncoder(
+            width=0, height=0, fps=self._fps, bitrate=self._bitrate,
+            keyint=self._keyint, encoder_sel=self._encoder_sel, preset=self._preset,
+            target_width=self._target_width, quality=self._quality, name=name,
+            on_build=self._on_encoder_built)
         self._thread = None
 
     # ---------- 生命周期 ----------
@@ -218,12 +220,9 @@ class ScreenShareSession:
             self._close_resources()
 
     def _close_resources(self):
-        if self._encoder is not None:
-            try:
-                self._encoder.close()
-            except Exception:
-                pass
-            self._encoder = None
+        fe = getattr(self, "_fe", None)
+        if fe is not None:
+            fe.close()
         # 注入的伪采集器也需关闭：stop() 语义是释放本会话持有的所有采集资源
         if self._cap is not None:
             try:
@@ -234,66 +233,38 @@ class ScreenShareSession:
 
     # ---------- 编码与发送 ----------
 
+    def _on_encoder_built(self, enc, w, h, bitrate):
+        """编码器建成回调（pipeline.FrameEncoder 调用）。"""
+        log.info("频道[%s] 共享编码器: %s（%dx%d，%d Kbps）",
+                 self._name, enc.name, w, h, bitrate // 1000)
+
     def _encode_send(self, bgr, ts_us, force_key=False):
-        """缩放→编码→发送一帧；返回 (缩放后BGR, 完整消息字节, 是否视频) 或 None。"""
-        try:
-            w, h = calc_output_size(bgr.shape[1], bgr.shape[0], 1.0, self._target_width)
-            if self._encoder is not None and not self._encoder.available:
-                try:
-                    self._encoder.close()
-                except Exception:
-                    pass
-                self._encoder = None
-            # 第 53 条：编码器构造失败后负缓存退避，避免每帧都新建 VideoEncoder
-            # （4 次 av.Codec 查找 + 4 次 open + 最多 4 条告警，30 次/秒打满 CPU 刷爆日志）
-            now = time.monotonic()
-            if (self._encoder is None and self._encoder_sel != "jpeg"
-                    and now >= self._enc_retry_at):
-                enc = codec_mod.VideoEncoder(
-                    w, h, self._fps, self._bitrate, self._keyint,
-                    self._encoder_sel, self._preset)
-                if enc.available:
-                    self._encoder = enc
-                    self._enc_backoff = 1.0
-                    log.info("频道[%s] 共享编码器: %s（%dx%d，%d Kbps）",
-                             self._name, enc.name, w, h, self._bitrate // 1000)
-                else:
-                    # 构造失败：指数退避（1→2→4→…→30s 封顶），期间走 JPEG 回退
-                    self._enc_retry_at = now + self._enc_backoff
-                    self._enc_backoff = min(30.0, self._enc_backoff * 2)
-            frame = bgr
-            if (w, h) != (bgr.shape[1], bgr.shape[0]):
-                frame = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
-            if self._encoder is not None:
-                res = self._encoder.encode(frame, raw_ts=ts_us, force_key=force_key)
-                if res is None:
-                    return None
-                nal, is_key, _ms, out_ts = res
-                msg = pack_video(nal, out_ts, is_key, codec=self._encoder.codec_id)
-                if not self._send_msg(msg):
-                    return None
-                return frame, msg, True
-            jpeg, _ms = encode_bgr(bgr, 1.0, self._quality, self._target_width)
-            msg = pack_frame(jpeg, ts_us)
-            if not self._send_msg(msg):
-                return None
-            return frame, msg, False
-        except Exception as e:
-            # 第 4 条：编码/发送路径任何异常都不应静默杀死上传线程；跳过本帧并记日志
-            log.warning("频道[%s] 共享编码发送异常（已跳过本帧）: %s", self._name, e)
+        """缩放→编码→发送一帧；返回 (缩放后BGR, 完整消息字节, 是否视频) 或 None。
+
+        编码/回退逻辑在 pipeline.FrameEncoder（第 110 条，与 host 共用）；本方法只负责
+        "帧去哪"——打包协议消息并经 _tx_lock 发送。
+        """
+        ef = self._fe.encode(bgr, ts_us, force_key=force_key, scale=1.0,
+                             quality=self._quality, fps=self._fps,
+                             bitrate=self._bitrate)
+        if ef is None:
             return None
+        if ef.is_video:
+            msg = pack_video(ef.data, ef.ts, ef.is_key, codec=ef.codec_id)
+        else:
+            msg = pack_frame(ef.data, ts_us)
+        if not self._send_msg(msg):
+            return None
+        return ef.frame, msg, ef.is_video
 
     def _send_key_response(self, last_frame, last_packed, last_is_video):
         """静止/空闲期关键帧请求响应：视频=强制 IDR；JPEG=重发缓存帧。"""
         if last_packed is None:
             return
-        if (last_is_video and self._encoder is not None
-                and self._encoder.available and last_frame is not None):
-            key_ts = int(time.time() * 1_000_000)
-            try:
-                res = self._encoder.encode(last_frame, raw_ts=key_ts, force_key=True)
-            except Exception as e:
-                log.warning("频道[%s] 静止期强制 IDR 失败: %s", self._name, e)
+        if last_is_video and last_frame is not None:
+            res, err = self._fe.force_idr(last_frame)
+            if err is not None:
+                log.warning("频道[%s] 静止期强制 IDR 失败: %s", self._name, err)
                 return
             if res is None:
                 return
@@ -301,7 +272,7 @@ class ScreenShareSession:
             if not is_key:
                 return
             if self._send_msg(pack_video(nal, out_ts, True,
-                                         codec=self._encoder.codec_id)):
+                                         codec=self._fe.encoder.codec_id)):
                 log.info("频道[%s] 静止期响应关键帧请求（%d 字节）",
                          self._name, len(nal))
             return

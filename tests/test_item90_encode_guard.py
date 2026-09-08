@@ -18,6 +18,10 @@ import os
 import unittest
 
 _HOST_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "host.py")
+# 第 110 条（阶段 2）：编码器生命周期与 JPEG 回退抽到 pipeline.FrameEncoder，host 与
+# share 共用；encode() 调用因此从 host._encode_loop 迁到这里，守卫随之下沉到该模块。
+_PIPELINE_PY = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pipeline.py")
 
 
 def _find_func(tree, name):
@@ -64,30 +68,51 @@ def _guarded_by_try_body(call, parents, func):
 
 
 class TestEncodeLoopGuard(unittest.TestCase):
+    # 第 109/110 条（阶段 2）重构后，编码调用分布在：
+    #   pipeline.FrameEncoder.encode     —— 主编码路径（host 与 share 共用）
+    #   pipeline.FrameEncoder.force_idr  —— 静止期强制 IDR
+    # 两处的 encode() 都必须被 try 兜底，故一并检查。
+    _TARGETS = ((_PIPELINE_PY, "encode"), (_PIPELINE_PY, "force_idr"))
+
     def setUp(self):
-        with open(_HOST_PY, "r", encoding="utf-8") as f:
-            self.tree = ast.parse(f.read(), filename=_HOST_PY)
-        self.func = _find_func(self.tree, "_encode_loop")
-        self.assertIsNotNone(self.func, "host.py 中找不到 _encode_loop（结构已变？请更新本测试）")
-        self.parents = _parent_map(self.tree)
+        self.parsed = {}
+        for path, _ in self._TARGETS:
+            if path in self.parsed:
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                self.parsed[path] = ast.parse(f.read(), filename=path)
+        self.parents = {p: _parent_map(t) for p, t in self.parsed.items()}
+        self.funcs = []
+        for path, name in self._TARGETS:
+            func = _find_func(self.parsed[path], name)
+            self.assertIsNotNone(
+                func, "%s 中找不到 %s（结构已变？请更新本测试）" % (path, name))
+            self.funcs.append((path, func))
+
+    def _all_encode_calls(self):
+        for path, func in self.funcs:
+            for call in _encode_calls(func):
+                yield path, func, call
 
     def test_encode_loop_has_encode_calls(self):
         # 健全性：确实找到了 encode 调用，避免因 AST 结构变动导致下面的断言空过。
-        calls = list(_encode_calls(self.func))
+        calls = list(self._all_encode_calls())
         self.assertGreaterEqual(
             len(calls), 2,
-            "_encode_loop 内应至少有 2 处 encoder.encode（主路径 + 静止期关键帧分支）；"
-            "实际 %d 处——源码结构可能已变，请核对并更新本测试" % len(calls))
+            "FrameEncoder.encode/force_idr 内应至少有 2 处 encoder.encode"
+            "（主路径 + 静止期关键帧分支）；实际 %d 处——源码结构可能已变，"
+            "请核对并更新本测试" % len(calls))
 
     def test_every_encode_call_is_inside_try_body(self):
         # 核心断言：每一处 .encode(...) 调用都必须在某个 try 的 body 内（第 90 条）。
         unguarded = []
-        for call in _encode_calls(self.func):
-            if not _guarded_by_try_body(call, self.parents, self.func):
-                unguarded.append(getattr(call, "lineno", "?"))
+        for path, func, call in self._all_encode_calls():
+            if not _guarded_by_try_body(call, self.parents[path], func):
+                unguarded.append("%s:%s" % (os.path.basename(path),
+                                            getattr(call, "lineno", "?")))
         self.assertEqual(
             unguarded, [],
-            "_encode_loop 中存在未被 try 兜底的 encoder.encode 调用（行号 %s）——"
+            "存在未被 try 兜底的 encoder.encode 调用（%s）——"
             "编码器半死时会杀死编码线程导致观看端永久定格（第 90 条）。" % unguarded)
 
 

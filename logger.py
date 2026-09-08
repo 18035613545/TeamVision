@@ -4,8 +4,8 @@
 提供统一的日志初始化 setup_logger、惰性获取 get_logger 以及
 敏感信息打码 mask_secret，供 host.py / viewer.py 共同使用。
 
-日志写入 exe_dir()/logs/app_YYYYMMDD.log（5MB 滚动、保留 5 份），
-同时输出到控制台（stdout）。仅依赖标准库 logging / os / sys / time。
+日志写入可写数据目录（common.data_dir()，见第 102 条）/logs/app_YYYYMMDD_pidNNN.log
+（5MB 滚动、保留 5 份），同时输出到控制台（stdout）。仅依赖标准库 logging / os / sys / time。
 """
 
 import logging
@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 
-from common import exe_dir
+from common import data_dir, exe_dir
 
 #: 全局日志器名称
 LOGGER_NAME = "sakura"
@@ -144,17 +144,22 @@ def _resolve_level(level_name):
 
 
 def _writable_log_dir():
-    """返回一个可写的日志目录（第 13 条）。
+    """返回一个可写的日志目录（第 13 条 / 第 102 条）。
 
     安装到 Program Files 后非管理员运行时 exe_dir()/logs 不可写，原代码在 import 期
     os.makedirs 直接抛 PermissionError，窗口都不出现。这里依次尝试：
-    exe_dir()/logs → %LOCALAPPDATA%/TeamVision/logs → 临时目录/TeamVision-logs，
-    对每个候选实际写一个探测文件验证可写，返回第一个可用目录；全不可写返回 None。
+    可写数据目录（common.data_dir()，与 config.json/accounts.json 同一目录）
+    → exe_dir()/logs → 临时目录/TeamVision-logs，对每个候选实际写一个探测文件验证可写，
+    返回第一个可用目录；全不可写返回 None。
+
+    第 102 条：改为优先跟随 common.data_dir()，让配置、账户、日志落在同一处，
+    避免"配置在用户目录、日志在安装目录"这种更难解释的状态。
     """
-    candidates = [os.path.join(exe_dir(), "logs")]
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        candidates.append(os.path.join(local, "TeamVision", "logs"))
+    candidates = []
+    base = data_dir()
+    if base:
+        candidates.append(os.path.join(base, "logs"))
+    candidates.append(os.path.join(exe_dir(), "logs"))
     candidates.append(os.path.join(tempfile.gettempdir(), "TeamVision-logs"))
     for d in candidates:
         try:

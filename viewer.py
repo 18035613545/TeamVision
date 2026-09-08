@@ -88,6 +88,21 @@ def _handle_uncaught(exc_type, exc_value, exc_tb):
             pass
 
 
+def _thread_excepthook(args):
+    """工作线程未捕获异常兜底（第 100 条）。
+
+    windowed 打包下 sys.stderr 为 None，threading 默认钩子什么都不会写：接收/心跳/
+    上传/热键/诊断线程一旦崩溃就是"画面突然不动、日志空白"。host.py 早已安装同名
+    钩子，viewer 此前只有 sys.excepthook（只覆盖主线程）。这里补上，并**不弹模态框**
+    （工作线程崩溃不该阻塞主线程绘制）。
+    """
+    name = getattr(getattr(args, "thread", None), "name", "thread")
+    if getattr(args, "exc_type", None) is SystemExit:
+        return
+    log.error("线程 %s 未捕获异常", name,
+              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
 # 第 79 条：sys.excepthook 的安装移到 main() 里，不在 import 时无条件执行。
 # 否则任何 import viewer 的进程（含单元测试套件）都会被全局换成这个会弹**模态**
 # messagebox 的钩子；测试期间一旦有异常逃逸到解释器顶层，整套件就卡在 GUI 对话框后面。
@@ -199,14 +214,76 @@ def _canonical_addr(addr):
     return h, port
 
 
+def _cfg_int(value, default, lo=None, hi=None):
+    """把配置值安全转为 int（第 100 条）：非法/超范围时回退 default 并夹紧。
+
+    手改 config.json（如 display_width: 0、rcvbuf_kb: "abc"）不应让 GUI 每帧抛异常
+    被静默吞掉或让接收线程起不来。
+    """
+    if isinstance(value, bool):
+        value = int(value)
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        log.warning("viewer 配置值 %r 不是整数，回退默认值 %r", value, default)
+        out = int(default)
+    if lo is not None and out < lo:
+        out = int(lo)
+    if hi is not None and out > hi:
+        out = int(hi)
+    return out
+
+
+def _cfg_float(value, default, lo=None, hi=None):
+    """把配置值安全转为 float（第 100 条）：非法时回退 default，并按需夹到 [lo, hi]。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        log.warning("viewer 配置值 %r 不是数字，回退默认值 %r", value, default)
+        out = float(default)
+    if lo is not None and out < lo:
+        out = float(lo)
+    if hi is not None and out > hi:
+        out = float(hi)
+    return out
+
+
+def _normalize_channel_items(viewer_cfg):
+    """把 config.viewer.channels 规范成非空的对象列表（第 106 条 / B16）。
+
+    - 不是列表（手改成 "1.2.3.4:5700" / {}）→ 告警并忽略，回退默认频道；
+    - 列表元素不是对象 → 跳过该元素；
+    - 全部为空 → 用 server_addr 生成默认频道（向后兼容）。
+    旧实现直接对元素调 .get()：字符串会被逐字符遍历、字典会遍历键，启动即崩。
+    """
+    viewer_cfg = viewer_cfg if isinstance(viewer_cfg, dict) else {}
+    items = viewer_cfg.get("channels")
+    if not isinstance(items, list):
+        if items:
+            log.warning("viewer.channels 不是列表（%r），已忽略并按默认频道处理", items)
+        items = []
+    out = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            log.warning("viewer.channels[%d] 不是对象（%r），已跳过", i, item)
+            continue
+        out.append(item)
+    if not out:
+        out = [{"name": "默认频道",
+                "addr": viewer_cfg.get("server_addr", "127.0.0.1:5700")}]
+    return out
+
+
 class Channel:
     """单个画面来源：独立接收线程 + 最新帧缓存（BGR numpy 数组）。"""
 
-    def __init__(self, name, addr, auth=None, owner=None):
+    def __init__(self, name, addr, auth=None, owner=None, ephemeral=False):
         self.name = name
         self.addr = addr
         self.auth = auth or {}
         self.owner = owner
+        # 第 100 条：命令行 --addr 临时加入的频道不写回 config.json（见 _save_channels）
+        self.ephemeral = bool(ephemeral)
         self.username = (auth or {}).get("username", "")
         self.auth_msg = ""
         self._prompt_blocked_until = 0.0  # 取消登录后的冷却时刻，避免频繁重连狂弹对话框
@@ -217,16 +294,21 @@ class Channel:
         viewer_cfg = (owner.cfg if owner is not None else {}).get("viewer", {}) or {}
         net_cfg = viewer_cfg.get("net", {}) or {}
         rc_cfg = viewer_cfg.get("reconnect", {}) or {}
-        self._rcvbuf = int(net_cfg.get("rcvbuf_kb", 4096)) * 1024
-        self._read_idle_s = float(net_cfg.get("read_idle_s", 5.0))  # 停滞判定阈值
-        self._ping_interval = float(viewer_cfg.get("ping_interval_s", 2.0))
-        self._backoff_base = float(rc_cfg.get("base_s", 1.0))
-        self._backoff_max = float(rc_cfg.get("max_s", 30.0))
-        self._backoff_factor = float(rc_cfg.get("factor", 2.0))
+        self._rcvbuf = _cfg_int(net_cfg.get("rcvbuf_kb", 4096), 4096, 0) * 1024
+        self._read_idle_s = _cfg_float(net_cfg.get("read_idle_s", 5.0), 5.0, 0.5, 600.0)
+        self._ping_interval = _cfg_float(viewer_cfg.get("ping_interval_s", 2.0), 2.0, 0.2, 600.0)
+        self._backoff_base = _cfg_float(rc_cfg.get("base_s", 1.0), 1.0, 0.1, 600.0)
+        self._backoff_max = _cfg_float(rc_cfg.get("max_s", 30.0), 30.0, 0.5, 3600.0)
+        self._backoff_factor = _cfg_float(rc_cfg.get("factor", 2.0), 2.0, 1.0, 10.0)
         self._retry_delay = 0.0  # 当前重连等待（指数退避）；成功收帧后归零
         # H.264/H.265(HEVC) 视频解码（host 视频编码路径）；JPEG 回退仍兼容
         self._decoder = codec_mod.VideoDecoder()
         self._got_key = False          # 是否已收到关键帧（视频解码起点）
+        # 第 105 条（B6）：解码"代数"。切源/重连时 +1，_decode_video_batch 进入时
+        # 快照并逐帧校验——主线程切源会重置解码器，而接收线程可能正在用**旧源**的
+        # NAL 循环，若不校验就会把旧源帧喂进新解码器（或把旧源画面贴到新源标签下），
+        # 并反复重建解码器。不一致即整批丢弃。
+        self._gen = 0
         self._video_unavailable_warned = False  # 第 11 条：解码器不可用只告警一次
         self._key_requested_at = 0.0   # 上次请求关键帧时刻（冷却 0.5s 防刷屏）
         self.video_mode = False        # 当前是否视频编码流（展示用）
@@ -248,6 +330,10 @@ class Channel:
         self.share_enabled = False            # 用户共享开关（不持久化，每次启动默认关）
         self._share = None                    # ScreenShareSession 或 None
         self._running = True
+        # 第 108 条（B13）：可中断的退避等待。stop() 置位后接收线程立即退出，
+        # 不再睡满退避（默认 30s，配置上限 1h）——否则"删掉再加同一地址"会累积
+        # 多个仍在睡的 channel-recv 线程。
+        self._stop_evt = threading.Event()
         self._active_sock = None  # 当前活动 socket（控制心跳线程与接收线程共享；断线即清空）
         self._share_sync_timer = None  # 第 61 条：连接后能力确认兜底定时器（stop 时 cancel）
         self._fps_times = []  # 1 秒滑动窗口内各帧的时间戳
@@ -305,6 +391,7 @@ class Channel:
                 self.status = "receiving"
                 self.video_mode = False
                 self._got_key = False
+                self._gen = getattr(self, "_gen", 0) + 1   # 第 105 条（B6）：作废在途批次（旧连接的 NAL）
                 # 重连后重建解码器：丢弃旧连接的参考帧，避免新流 P 帧对着旧参考解码出脏画面
                 self._decoder = codec_mod.VideoDecoder(codec=self.cur_codec)
                 # MultiView：重置能力状态并发 cap_probe；host 侧新连接默认 local，
@@ -312,12 +399,13 @@ class Channel:
                 self.multiview = False
                 self._cap_event.clear()
                 try:
-                    with self._tx_lock:
-                        send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
-                        send_msg(sock, {"action": "cap_probe"})
-                        if self.watch_source != "local":
-                            send_msg(sock, {"action": "watch",
-                                            "source": self.watch_source})
+                    # 第 100 条：三条消息各自有界（_send_locked），避免对端不读时
+                    # 接收线程在连接初始化阶段就无限阻塞。
+                    self._send_locked(sock, {"action": "req_keyframe", "t": time.time_ns()})
+                    self._send_locked(sock, {"action": "cap_probe"})
+                    if self.watch_source != "local":
+                        self._send_locked(sock, {"action": "watch",
+                                                 "source": self.watch_source})
                 except (OSError, ValueError):
                     pass
                 # 第 61 条：定时器设为 daemon 并登记句柄，stop() 时 cancel。否则非守护
@@ -418,9 +506,45 @@ class Channel:
             if self._retry_delay <= 0:
                 self._retry_delay = self._backoff_base
             log.info("频道[%s] %.1f 秒后重新连接…", self.name, self._retry_delay)
-            time.sleep(self._retry_delay)
+            # 第 108 条（B13）：Event.wait 替代 sleep —— stop()/request_stop() 置位后
+            # 立刻返回并退出循环，线程回收即时。
+            if self._stop_evt.wait(self._retry_delay):
+                break
             self._retry_delay = min(
                 self._retry_delay * self._backoff_factor, self._backoff_max)
+
+    def _send_locked(self, sock, obj, timeout=5.0):
+        """在 _tx_lock 内发送一条控制消息，并把 sendall 的阻塞时间收紧到 timeout 秒。
+
+        第 100 条：接收循环把共享 socket 置为阻塞（None），而 ping/req_keyframe/watch/
+        unshare 这些控制发送既无超时、又可能由接收线程自己发起（_request_keyframe 在
+        停滞分支里被调用）。对端停止读取时 sendall 会阻塞到 TCP 重传超时（几十秒到
+        数分钟），于是 select 停滞检测与重连全部失效、画面永久定格。这里临时收紧、
+        finally 还原（与 share.py 的 _send_msg 同一不变量：接收循环的阻塞基线必须保持）。
+
+        对不支持 gettimeout/settimeout 的替身 socket（测试）自动跳过收紧与还原。
+        """
+        with self._tx_lock:
+            prev = None
+            saved = False
+            try:
+                prev = sock.gettimeout()
+                saved = True
+            except Exception:
+                saved = False
+            if saved:
+                try:
+                    sock.settimeout(timeout)
+                except Exception:
+                    saved = False
+            try:
+                send_msg(sock, obj)
+            finally:
+                if saved:
+                    try:
+                        sock.settimeout(prev)
+                    except Exception:
+                        pass
 
     def _control_ping_loop(self, sock):
         """心跳/测 RTT 控制线程：周期发送 ping 到服务端，pong 由接收循环解析。
@@ -434,10 +558,9 @@ class Channel:
             if self._active_sock is not sock:
                 return  # 连接已重建/断开：旧连接的心跳线程退出
             try:
-                with self._tx_lock:
-                    send_msg(sock, {"action": "ping", "t": time.time_ns()})
+                self._send_locked(sock, {"action": "ping", "t": time.time_ns()})
             except (OSError, ValueError):
-                return  # 连接已断，接收循环会负责重连
+                return  # 连接已断/发送超时，接收循环会负责重连
 
     def _request_keyframe(self, sock):
         """向服务端请求关键帧（带 0.5s 冷却），用于首连/丢关键帧/花屏快速恢复。"""
@@ -446,8 +569,7 @@ class Channel:
             return
         self._key_requested_at = now
         try:
-            with self._tx_lock:
-                send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
+            self._send_locked(sock, {"action": "req_keyframe", "t": time.time_ns()})
         except (OSError, ValueError):
             pass
 
@@ -474,7 +596,15 @@ class Channel:
             return
         last_frame = None
         last_ts = 0
+        # 第 105 条（B6）：批次进入时快照代数；主线程切源/重连会 +1，逐帧校验，
+        # 一旦变化就整批丢弃（含尚未喂给解码器的旧源 NAL），避免脏帧与解码器反复重建。
+        # getattr 兜底：部分测试替身只实现被断言到的接口。
+        gen = getattr(self, "_gen", 0)
         for ts, codec, flags, nal in batch:
+            if gen != getattr(self, "_gen", 0):
+                log.debug("频道[%s] 解码批次作废（切源/重连），丢弃 %d 帧",
+                          self.name, len(batch))
+                return
             if codec != self.cur_codec:
                 # 编码切换（H.264 <-> HEVC）：重建解码器并从关键帧重新开始
                 self._decoder.set_codec(codec)
@@ -667,6 +797,14 @@ class Channel:
         # 超时返回后用户才提交时，结果只写进这个已被放弃的 box，绝不会串给下一次请求。
         box = {}
         done = threading.Event()
+        # 第 108 条（B15）：队列限长——接收线程 done.wait(120) 超时后会重连并再次入队，
+        # 用户几小时后回来关掉第一个框，主线程会接着弹出积压的第二、第三个"幽灵登录框"。
+        # 超过 4 个就丢掉最旧的（其等待者已超时或即将超时，done 不会再被误置）。
+        try:
+            while owner._cred_requests.qsize() >= 4:
+                owner._cred_requests.get_nowait()
+        except queue.Empty:
+            pass
         owner._cred_requests.put((self, done, box))
         done.wait(timeout=120)
         if not done.is_set():
@@ -721,41 +859,54 @@ class Channel:
     # ---------- MultiView：共享开关 / 观看源切换 ----------
 
     def request_keyframe(self):
-        """供接收线程响应 host 转达的 req_keyframe：提示上传器补关键帧。"""
-        with self._share_lock:
-            if self._share is not None:
-                self._share.request_keyframe()
+        """供接收线程响应 host 转达的 req_keyframe：提示上传器补关键帧。
+
+        第 106 条（B7）：**不取 _share_lock**。本方法跑在接收线程的控制消息路径上，
+        而停止共享/恢复共享会持该锁做 join（最多 2 秒）；被挡在锁上期间接收线程不
+        select/recv，socket 缓冲积压，锁一释放就一口气解几十帧——用户感知是"点一下
+        共享，画面卡 2 秒然后跳帧"。`_share` 只做整体替换，无锁读引用是安全的。
+        """
+        session = self._share
+        if session is not None:
+            session.request_keyframe()
 
     def set_share(self, on):
-        """开/关本频道屏幕共享。返回 (ok, 提示)；开时校验对方能力（cap 确认）。"""
-        with self._share_lock:
-            if not on:
+        """开/关本频道屏幕共享。返回 (ok, 提示)；开时校验对方能力（cap 确认）。
+
+        第 106 条（B7）：`_share_lock` 只保护"状态提交"，所有可能阻塞的操作
+        （`_cap_event.wait(2.0)`、`_stop_share` 的 join、`_send_locked`）都放到锁外。
+        否则接收线程处理 cap/peers（`_maybe_resume_share`）时会等在锁上最长 2 秒
+        不读 socket。
+        """
+        if not on:
+            with self._share_lock:
                 self.share_enabled = False
-                self._stop_share()
-                # 通知 host 注销本成员的共享登记（连接保留）：host 广播 roster，
-                # 其他观看端据此从源列表移除本端并回落 local
-                sock = self._active_sock
-                if sock is not None:
-                    try:
-                        with self._tx_lock:
-                            send_msg(sock, {"action": "unshare"})
-                    except (OSError, ValueError):
-                        pass
-                log.info("频道[%s] 共享已关闭", self.name)
-                return True, ""
+            self._stop_share()          # 锁外 join（最多 2 秒）
+            # 通知 host 注销本成员的共享登记（连接保留）：host 广播 roster，
+            # 其他观看端据此从源列表移除本端并回落 local
+            sock = self._active_sock
+            if sock is not None:
+                try:
+                    self._send_locked(sock, {"action": "unshare"})
+                except (OSError, ValueError):
+                    pass
+            log.info("频道[%s] 共享已关闭", self.name)
+            return True, ""
+        with self._share_lock:
             if self.share_enabled and self._share is not None and self._share.alive:
                 return True, ""
-            if not self.multiview:
-                # 能力尚未确认：cap_probe 已随连接发出，等 cap/peers（≤2s）
-                if not self._cap_event.wait(2.0):
-                    return False, "对方不支持共享上传（旧版服务端或无响应）"
-            if self.status != "receiving":
-                return False, "频道未连接，无法开启共享"
+        if not self.multiview:
+            # 能力尚未确认：cap_probe 已随连接发出，等 cap/peers（≤2s）
+            if not self._cap_event.wait(2.0):
+                return False, "对方不支持共享上传（旧版服务端或无响应）"
+        if self.status != "receiving":
+            return False, "频道未连接，无法开启共享"
+        with self._share_lock:
             self.share_enabled = True
             ok, err = self._start_share()
             if not ok:
                 self.share_enabled = False
-            return ok, err
+        return ok, err
 
     def switch_source(self, source):
         """切换观看源："local" 或 peers 中的 "peer:<n>"。成功返回 True。
@@ -783,6 +934,10 @@ class Channel:
             # 切到 H.264 源时旧 HEVC 解码器被喂 H.264 数据 → 解码恒失败 → 永久黑屏。
             self._decoder = codec_mod.VideoDecoder(codec=CODEC_H264)
             self.last_frame = None
+            # 第 105 条（B6）：切源同时作废在途解码批次——接收线程可能正拿着旧源的
+            # NAL 循环，不校验会把旧源帧喂进刚建好的解码器、或把旧源画面贴到新源
+            # 标签下（并反复重建解码器）。
+            self._gen = getattr(self, "_gen", 0) + 1
             # 第 8 条：清 last_frame 的同时递增 frame_serial，强制 poll 重绘，
             # 否则「有无新帧」判据认为没变化，画面会停留在上一个人至少一个 GOP。
             self.frame_serial += 1
@@ -791,11 +946,11 @@ class Channel:
             self._revert_source(prev_source)  # 第 9 条：未发包，回滚避免谎报
             return False
         try:
-            with self._tx_lock:
-                send_msg(sock, {"action": "watch", "source": source})
-                if source == "local":
-                    # 本地源由 host 编码线程消费 force_key；看 peer 由 host 转达
-                    send_msg(sock, {"action": "req_keyframe", "t": time.time_ns()})
+            # 第 100 条：有界发送；超时抛 socket.timeout（OSError 子类）→ 回滚
+            self._send_locked(sock, {"action": "watch", "source": source})
+            if source == "local":
+                # 本地源由 host 编码线程消费 force_key；看 peer 由 host 转达
+                self._send_locked(sock, {"action": "req_keyframe", "t": time.time_ns()})
         except (OSError, ValueError):
             self._revert_source(prev_source)  # 第 9 条：发包失败，回滚避免谎报
             return False
@@ -840,14 +995,20 @@ class Channel:
         return True, ""
 
     def _stop_share(self):
-        """停止并清空共享会话（须持 _share_lock 或由本方法自取）。"""
+        """停止并清空共享会话（可在任意线程调用，第 106 条 / B7）。
+
+        锁内只做"取走引用"，`session.stop()`（join 最多 2 秒）放到锁外执行——
+        否则接收线程的 `request_keyframe`/`_maybe_resume_share` 会在锁上等满 2 秒
+        不读 socket，表现为卡顿后突发解码。
+        """
         with self._share_lock:
-            if self._share is not None:
-                try:
-                    self._share.stop()
-                except Exception:
-                    pass
-                self._share = None
+            session = self._share
+            self._share = None
+        if session is not None:
+            try:
+                session.stop()
+            except Exception:
+                pass
 
     def _maybe_resume_share(self):
         """cap/peers 确认后：若共享开关仍开且无会话则启动（重连/新连接自动恢复）。"""
@@ -929,6 +1090,10 @@ class Channel:
         基本即刻返回），把 N 个共享频道的 2N 秒串行冻结压到约 2 秒。
         """
         self._running = False
+        # 第 108 条（B13）：打断退避等待，线程立即回收（getattr 兼容测试替身）
+        stop_evt = getattr(self, "_stop_evt", None)
+        if stop_evt is not None:
+            stop_evt.set()
         with self._share_lock:
             if self._share is not None:
                 self._share.signal_stop()
@@ -936,6 +1101,9 @@ class Channel:
     def stop(self):
         """停止接收线程与共享上传（daemon 线程，无需 join）。"""
         self._running = False
+        stop_evt = getattr(self, "_stop_evt", None)
+        if stop_evt is not None:
+            stop_evt.set()   # 第 108 条（B13）：打断退避等待
         # 第 61 条：cancel 能力确认兜底定时器并清 _active_sock，杜绝退出后定时器触发
         # _share_sync_after_connect → _start_share 在 teardown 期间新開上传会话。
         if self._share_sync_timer is not None:
@@ -948,30 +1116,22 @@ class Channel:
 class ViewerApp:
     """观看端应用：多频道接收 + tkinter 悬浮窗 + 控制台面板 + 全局热键。"""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, addr_override=None):
         self.cfg = cfg
         viewer_cfg = cfg["viewer"]
-        self.display_width = int(viewer_cfg.get("display_width", 480))
-        self.alpha = float(viewer_cfg.get("alpha", 0.9))
+        # 第 100 条：显示宽度/透明度来自配置，手改成 0/负数/字符串时不应让每帧
+        # resize 抛异常被吞成"永久占位文字"。这里与 set_display_width 同口径夹紧。
+        self.display_width = _cfg_int(viewer_cfg.get("display_width", 480), 480, 1, 4096)
+        self.alpha = _cfg_float(viewer_cfg.get("alpha", 0.9), 0.9, 0.0, 1.0)
         self.click_through = bool(viewer_cfg.get("click_through", True))
         self.panel_topmost = bool(viewer_cfg.get("panel_topmost", True))
 
-        # 频道列表：为空时回退到 server_addr 生成默认单频道（向后兼容）
-        channel_items = viewer_cfg.get("channels") or []
-        if not channel_items:
-            server_addr = viewer_cfg.get("server_addr", "127.0.0.1:5700")
-            channel_items = [{"name": "默认频道", "addr": server_addr}]
-        self.channels = [
-            Channel(
-                item.get("name") or ("频道%d" % (i + 1)),
-                item.get("addr", ""),
-                auth=item.get("auth") if isinstance(item.get("auth"), dict) else None,
-                owner=self,
-            )
-            for i, item in enumerate(channel_items)
-        ]
-        self.active_idx = 0
-
+        # ---- 第 100 条：先把接收线程依赖的全部状态建好，再创建频道 ----
+        # Channel.__init__ 末尾就启动接收线程，而 _receiver_loop 会读 owner._mainloop_ready
+        # （等界面就绪再连接）与 owner.running/_cred_requests。旧顺序把这些属性放在频道
+        # 列表之后 24 行创建，getattr(..., None) 拿到 None 就把"等待界面就绪"整个跳过
+        # （实测 200/200 次子线程都先于父线程到达该行）→ 首启向导期间就连接，服务端
+        # auth_timeout 到点即断，用户"明明输对了却登录失败"。
         self.running = True
         self.has_frame = False
         self._last_text = None
@@ -987,6 +1147,10 @@ class ViewerApp:
         self.user_moved = False
         self._mainloop_ready = threading.Event()  # mainloop 真正启动后置位，供接收线程安全调度 UI
         self._cred_requests = queue.Queue()  # 认证对话框请求队列（接收线程入队，主线程 poll 处理）
+        # 第 108 条（B14）：工作线程 → 主线程的 UI 回调队列。原来直接 root.after(0, fn)，
+        # running 判断与调用之间存在窗口：quit() 销毁 Tcl 解释器后仍可能向其投递命令
+        # （解释器层崩溃/挂起，except 兜不住）。改为只入队，由 15ms 的 poll 排空。
+        self._ui_queue = queue.SimpleQueue()
         self._cred_busy = False  # 第 93 条：认证对话框互斥标志，强制"每次只一个"，杜绝 wait_window 嵌套期间再叠一个
         self._channels_lock = threading.RLock()  # 保护频道列表与配置持久化（接收线程也会写凭据）
         self.root = None
@@ -997,6 +1161,29 @@ class ViewerApp:
         self.panel = None
         self._share_toggle_busy = False  # 第 60 条：共享开关异步执行期间的重入护栏
         self._save_after_id = None  # 第 64 条：viewer 配置去抖落盘的 root.after 句柄
+        self.channels = []
+        self.active_idx = 0
+
+        # 频道列表：为空时回退到 server_addr 生成默认单频道（向后兼容）
+        # 第 106 条（B16）：先规范化——手改成字符串/对象时旧实现会遍历字符并调 .get，
+        # 抛 AttributeError 让 ViewerApp 构造失败（启动直接弹错误框）。
+        channel_items = _normalize_channel_items(viewer_cfg)
+        self.channels = [
+            Channel(
+                item.get("name") or ("频道%d" % (i + 1)),
+                item.get("addr", ""),
+                auth=item.get("auth") if isinstance(item.get("auth"), dict) else None,
+                owner=self,
+            )
+            for i, item in enumerate(channel_items)
+        ]
+        # 第 100 条：命令行 --addr 是"本次运行生效"的覆盖。旧实现只写 server_addr，
+        # 而 server_addr 仅在频道列表为空时被读取 → 已有频道时该参数被静默忽略。
+        # 这里把它作为**临时频道**插到首位并设为活动频道（不写回配置，见 _save_channels）。
+        if addr_override:
+            self.channels.insert(0, Channel("命令行地址", addr_override,
+                                            owner=self, ephemeral=True))
+        self.active_idx = 0
 
     # ---------- 生命周期 ----------
 
@@ -1107,13 +1294,16 @@ class ViewerApp:
         with self._channels_lock:
             was_active = (i == self.active_idx)
             removed = self.channels.pop(i)
-            removed.stop()
-            log.info("删除频道[%s] %s", removed.name, removed.addr)
             if was_active:
                 self.active_idx = max(0, min(i, len(self.channels) - 1))
             elif self.active_idx > i:
                 self.active_idx -= 1
-            self._save_channels()
+        # 第 106 条（B7）：stop()（含共享会话 join，最多 2 秒）与落盘都移到
+        # _channels_lock 之外——接收线程的 _save_channels 也在抢这把锁，被挡住就
+        # 是 2 秒不读帧；主线程这边则是"删除频道"卡住界面。
+        removed.stop()
+        log.info("删除频道[%s] %s", removed.name, removed.addr)
+        self._save_channels()
         self._refresh_overlay()
 
     def get_channels_snapshot(self):
@@ -1127,6 +1317,7 @@ class ViewerApp:
                 "name": ch.name,
                 "addr": ch.addr,
                 "status": ch.status,
+                "auth_msg": ch.auth_msg,  # 第 104 条（B10）：认证失败具体原因，面板据此显示
                 "fps": fps,
                 "latency": latency,  # 端到端延迟（RTT/2，0 表示暂无数据）
                 "video": ch.video_mode,  # 是否视频编码流（展示用）
@@ -1135,7 +1326,11 @@ class ViewerApp:
         return snapshot
 
     def _save_channels(self):
-        """将当前频道列表（name/addr/auth）写回配置（线程安全）。"""
+        """将当前频道列表（name/addr/auth）写回配置（线程安全）。
+
+        第 100 条：跳过命令行 `--addr` 临时加入的频道（ch.ephemeral），
+        避免每次带参数启动都往 config.json 里追加一条永久频道。
+        """
         with self._channels_lock:
             self.cfg["viewer"]["channels"] = [
                 {
@@ -1144,6 +1339,7 @@ class ViewerApp:
                     **({"auth": ch.auth} if ch.auth else {}),
                 }
                 for ch in self.channels
+                if not getattr(ch, "ephemeral", False)
             ]
             save_config(self.cfg, "viewer")
 
@@ -1190,24 +1386,38 @@ class ViewerApp:
         self._flush_save()
 
     def _post_ui(self, fn):
-        """把回调安全调度到主线程（子线程调用，root 未就绪/已销毁/退出中静默丢弃）。
+        """把回调交给主线程执行（子线程调用，退出中静默丢弃）。
 
         第 92 条：除 root 为空外，还拦截「mainloop 未就绪」与「已进入退出」两种状态。
-        退出瞬间从外部线程调进已销毁的 Tcl 解释器不只是抛异常——可能崩溃/挂起，
-        末尾的 except 兜不住。热键线程与诊断线程必须改走这里，而非直接 root.after。
+        第 108 条（B14）：改为**只入队**，不再从工作线程直接 `root.after`。原来的
+        `running` 判断与 `root.after` 之间是 TOCTOU 窗口——quit() 正在销毁 Tcl 解释器时
+        仍可能向其投递命令，那是解释器层崩溃/挂起，末尾的 except 兜不住。回调统一由
+        `poll` 在 Tk 主线程里 `_drain_ui_queue` 执行。
         """
         if not self.running:
             return
         ready = getattr(self, "_mainloop_ready", None)
         if ready is not None and not ready.is_set():
             return
-        root = self.root
-        if root is None:
-            return
         try:
-            root.after(0, fn)
+            self._ui_queue.put(fn)
         except Exception:
             pass
+
+    def _drain_ui_queue(self):
+        """主线程：执行工作线程投递的 UI 回调（第 108 条 / B14）。
+
+        单次最多执行 64 个，避免某次 poll 被大量回调拖住；剩余的下一个 15ms 周期继续。
+        """
+        for _ in range(64):
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception:
+                log.warning("UI 回调执行失败", exc_info=True)
 
     def _on_peers_changed(self):
         """频道 peers 更新回调（主线程）：立即刷新画面源卡片与共享按钮。"""
@@ -1636,18 +1846,20 @@ class ViewerApp:
             frame = None
             name = None
             status = None
+            auth_msg = ""
             serial = 0
             changed = True
             if self.channels and 0 <= idx < len(self.channels):
                 ch = self.channels[idx]
                 name, status = ch.name, ch.status
+                auth_msg = ch.auth_msg
                 with ch.lock:
                     serial = ch.frame_serial
                 changed = (idx != self._panel_last_idx or serial != self._panel_last_serial)
                 if changed:
                     with ch.lock:
                         if ch.last_frame is not None:
-                            frame = ch.last_frame.copy()
+                            frame = ch.last_frame   # 第 105 条（B5）：只取引用
             if frame is not None:
                 if changed:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1677,22 +1889,35 @@ class ViewerApp:
                 if clear:
                     self._panel_last_serial = -1
                     self._panel_last_idx = -1
-                    # 先让 label 脱离旧图像再释放引用（同上，避免删除仍在显示的图像）
-                    self._preview_label.configure(image=None, text="暂无画面")
+                    # 第 102 条：清空图像必须用 ""，**不能用 None**。tkinter 的
+                    # _options() 会丢弃值为 None 的选项，`configure(image=None, ...)`
+                    # 实际只发 -text，label 的 -image 仍指向旧图；随后
+                    # `self._panel_photo = None` 让 PhotoImage.__del__ 执行
+                    # `image delete pyimageN`，label 从此持有已删除的图像名 →
+                    # 之后任何 configure 都抛 TclError: image "pyimageN" doesn't
+                    # exist（实测每次切源必现，预览永久失效并刷屏）。
+                    self._preview_label.configure(image="", text="暂无画面")
                     self._panel_photo = None
             # 预览小字：频道名称与状态
             if name is None:
                 self._preview_info.configure(text="", fg=COL_DIM)
             else:
                 self._preview_info.configure(
-                    text="%s · %s" % (name, STATUS_TEXT.get(status, status)),
+                    # 第 104 条（B10）：认证失败显示具体原因（密码错/撞名/取消/通信失败）
+                    text="%s · %s" % (name, auth_msg if status == "auth" and auth_msg
+                                      else STATUS_TEXT.get(status, status)),
                     fg=STATUS_COLOR.get(status, COL_DIM))
         except Exception:
             # 第 91 条：cvtColor/fromarray/resize/PhotoImage/configure 原全裸奔，一帧异常形状
             # （如解码出灰度 (H,W) 而非 (H,W,3)、或通道数不符）的图像会让 cv2.cvtColor 抛异常，
             # 在末尾续排 after 之前逃出 → 预览永久停更（fps/状态陈旧），而悬浮窗仍动 →「半活」。
             # 对照 _show_frame 本就有 try 兜底。兜底后异常被记录、本次跳过，finally 续排定时器。
-            log.warning("面板预览刷新失败，跳过本次（定时器续排，不停更）", exc_info=True)
+            # 第 102 条：同一条 TclError 每 200ms 刷一条会淹没真问题（实测单次会话 66 条），
+            # 改为 60 秒最多记一次（首次仍可见，供排查）。
+            now_err = time.monotonic()
+            if now_err - getattr(self, "_preview_err_at", 0.0) >= 60.0:
+                self._preview_err_at = now_err
+                log.warning("面板预览刷新失败，跳过本次（定时器续排，不停更）", exc_info=True)
         finally:
             try:
                 self.panel.after(200, self._panel_refresh_preview)
@@ -2319,6 +2544,16 @@ class ViewerApp:
             ch, done, box = self._cred_requests.get_nowait()
         except queue.Empty:
             return
+        # 第 108 条（B15）：丢弃陈旧请求——等待者已超时（done 已置位）或频道已被删除时，
+        # 再弹一个模态框只会打扰用户，且结果写进无人等待的 box。删除频道的情况顺手
+        # 置位 done，让接收线程立刻从 done.wait(120) 返回。
+        if done.is_set():
+            return
+        channels = getattr(self, "channels", None)
+        if channels is not None and ch not in channels:
+            box["result"] = {"error": RuntimeError("频道已删除")}
+            done.set()
+            return
         self._cred_busy = True
         result = {}
         try:
@@ -2341,6 +2576,7 @@ class ViewerApp:
         # 仍在跑，造成面板与悬浮窗互相矛盾。提前重排可让悬浮窗在对话框期间继续刷新
         # （嵌套循环照常触发 after 定时器），且每次只排一个后继，不会形成定时器风暴。
         self.root.after(15, self.poll)
+        self._drain_ui_queue()          # 第 108 条（B14）：执行工作线程投递的 UI 回调
         self._process_cred_requests()
         if not self.channels:
             self._show_text("无频道")
@@ -2355,7 +2591,11 @@ class ViewerApp:
         frame = None
         with channel.lock:
             if channel.last_frame is not None:
-                frame = channel.last_frame.copy()
+                # 第 105 条（B5）：只取引用，不再 copy()。last_frame 永远整体替换、
+                # 从不原地修改（_store_frame 赋新数组、switch_source 置 None），
+                # 而下方 cvtColor/Image.fromarray 都只读；1080p 下每帧省 ~6MB 拷贝，
+                # 也缩短了持锁时间（接收线程 _store_frame 等的是同一把锁）。
+                frame = channel.last_frame
         if frame is not None:
             self._show_frame(frame, serial)
         else:
@@ -2363,7 +2603,9 @@ class ViewerApp:
             if channel.status == "disconnected":
                 self._show_text("已断开，正在重连…")
             elif channel.status == "auth":
-                self._show_text("需要登录")
+                # 第 104 条（B10）：显示具体原因（密码错/撞名/取消/通信失败），
+                # 而不是统一的"需要登录"——auth_msg 原来只写不读，用户无从判断。
+                self._show_text(channel.auth_msg or "需要登录")
             else:
                 self._show_text("连接中…")
 
@@ -2380,13 +2622,13 @@ class ViewerApp:
         with channel.lock:
             serial = channel.frame_serial
             if channel.last_frame is not None:
-                frame = channel.last_frame.copy()
+                frame = channel.last_frame   # 第 105 条（B5）：只取引用，无需拷贝
         if frame is not None:
             self._show_frame(frame, serial)
         elif channel.status == "disconnected":
             self._show_text("已断开，正在重连…")
         elif channel.status == "auth":
-            self._show_text("需要登录")
+            self._show_text(channel.auth_msg or "需要登录")
         else:
             self._show_text("连接中…")
 
@@ -2458,7 +2700,12 @@ class ViewerApp:
             return
         self.has_frame = False
         self._last_text = text
-        self.label.configure(image=None, text=text)
+        # 第 102 条：必须用 "" 清空 -image。`configure(image=None, ...)` 里 None 会被
+        # tkinter 丢弃（只发 -text），而 Label 的 compound 默认是 "none"——只要还挂着
+        # 图像就只显示图像、不显示文字。于是断线/切源后用户看到的是**上一帧静止画面**
+        # 而不是"已断开，正在重连…"（实测：文字布局宽度 481 vs 图片布局 54）。
+        self.label.configure(image="", text=text)
+        self._photo = None  # label 已脱离图像，可安全释放 Tk 侧对象
         # 第 98 条：内容切到文字占位、窗口尺寸随之改变 → 作废照片尺寸定位缓存，
         # 使下一帧画面恢复时必定重新定位（否则会沿用照片尺寸旧位置而错位）。
         self._last_pos_size = None
@@ -2645,22 +2892,31 @@ def main():
     # ViewerApp 构造等位于下方 try 之外、异常会逃逸到解释器顶层的启动阶段）。
     # 不在 import 时安装，避免劫持测试套件等仅 import viewer 的进程的全局错误处理。
     sys.excepthook = _handle_uncaught
+    # 第 100 条：工作线程也要有兜底（与 host.py 一致）。windowed 打包下 sys.stderr
+    # 为 None，默认 threading.excepthook 什么都不会写 → 线程崩溃后日志空白、画面定格。
+    threading.excepthook = _thread_excepthook
     parser = argparse.ArgumentParser(description="FPS 画面观看端（TCP 客户端 + 置顶悬浮窗）")
     parser.add_argument(
-        "--addr", help="服务端地址 host:port，可覆盖配置文件中的 viewer.server_addr"
+        "--addr", help="服务端地址 host:port，本次运行作为首个频道使用（无频道时覆盖 viewer.server_addr）"
     )
     args = parser.parse_args()
 
     cfg = load_config()
     logger.setup_logger(cfg)
+    addr_override = None
     if args.addr:
-        cfg["viewer"]["server_addr"] = args.addr
-        save_config(cfg, "viewer")
-        log.info("已使用命令行地址 %s 并写入配置", args.addr)
+        # 第 100 条：server_addr 仅在频道列表为空时被读取，已有频道时旧实现把参数
+        # 静默忽略（却写盘并打印"已使用"）。改为：始终作为临时频道生效；只有确实
+        # 没有频道时才写回 server_addr（保持向后兼容的持久化语义）。
+        addr_override = args.addr
+        if not (cfg["viewer"].get("channels") or []):
+            cfg["viewer"]["server_addr"] = args.addr
+            save_config(cfg, "viewer")
+        log.info("已使用命令行地址 %s（作为首个频道，不写入配置）", args.addr)
 
     enable_dpi_awareness()
 
-    app = ViewerApp(cfg)
+    app = ViewerApp(cfg, addr_override=addr_override)
     try:
         app.run()
     except Exception:

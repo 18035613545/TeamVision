@@ -89,6 +89,10 @@
 
 运行 `TeamVision-Setup-1.3.0.exe`（Inno Setup 产物），自动放置 `fps-host.exe` 与 `fps-viewer.exe`。
 
+> 安装包为**用户级安装**（默认装到 `%LOCALAPPDATA%\Programs\TeamVision`，不需要管理员权限）。
+> `config.json`、`accounts.json` 与 `logs\` 都写在程序所在目录；若该目录不可写（例如手动装到
+> `C:\Program Files`），会自动回退到 `%LOCALAPPDATA%\TeamVision\`，并在首次运行时迁移已有配置。
+
 ### 方式二：绿色版
 
 将 `fps-host.exe`、`fps-viewer.exe` 放到同一目录即可运行；`config.json` 首次运行自动生成。
@@ -121,7 +125,9 @@
 
 ## 配置参考（config.json）
 
-配置文件与 exe 同目录，缺失时自动生成；旧配置升级时自动补全新字段（不覆盖已有值）。
+配置文件优先放在 exe 同目录（绿色版），该目录不可写时自动改用 `%LOCALAPPDATA%\TeamVision\`
+（并迁移已有配置）；缺失时自动生成，旧配置升级时自动补全新字段（不覆盖已有值）。
+`accounts.json` 与 `logs\` 同此规则。
 
 ### 共享端 `host`
 
@@ -178,7 +184,7 @@ build_exe.bat
 # 4. 生成安装包（需先安装 Inno Setup 6）
 build_installer.bat
 
-# 5. 运行测试（214 项单元测试）
+# 5. 运行测试（327 项单元测试，约 111 秒）
 run_tests.bat
 ```
 

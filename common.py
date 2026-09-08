@@ -20,9 +20,11 @@ kind 标记让接收端无需猜测即可区分帧与控制消息（ping/pong �
 import copy
 import json
 import os
+import shutil
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 
@@ -80,6 +82,10 @@ DEFAULT_CONFIG = {
             "rcvbuf_kb": 2048,   # 接收缓冲（KB）
             "keepalive": True,
             "keepalive_idle_s": 60,  # 客户端无消息超过该时长视为半开连接并移除
+            "max_clients": 32,   # 同时在册连接上限（含握手中，第 103 条）
+            "msg_timeout_s": 15.0,  # 单条消息（头+体）接收总时限，防 slowloris（第 103 条）
+            "upstream_max_kbps": 0,  # 单成员上行带宽上限（0=自动 2×codec.bitrate_kbps，第 107 条）
+            "upstream_max_fps": 0    # 单成员上行帧率上限（0=自动 max(8, 2×fps)，第 107 条）
         },
         "perf": {
             "adaptive": True,
@@ -387,9 +393,95 @@ def exe_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+#: 数据目录缓存（config.json/accounts.json/日志共用；None=尚未探测）
+_DATA_DIR = None
+
+
+def _probe_writable(d):
+    """探测目录是否可写（创建目录 + 写一个探针文件再删除），绝不抛异常。"""
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".wprobe_%d" % os.getpid())
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _data_dir_candidates():
+    """默认数据目录候选（按优先级）：exe 目录 → %LOCALAPPDATA%\\TeamVision → 临时目录。"""
+    candidates = [exe_dir()]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(os.path.join(local, "TeamVision"))
+    candidates.append(os.path.join(tempfile.gettempdir(), "TeamVision"))
+    return candidates
+
+
+def data_dir(candidates=None):
+    """返回**可写**的数据目录，config.json / accounts.json / logs 共用（第 102 条）。
+
+    安装到 Program Files（机器级目录）后非管理员运行时 exe_dir() 不可写：原实现把
+    config.json 与 accounts.json 都写在那里，于是 `load_config` 首次启动就抛
+    PermissionError（host 的 excepthook 还没装 → windowed 打包下静默退出、无日志，
+    即用户口中的"双击没反应"），改设置时 save_config 抛异常被 Tk 回调吞掉，表现为
+    "设置老是自己消失"。logger 早就有同样的回退（第 13 条），这里把它统一到
+    common，让配置/账户/日志落在同一个可写目录。
+
+    便携（绿色版）行为不变：exe_dir() 可写时仍然优先用它。
+    candidates 仅用于单测注入（给定时不写缓存）；全部不可写时返回 None。
+    """
+    global _DATA_DIR
+    cache = candidates is None
+    if cache and _DATA_DIR is not None:
+        return _DATA_DIR
+    if cache:
+        candidates = _data_dir_candidates()
+    for d in candidates or []:
+        if d and _probe_writable(d):
+            if cache:
+                _DATA_DIR = d
+            return d
+    return None
+
+
+def _migrate_from_exe_dir(name):
+    """返回可写数据目录下 name 的路径；若该文件只在 exe 目录存在则先复制过去。
+
+    用于从"绿色版/机器级安装"平滑迁移：老用户 exe 同目录已有 config.json 或
+    accounts.json，升级后数据目录变到 %LOCALAPPDATA%\\TeamVision 时不能丢设置与账户。
+    任何失败都静默（迁移只是尽力而为，绝不影响启动）。
+    """
+    base = data_dir() or exe_dir()
+    path = os.path.join(base, name)
+    legacy = os.path.join(exe_dir(), name)
+    if os.path.abspath(legacy) == os.path.abspath(path):
+        return path
+    if os.path.exists(path) or not os.path.exists(legacy):
+        return path
+    try:
+        shutil.copyfile(legacy, path)
+        try:
+            import logger
+            logger.get_logger().info(
+                "%s 已从 %s 迁移到可写数据目录 %s", name, exe_dir(), base)
+        except Exception:
+            pass
+    except OSError:
+        pass
+    return path
+
+
 def _config_path():
-    """返回 config.json 的完整路径（与程序资源所在目录同目录）。"""
-    return os.path.join(exe_dir(), "config.json")
+    """返回 config.json 的完整路径（可写数据目录，见 data_dir）。"""
+    return _migrate_from_exe_dir("config.json")
+
+
+def accounts_path():
+    """返回 accounts.json 的完整路径（可写数据目录，见 data_dir）。"""
+    return _migrate_from_exe_dir("accounts.json")
 
 
 def _deep_merge(base, override):
@@ -419,11 +511,21 @@ def load_config():
 
     第 16 条：文件损坏（非法 JSON / 顶层非字典 / 合并异常）时不再抛出原始
     traceback 让程序起不来，而是把损坏文件重命名留存、回退默认配置并重新落盘。
+    第 102 条：写入失败（目录只读/磁盘满）也只告警并返回默认配置——启动阶段
+    绝不能因为"存不下配置"而崩溃（windowed 打包下表现为静默退出、无日志）。
     """
     path = _config_path()
     if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            try:
+                import logger
+                logger.get_logger().warning(
+                    "config.json 无法写入 %s（%s），本次运行使用默认配置", path, e)
+            except Exception:
+                pass
         return copy.deepcopy(DEFAULT_CONFIG)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -486,6 +588,21 @@ def save_config(cfg, section=None):
                     base = {}
             base[section] = cfg.get(section)
             out = base
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        # 第 102 条：写盘失败（目录只读/磁盘满/杀软占用）只记一条 ERROR 并返回。
+        # 调用方在 Tk 回调/接收线程里，抛出去要么被 Tk 静默吞掉（用户看到"改了没反应"），
+        # 要么直接打死接收线程；吞掉 + 明确日志既保住本次运行的行为，又留下可排查的痕迹。
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            try:
+                import logger
+                logger.get_logger().error(
+                    "config.json 写入失败（%s）：本次改动仅在内存生效，重启后丢失", e)
+            except Exception:
+                pass

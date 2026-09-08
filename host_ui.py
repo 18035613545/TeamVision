@@ -43,18 +43,35 @@ class _LogQueueHandler(logging.Handler):
             pass
 
 
-def list_monitors():
-    """枚举本机显示器（mss 语义），返回 ["0: 全部屏幕 (WxH)", "1: 显示器 1 (WxH)", ...]。"""
-    monitors = []
+def list_monitor_rects():
+    """枚举本机显示器矩形（mss 语义），返回 [{"left","top","width","height"}, ...]。
+
+    索引 0 是"全部屏幕"的并集，1..N 为各物理显示器。枚举失败返回 []（调用方按
+    "无法校验"处理，绝不因此拦住用户设置）。
+    """
+    rects = []
     try:
         with mss.MSS() as sct:
-            for i, m in enumerate(sct.monitors):
-                label = "全部屏幕" if i == 0 else "显示器 %d" % i
-                monitors.append("%d: %s (%dx%d)" % (i, label, m["width"], m["height"]))
+            for m in sct.monitors:
+                rects.append({"left": int(m["left"]), "top": int(m["top"]),
+                              "width": int(m["width"]), "height": int(m["height"])})
     except Exception as e:
-        log.warning("枚举显示器失败: %s", e)
-        monitors = ["1: 主显示器"]
-    return monitors
+        log.warning("枚举显示器矩形失败: %s", e)
+    return rects
+
+
+def _monitor_labels(rects):
+    """把显示器矩形列表转成下拉框标签（索引 0 为"全部屏幕"）。"""
+    if not rects:
+        return ["1: 主显示器"]
+    return ["%d: %s (%dx%d)" % (i, "全部屏幕" if i == 0 else "显示器 %d" % i,
+                               m["width"], m["height"])
+            for i, m in enumerate(rects)]
+
+
+def list_monitors():
+    """枚举本机显示器（mss 语义），返回 ["0: 全部屏幕 (WxH)", "1: 显示器 1 (WxH)", ...]。"""
+    return _monitor_labels(list_monitor_rects())
 
 
 class HostConsole:
@@ -65,7 +82,8 @@ class HostConsole:
 
     def __init__(self, runtime):
         self.runtime = runtime
-        self.monitors = list_monitors()
+        self.monitor_rects = list_monitor_rects()
+        self.monitors = _monitor_labels(self.monitor_rects)
         self.root = tk.Tk()
         self.root.title("%s v%s · 共享端控制台" % (APP_NAME, APP_VERSION))
         self.root.configure(bg=COL_BG)
@@ -274,9 +292,32 @@ class HostConsole:
 
     @staticmethod
     def _region_text(region):
-        if not region:
+        # 第 100 条：缺键/非数字的 region（手改 config.json）不得抛 KeyError——
+        # 那会让整个图形控制台构造失败、静默回落到命令行模式（"双击没反应"）。
+        if not isinstance(region, dict):
             return ""
-        return "%d,%d,%d,%d" % (region["left"], region["top"], region["width"], region["height"])
+        try:
+            return "%d,%d,%d,%d" % (region["left"], region["top"],
+                                    region["width"], region["height"])
+        except (KeyError, TypeError, ValueError):
+            log.warning("采集区域配置非法（%r），输入框按空（全屏）显示", region)
+            return ""
+
+    def _region_out_of_bounds(self, region):
+        """区域是否明显越界；越界返回 (可用宽, 可用高)，否则 None。
+
+        第 100 条：mss 对越界区域**不报错**，只是返回全黑帧（实测 left/top=99999
+        时 mean=0），于是观看端全黑、GUI 却显示"采集源已更新"、帧率正常。这里用
+        所有显示器的最大宽高做保守校验（不按单个显示器原点比对，避免多屏偏移误判）。
+        枚举失败（monitor_rects 为空）时不做校验。
+        """
+        max_w = max((m["width"] for m in self.monitor_rects), default=0)
+        max_h = max((m["height"] for m in self.monitor_rects), default=0)
+        if max_w <= 0 or max_h <= 0:
+            return None
+        if region["left"] + region["width"] > max_w or region["top"] + region["height"] > max_h:
+            return max_w, max_h
+        return None
 
     def run(self):
         self.root.mainloop()
@@ -334,6 +375,15 @@ class HostConsole:
             except Exception:
                 self._set_status(
                     "区域格式错误：应为 左,上,宽,高（左/上≥0，宽/高须为正整数）", error=True)
+                return
+            # 第 100 条：越界区域 mss 不报错、只给全黑帧 → 观看端全黑而状态栏仍说
+            # "已更新"。这里提前拦下并说明原因。
+            bounds = self._region_out_of_bounds(region)
+            if bounds is not None:
+                self._set_status(
+                    "区域超出显示器范围：%d,%d,%d,%d（最大可用 %dx%d）" % (
+                        region["left"], region["top"], region["width"],
+                        region["height"], bounds[0], bounds[1]), error=True)
                 return
         backend = self._backend_var.get().strip().lower() or "mss"
         self.runtime.update_capture(monitor=monitor, region=region, backend=backend)

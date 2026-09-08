@@ -118,9 +118,20 @@ class CaptureManager:
         if self.backend == "dxgi":
             try:
                 import dxcam  # 延迟导入：可选依赖，未安装时回退 mss
-                self._camera = dxcam.create(output_idx=max(0, self.monitor - 1))
+                # 第 100 条：dxcam 的 output_color 默认是 "RGB"，其处理器做的是
+                # COLOR_BGRA2RGB，即 grab() 返回 RGB 数组；而本程序全链路（JPEG
+                # imencode、av.VideoFrame(format="bgr24")、观看端 BGR2RGB）都按 BGR
+                # 处理，用默认值会让整路画面红蓝互换。必须显式要 BGR。
+                try:
+                    self._camera = dxcam.create(
+                        output_idx=max(0, self.monitor - 1), output_color="BGR")
+                except TypeError:
+                    # 旧版 dxcam 无该参数：退回默认调用并告警（通道可能互换）
+                    log.warning("dxcam 不支持 output_color 参数，画面可能红蓝互换，"
+                                "请升级 dxcam")
+                    self._camera = dxcam.create(output_idx=max(0, self.monitor - 1))
                 self._effective = "dxgi"
-                log.info("采集后端: dxgi（显示器 #%d）", self.monitor)
+                log.info("采集后端: dxgi（显示器 #%d，BGR）", self.monitor)
                 return
             except Exception as e:
                 log.warning("dxgi 后端不可用，回退 mss：%s", e)
@@ -157,7 +168,7 @@ class CaptureManager:
                     frame = self._camera.grab(region=(l, t, r, b))
                 else:
                     frame = self._camera.grab()
-                return frame  # dxcam 返回 BGR ndarray 或 None（无新帧）
+                return frame  # dxcam 返回 BGR ndarray（已显式 output_color="BGR"）或 None（无新帧）
             if self._mss is not None:
                 if self.region:
                     mon = {"left": int(self.region["left"]), "top": int(self.region["top"]),
