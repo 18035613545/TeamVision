@@ -87,7 +87,7 @@
 
 ### 方式一：安装包（推荐）
 
-运行 `TeamVision-Setup-1.3.0.exe`（Inno Setup 产物），自动放置 `fps-host.exe` 与 `fps-viewer.exe`。
+[下载 TeamVision-Setup-1.3.0.exe（186 MB）](https://github.com/18035613545/TeamVision/releases/tag/v1.3.0) —— 安装后自动放置 `fps-host.exe` 与 `fps-viewer.exe`。
 
 > 安装包为**用户级安装**（默认装到 `%LOCALAPPDATA%\Programs\TeamVision`，不需要管理员权限）。
 > `config.json`、`accounts.json` 与 `logs\` 都写在程序所在目录；若该目录不可写（例如手动装到
