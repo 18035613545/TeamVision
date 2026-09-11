@@ -176,37 +176,65 @@ class VideoEncoder:
         ctx.open()
         return ctx
 
-    def _recreate(self, bitrate):
-        """关闭旧上下文并按新码率重建；返回是否成功。"""
-        if self._permafailed or self._closed:
-            return False
-        self._close_ctx()
-        self._last_bitrate = int(bitrate)
-        names = self._pick_encoder()
+    def _create_ctx_with(self, names, bitrate):
+        """在**锁外**按候选顺序构造并打开新上下文；返回 (ctx, name)，全失败返回 (None, "")。
+
+        第 112 条（C1）：NVENC 拆装一次约 93–110ms，原先整个重建过程都在 `self._lock`
+        之内，编码线程要停等三帧（30fps 下 100ms 卡顿）。把"构造"移出锁、只在锁内做
+        指针切换，编码线程即可用旧上下文继续出帧直到新上下文就绪。
+        """
         for name in names:
             try:
-                self._ctx = self._create_ctx(name, self._last_bitrate)
-                self.name = name
-                self._rebuilt_at_frame = self.frame_sent  # 重建后首帧必为关键帧（IDR）
-                return True
+                return self._create_ctx(name, bitrate), name
             except Exception as e:
-                self._ctx = None
                 log_note("视频编码器 %s 初始化失败: %s" % (name, e))
-        self.name = ""
-        return False
+        return None, ""
 
-    def _close_ctx(self):
+    def _install_ctx(self, ctx, name, bitrate):
+        """切换上下文（调用方须持锁）：只做指针交换 + 旧上下文解引用，耗时微秒级。"""
+        old = self._ctx
+        self._ctx = ctx
+        self.name = name
+        self._last_bitrate = int(bitrate)
+        self._rebuilt_at_frame = self.frame_sent  # 重建后首帧必为关键帧（IDR）
+        self._retire_ctx(old)
+
+    def _recreate(self, bitrate, keep_old_on_failure=False):
+        """按新码率重建上下文；返回是否成功。
+
+        第 112 条（C1）：改为**先建后切**——新上下文构造成功才替换旧的。旧实现在
+        构造前就 `_close_ctx()`，一旦新码率建不出来（显存不足/驱动拒绝），原本可用的
+        编码器也被自己拆掉，只能回退 JPEG；现在失败时旧上下文原样保留。
+        `keep_old_on_failure=False` 用于旧上下文确已不可用的场景（帧尺寸变化、连续
+        编码失败后的自愈重建），此时必须丢弃它，否则会继续按旧尺寸出帧。
+        """
+        if self._permafailed or self._closed:
+            return False
+        ctx, name = self._create_ctx_with(self._pick_encoder(), bitrate)
+        if ctx is None:
+            if not keep_old_on_failure:
+                self._close_ctx()
+                self.name = ""
+            return False
+        self._install_ctx(ctx, name, bitrate)
+        return True
+
+    @staticmethod
+    def _retire_ctx(ctx):
         # PyAV 17 的 CodecContext 没有 close()：先解引用让 GC 释放 NVENC 会话，
         # 仅当底层确实提供 close 时才调用（兼容旧版 PyAV），不再假装关闭。
-        ctx = self._ctx
-        self._ctx = None
-        if ctx is not None:
-            close = getattr(ctx, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
+        if ctx is None:
+            return
+        close = getattr(ctx, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _close_ctx(self):
+        ctx, self._ctx = self._ctx, None
+        self._retire_ctx(ctx)
 
     # ---------- 对外 ----------
 
@@ -304,6 +332,9 @@ class VideoEncoder:
         """码率自适应：目标码率变化超过当前 ±hysteresis 时重建编码器。
 
         返回 True 表示已重建（调用方应让下一帧强制关键帧以重置解码端参考帧）。
+
+        第 112 条（C1）：构造新上下文在**锁外**完成，编码线程不再为一次调码率停等
+        约 100ms；且新上下文建不出来时保持旧上下文可用（不再自毁编码器）。
         """
         bps = max(64, int(bps))
         with self._lock:
@@ -311,7 +342,16 @@ class VideoEncoder:
                 return False  # 第 52 条：已关闭/已失效，禁止复活
             if self._ctx is not None and abs(bps - self._last_bitrate) <= self._last_bitrate * hysteresis:
                 return False
-            return self._recreate(bps)
+            names = self._pick_encoder()
+        ctx, name = self._create_ctx_with(names, bps)
+        if ctx is None:
+            return False
+        with self._lock:
+            if self._closed or self._permafailed:
+                self._retire_ctx(ctx)
+                return False
+            self._install_ctx(ctx, name, bps)
+            return True
 
     def close(self):
         with self._lock:

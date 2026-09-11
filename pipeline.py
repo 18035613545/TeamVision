@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-"""编码器生命周期 + 编码 + 关键帧 + JPEG 回退（host 与 share 共用，第 110 条 · 阶段 2）。
+"""采集 → 静止门控 → 编码 的共享流水线（host 与 share 共用，第 110/111 条 · 阶段 2）。
 
-原先 host.py（本地共享端 `_encode_loop`）与 share.py（观看端上传 `_encode_send`）各自
-维护一份同构的编码/回退逻辑，且已开始漂移：
+host.py（本地共享端）与 share.py（观看端上传）原先各维护一套同构逻辑：采集句柄的
+故障恢复、静止检测门控、编码器生命周期与 JPEG 回退。参数与判据几乎一致而实现细节
+互有出入（host 缺编码器负缓存退避、share 缺静止边沿日志；重建阈值一个按秒一个按帧数），
+任一侧修 bug 另一侧不会跟着好。这里收成三个可独立测试的小对象：
 
-- share 有第 53 条的"构造失败负缓存退避"，host 没有 —— 编码器不可用（NVENC/x264 都打
-  不开、GPU 驱动异常）时 host 会**每帧**新建一次 VideoEncoder（4 次 av.Codec 查找 +
-  4 次 open + 最多 4 条告警，30 帧/秒），把 CPU 与日志一起打满且永不恢复；
-- host 有"编码器失效自动丢弃重建"，share 有等价逻辑但错误处理与日志各不相同。
+- `CaptureSource`（第 111 条）：采集句柄 + 故障恢复（连续异常重建、持续空帧重建、
+  后端已死重建、长期空帧告警）——两侧策略差异做成参数。
+- `StillGate`（第 111 条）：motion_changed + still_gate_update 状态机，可选边沿回调。
+- `FrameEncoder`（第 110 条）：编码器选型/重建/负缓存退避 + 编码 + 关键帧 + JPEG 回退。
 
-本模块把这段收成 `FrameEncoder` 一个实现，两侧只提供"帧去哪"（host 写共享槽、share
-经 _tx_lock 发送）与各自的动态参数（host 的 scale/quality/fps 来自共享槽，share 固定）。
+两侧只负责"帧去哪"：host 写共享槽（发送线程广播），share 经 _tx_lock 直接发送。
 
 第 90 条不变量：**本模块内所有 `encoder.encode(...)` 调用都在 try 之内**——编码器半死
 （GPU 重置 / PyAV 错误）时异常不得沿调用线程传播，否则 host 编码线程死亡 → 观看端永久
@@ -24,7 +25,8 @@ import cv2
 
 import logger
 import codec as codec_mod
-from screen import calc_output_size, encode_bgr
+from screen import (CaptureManager, calc_output_size, downsample_frame, encode_bgr,
+                    motion_changed, still_gate_update)
 
 log = logger.get_logger()
 
@@ -197,3 +199,205 @@ class FrameEncoder:
     def close(self):
         """释放编码器（幂等）。"""
         self._drop_encoder()
+
+
+class CaptureSource:
+    """采集句柄 + 故障恢复（第 111 条：host 与 share 共用同一份机制）。
+
+    两侧策略确有差异，因此差异全部做成参数，机制只写一份：
+
+    | 场景 | host（本地共享） | share（观看端上传） |
+    |---|---|---|
+    | 连续异常 | 5 次后重建 | 5 次后重建（仅自有句柄） |
+    | 持续空帧 | 后端 `working=False` 且持续 5 秒才重建 | 连续 `max(10, fps*5)` 帧无画面即重建 |
+    | 长期空帧 | 30 秒告警一次（画面静止/独占全屏属正常语义） | 无 |
+
+    `owned=False`（调用方注入的伪采集器，测试用）时**永不重建**：重建会换回真实后端，
+    把注入的替身顶掉。
+    """
+
+    def __init__(self, backend=None, monitor=1, region=None, *, capture=None,
+                 owned=True, name="", rebuild_on_errors=5,
+                 none_rebuild_frames=None, none_rebuild_s=None,
+                 none_rebuild_requires_dead=False, none_warn_s=None,
+                 sleep_on_none=0.01, sleep_on_error=0.5):
+        self._backend = backend
+        self._monitor = monitor
+        self._region = region
+        self._owned = owned
+        self._name = name
+        self._rebuild_on_errors = max(1, int(rebuild_on_errors))
+        self._none_rebuild_frames = none_rebuild_frames
+        self._none_rebuild_s = none_rebuild_s
+        self._none_rebuild_requires_dead = bool(none_rebuild_requires_dead)
+        self._none_warn_s = none_warn_s
+        self._sleep_on_none = sleep_on_none
+        self._sleep_on_error = sleep_on_error
+        self._errors = 0        # 连续 grab 异常次数
+        self._nones = 0         # 连续空帧次数（成功抓到一帧即清零）
+        self._none_since = None  # 空帧起始时刻（monotonic）
+        self._none_warned = False
+        self.cap = capture
+        if self.cap is None:
+            self._open()
+
+    # ---------- 状态 ----------
+
+    def _tag(self):
+        return ("频道[%s] 共享" % self._name) if self._name else ""
+
+    def working(self):
+        """采集后端是否可用：句柄存在且未自报失效（无 working 属性视为可用）。"""
+        cap = self.cap
+        return cap is not None and bool(getattr(cap, "working", True))
+
+    # ---------- 生命周期 ----------
+
+    def _open(self):
+        try:
+            self.cap = CaptureManager(self._backend, self._monitor, self._region)
+        except Exception as e:
+            log.error("%s采集器初始化失败: %s", self._tag(), e)
+            self.cap = None
+
+    def _rebuild(self, reason, level="warning"):
+        """关闭并重建采集句柄；owned=False 时不做任何事（保护注入的伪采集器）。"""
+        if not self._owned:
+            return
+        getattr(log, level)("%s%s", self._tag(), reason)
+        old, self.cap = self.cap, None
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        self._open()
+        if self.working():
+            log.info("%s采集器已重建", self._tag())
+        else:
+            log.error("%s重建后的采集后端仍不可用，请检查采集源设置", self._tag())
+
+    def set_params(self, backend, monitor, region):
+        """下发采集参数（host 允许在线切换采集源）；失败返回 False（调用方应退避重试）。"""
+        self._backend, self._monitor, self._region = backend, monitor, region
+        try:
+            self.cap.set_params(backend, monitor, region)
+            return True
+        except Exception as e:
+            self._errors += 1
+            log.warning("%s采集参数重建失败: %s（连续 %d 次）",
+                        self._tag(), e, self._errors)
+            time.sleep(self._sleep_on_error)
+            return False
+
+    # ---------- 抓帧 ----------
+
+    def _should_rebuild_none(self, now):
+        if not self._owned:
+            return False
+        if self._none_rebuild_requires_dead and self.working():
+            # 后端自报可用：空帧属正常语义（画面静止 / 独占全屏），重建无意义
+            return False
+        if (self._none_rebuild_frames is not None
+                and self._nones >= self._none_rebuild_frames):
+            return True
+        return (self._none_rebuild_s is not None and self._none_since is not None
+                and now - self._none_since >= self._none_rebuild_s)
+
+    def grab(self):
+        """抓一帧；返回 BGR，或 None 表示本轮无帧（内部已做恢复/告警/等待）。"""
+        if self.cap is None:
+            # 构造阶段就没拿到句柄（两个后端都不可用）：按错误路径计数，累计到阈值后
+            # 再尝试重建。直接调 self.cap.grab() 只会抛 AttributeError 刷无意义日志。
+            self._errors += 1
+            log.warning("%s采集句柄缺失（后端初始化失败），采集不可用（连续 %d 次）",
+                        self._tag(), self._errors)
+            if self._errors >= self._rebuild_on_errors:
+                self._rebuild("采集句柄缺失，尝试重建采集器", level="error")
+                self._errors = 0
+            time.sleep(self._sleep_on_error)
+            return None
+        try:
+            bgr = self.cap.grab()
+        except Exception as e:
+            self._errors += 1
+            log.warning("%s采集错误: %s（连续 %d 次）", self._tag(), e, self._errors)
+            if self._errors >= self._rebuild_on_errors:
+                self._rebuild("采集后端持续异常，尝试重建采集器（故障恢复）")
+                self._errors = 0
+            time.sleep(self._sleep_on_error)
+            return None
+        if bgr is None:
+            if self._errors > 0:
+                self._errors = 0   # 抓取本身没抛异常，只是没有新帧
+            self._nones += 1
+            now = time.monotonic()
+            if self._none_since is None:
+                self._none_since = now
+            if self._should_rebuild_none(now):
+                # 后端已死（working=False）：必须重建并上报，否则画面永久冻结且日志无痕
+                dead = not self.working()
+                self._rebuild(
+                    "采集后端已失效（dxgi/mss 均无句柄），重建采集器" if dead
+                    else "采集连续无画面，尝试重建采集器",
+                    level="error" if dead else "warning")
+                self._nones = 0
+                self._none_since = None
+                self._none_warned = False
+                time.sleep(self._sleep_on_error)
+                return None
+            if (self._none_warn_s is not None and not self._none_warned
+                    and now - self._none_since >= self._none_warn_s):
+                self._none_warned = True
+                log.warning("%s已连续 %.0f 秒采集不到新帧（画面静止或独占全屏），"
+                            "观看端将看不到更新；可切换采集后端为 mss 试试",
+                            self._tag(), now - self._none_since)
+            time.sleep(self._sleep_on_none)
+            return None
+        self._nones = 0
+        self._none_since = None
+        self._none_warned = False
+        self._errors = 0
+        return bgr
+
+    def close(self):
+        """释放采集句柄（幂等；注入的伪采集器同样关闭——本会话持有的资源归本会话）。"""
+        cap, self.cap = self.cap, None
+        if cap is not None:
+            try:
+                cap.close()
+            except Exception:
+                pass
+
+
+class StillGate:
+    """静止检测闸门（第 111 条：host 与 share 共用同一状态机）。
+
+    连续 quiet_s 秒无有效变化才判定静止；探测异常按"有变化"处理——宁可多发一帧，
+    不可画面冻结。on_edge(in_still) 回调用于 host 侧打边沿日志并更新 runtime.stats
+    （性能线程据此暂停自适应评估，避免把停发误判为空闲）；share 侧不需要。
+    """
+
+    def __init__(self, point_thr, ratio_thr, quiet_s, on_edge=None):
+        self._point_thr = point_thr
+        self._ratio_thr = ratio_thr
+        self._quiet_s = quiet_s
+        self._on_edge = on_edge
+        self._ref = None          # 最近一次发送帧的抽稀参考图
+        self._quiet_since = None  # 连续无变化起始时刻（perf_counter）；None=上一帧有变化
+        self.in_still = False     # 是否处于静止停发态
+
+    def check(self, bgr):
+        """返回本帧是否有有效变化（True=需发送）；内部维护参考图与静止态。"""
+        try:
+            changed, self._ref = motion_changed(
+                self._ref, downsample_frame(bgr), self._point_thr, self._ratio_thr)
+        except Exception:
+            changed, self._ref = True, downsample_frame(bgr)
+        was_still = self.in_still
+        self.in_still, self._quiet_since = still_gate_update(
+            self.in_still, self._quiet_since, changed, time.perf_counter(),
+            self._quiet_s)
+        if self._on_edge is not None and self.in_still != was_still:
+            self._on_edge(self.in_still)
+        return changed

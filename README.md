@@ -184,7 +184,7 @@ build_exe.bat
 # 4. 生成安装包（需先安装 Inno Setup 6）
 build_installer.bat
 
-# 5. 运行测试（327 项单元测试，约 111 秒）
+# 5. 运行测试（357 项单元测试，约 111 秒）
 run_tests.bat
 ```
 

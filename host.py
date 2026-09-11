@@ -41,10 +41,11 @@ from common import (
     VIDEO_FLAG_KEY, CODEC_H264, parse_video,
 )
 
-# 采集/静止检测公共件从 screen.py 导入并保持同名（viewer 上传端复用同一实现）；
-# 编码器生命周期与 JPEG 回退由 pipeline.FrameEncoder 提供（第 110 条，与 share.py 共用）。
-# encode_bgr 本模块已不再直接调用，但按 test_multiview.TestScreenExtraction 锁定的
-# "host 转发 screen 公共件"契约继续保留（外部/测试按 host.encode_bgr 取用）。
+# 采集/静止检测公共件从 screen.py 导入并保持同名（viewer 上传端复用同一实现）。
+# 第 110/111 条后 host 本模块已不再直接调用这些符号——采集句柄与静止门控在
+# pipeline.CaptureSource / pipeline.StillGate，编码与回退在 pipeline.FrameEncoder，
+# 但按 test_multiview.TestScreenExtraction 锁定的"host 转发 screen 公共件"契约继续保留
+# （外部/测试按 host.encode_bgr、host.CaptureManager 等取用）。
 from screen import (
     CaptureManager, STILL_STEP, downsample_frame, motion_changed,
     still_gate_update, calc_output_size, encode_bgr,
@@ -58,6 +59,15 @@ log = logger.get_logger()
 #: 会永久阻塞；不发魔数的连接每个永久占用一个线程 + 一个 fd，而 accept 循环没有
 #: 并发上限，一次端口扫描即可把服务耗死。
 HANDSHAKE_TIMEOUT_S = 10.0
+
+#: 第 112 条（C1）：客户端发送速率滑动窗口的**保留**时长（秒）。
+#: 带宽日志按 1 秒窗口展示（灵敏），ABR 按 3 秒窗口取平均（跨过一个 GOP，见 rate_kbps）。
+_RATE_KEEP_S = 3.0
+
+#: 第 112 条（C1）：ABR 估算实测吞吐所用的窗口（秒）。
+#: keyint=60 / 30fps 时每 2 秒一个 ~70KB 关键帧，1 秒窗口会在关键帧窗口与纯 P 帧窗口
+#: 之间来回跳（实测 651 Kbps ↔ 66 Kbps），据此把码率一步砸到地板是错误的。
+_ABR_EGRESS_WINDOW_S = 3.0
 
 #: 第 100 条：单个客户端"发送耗时"样本的有效期（秒）。超过该时长没有再发送过的
 #: 客户端，其 last_send_ms 不再计入 ABR 的拥塞判据——否则一个已经切走/不再收帧的
@@ -391,23 +401,29 @@ class ClientInfo:
         with self._lock:
             self.bytes_sent += nbytes
             self._window.append((now, nbytes))
-            cutoff = now - 1.0
+            cutoff = now - _RATE_KEEP_S
             while self._window and self._window[0][0] <= cutoff:
                 self._window.pop(0)
             if send_ms > 0:
                 self.last_send_ms = send_ms
                 self.last_send_at = now
 
-    def rate_kbps(self, now=None):
-        """最近 1 秒平均发送速率（KB/s）。"""
+    def rate_kbps(self, now=None, window=1.0):
+        """最近 window 秒的平均发送速率（KB/s）。
+
+        第 112 条（C1）：窗口可调。ABR 用 3 秒（≥ 一个 GOP：keyint=60 时每 2 秒一个
+        ~70KB 关键帧，1 秒窗口会在"关键帧窗口 651Kbps"与"纯 P 帧窗口 66Kbps"之间
+        来回跳，据此定码率会一步砸到地板）；带宽日志仍用 1 秒保持灵敏。
+        """
         now = now if now is not None else time.monotonic()
-        cutoff = now - 1.0
+        win = max(0.1, float(window))
+        cutoff = now - win
         total = 0.0
         with self._lock:
             for t, n in self._window:
                 if t > cutoff:
                     total += n
-        return total / 1024.0  # 窗口约 1 秒
+        return total / (win * 1024.0)
 
     def has_recent_drop(self, now=None):
         """最近 1 秒内是否发生过因发送队列满而丢帧。"""
@@ -779,7 +795,9 @@ class HostRuntime:
         self.stats = {"capture_fps": 0, "encode_fps": 0, "send_fps": 0,
                   "encode_ms": 0.0, "avg_send_ms": 0.0,
                   "codec_name": "", "keyint": 0,
-                  "keyframe_total": 0, "abr_changes": 0, "still": False}
+                  "keyframe_total": 0, "abr_changes": 0, "still": False,
+                  # 第 112 条（C1）：各客户端最近 1 秒**实测**发送速率汇总（bit/s）
+                  "egress_bps": 0}
         self.stats_lock = threading.Lock()
         self.accounts = AccountManager()
         self.frp = FrpManager(cfg)
@@ -1794,107 +1812,30 @@ def run_server(runtime):
             if remaining > 0:
                 t.join(timeout=remaining)
         log.info("服务已停止")
-class _CaptureState:
-    """采集线程的可变状态（连续错误计数、空帧起始时刻/告警标志）。"""
+def _still_edge(runtime, p, in_still):
+    """静止/恢复边沿：打日志并更新 runtime.stats["still"]。
 
-    __slots__ = ("consecutive_errors", "none_since", "none_warned")
-
-    def __init__(self):
-        self.consecutive_errors = 0
-        self.none_since = None
-        self.none_warned = False
-
-
-def _grab_with_recovery(cap, backend, monitor, region, st):
-    """抓一帧并处理两类失败，返回 (frame, cap)；frame 为 None 表示本轮回退。
-
-    第 100 条：持续空帧要区分两种情况——后端已死（working=False，必须重建并上报，
-    否则画面永久冻结且日志无痕）与“画面静止/独占全屏”（dxgi 语义上正常，只告警一次，
-    不重建）。异常路径连续 5 次失败后重建采集器。
-    返回的 cap 可能是重建后的新句柄，调用方必须接收。
+    性能线程据 stats["still"] 暂停自适应评估，避免把"静止停发"误判成链路空闲而误降码率
+    （见第 89 条的 perf guard）。
     """
-    try:
-        bgr = cap.grab()
-        if bgr is None:
-            now_none = time.monotonic()
-            if st.none_since is None:
-                st.none_since = now_none
-            if not getattr(cap, "working", True):
-                if now_none - st.none_since >= 5.0:
-                    log.error("采集后端已失效（dxgi/mss 均无句柄），重建采集器")
-                    try:
-                        cap.close()
-                    except Exception:
-                        pass
-                    try:
-                        cap = CaptureManager(backend, monitor, region)
-                        if not getattr(cap, "working", True):
-                            log.error("重建后的采集后端仍不可用，请检查采集源设置")
-                    except Exception as e2:
-                        log.error("重建采集后端失败: %s", e2)
-                    st.none_since = None
-                    st.none_warned = False
-                    time.sleep(0.5)
-                    return None, cap
-            elif not st.none_warned and now_none - st.none_since >= 30.0:
-                st.none_warned = True
-                log.warning("已连续 %.0f 秒采集不到新帧（画面静止或独占全屏），"
-                            "观看端将看不到更新；可切换采集后端为 mss 试试",
-                            now_none - st.none_since)
-            time.sleep(0.01)  # 无新帧（dxgi），短暂等待后重试
-            return None, cap
-        st.none_since = None
-        st.none_warned = False
-    except Exception as e:
-        st.consecutive_errors += 1
-        log.warning("采集错误: %s（连续 %d 次）", e, st.consecutive_errors)
-        if st.consecutive_errors >= 5:
-            log.warning("采集后端持续异常，尝试重建采集器（故障恢复）")
-            try:
-                cap.close()
-            except Exception:
-                pass
-            try:
-                cap = CaptureManager(backend, monitor, region)
-            except Exception as e2:
-                log.error("重建采集后端失败: %s", e2)
-            st.consecutive_errors = 0
-        time.sleep(0.5)
-        return None, cap
-    if st.consecutive_errors > 0:
-        st.consecutive_errors = 0  # 恢复成功，清空连续错误计数
-    return bgr, cap
-
-
-def _still_gate_step(runtime, p, bgr, still_ref, in_still, quiet_since, was_still):
-    """静止检测闸门一步：返回 (changed, still_ref, in_still, quiet_since, was_still)。
-
-    探测异常按“有变化”处理：宁可多发一帧，不可画面冻结。静止/恢复的边沿各打一条日志
-    并更新 runtime.stats["still"]（性能线程据此暂停自适应评估，避免把停发误判为空闲）。
-    """
-    try:
-        changed, still_ref = motion_changed(
-            still_ref, downsample_frame(bgr), p.point_thr, p.ratio_thr)
-    except Exception:
-        changed, still_ref = True, downsample_frame(bgr)
-    in_still, quiet_since = still_gate_update(
-        in_still, quiet_since, changed, time.perf_counter(), p.still_quiet_s)
-    if in_still and not was_still:
+    if in_still:
         log.info("画面静止，暂停发送（%d fps 探测）", int(1 / p.still_probe_interval))
-        with runtime.stats_lock:
-            runtime.stats["still"] = True
-    elif was_still and not in_still:
+    else:
         log.info("画面变化，恢复发送")
-        with runtime.stats_lock:
-            runtime.stats["still"] = False
-    return changed, still_ref, in_still, quiet_since, in_still
+    with runtime.stats_lock:
+        runtime.stats["still"] = bool(in_still)
 
 
 def _capture_loop(runtime, p):
     """采集线程：按目标帧率把原始帧写入 raw 槽，只统计帧率，不负责编码与发送。
 
     编码移动到独立线程，避免编码耗时拉长采集间隔（采集节奏 = 1/fps 严格节流）。
-    连续采集失败超过阈值时重建采集后端（dxcam 设备丢失等场景自动恢复）。
+
+    第 111 条（阶段 2）：采集句柄的故障恢复与静止检测闸门改由 pipeline.CaptureSource /
+    pipeline.StillGate 统一提供（与 share.py 共用同一实现，差异做成参数）：
+    - 后端已死（working=False）持续 5 秒 → 重建并上报，否则画面永久冻结且日志无痕
+    - 采集异常连续 5 次 → 重建采集器（dxcam 设备丢失等场景自动恢复）
+    - 长期空帧 30 秒 → 告警一次（画面静止或独占全屏属正常语义，不重建）
     """
     # 1 秒滑动窗口：记录每帧采集完成的时刻，用于统计实际采集帧率
     fps_window = []
@@ -1902,17 +1843,17 @@ def _capture_loop(runtime, p):
         backend = runtime.slot["backend"]
         monitor = runtime.slot["monitor"]
         region = runtime.slot["region"]
-    cap = CaptureManager(backend, monitor, region)
     # 第 100 条：采集器构造永不抛异常（两个后端都失败时只把句柄置 None），此时
     # grab() 恒返回 None，线程会以 100Hz 空转且什么都不上报。启动即验活。
-    if not getattr(cap, "working", True):
+    src = pipeline.CaptureSource(
+        backend, monitor, region, none_rebuild_s=5.0,
+        none_rebuild_requires_dead=True, none_warn_s=30.0)
+    if not src.working():
         log.error("采集后端初始化失败（dxgi/mss 均不可用），将无法共享画面；"
                   "请在控制台「采集源」切换后端后重试")
-    st = _CaptureState()
-    still_ref = None      # 最近一次发送帧的抽稀参考图
-    quiet_since = None    # 连续无变化起始时刻（perf_counter）；None=上一帧有变化
-    in_still = False      # 是否处于静止停发态
-    was_still = False     # 上一帧静止态（边沿触发日志与统计）
+    gate = pipeline.StillGate(
+        p.point_thr, p.ratio_thr, p.still_quiet_s,
+        on_edge=lambda in_still: _still_edge(runtime, p, in_still))
     try:
         while not runtime.stop_event.is_set():
             with runtime.slot_lock:
@@ -1921,25 +1862,19 @@ def _capture_loop(runtime, p):
                 region = runtime.slot["region"]
                 fps_now = _safe_int(runtime.slot.get("fps", p.base_fps),
                                     p.base_fps, 1, 240, warn=False)
-            try:
-                cap.set_params(backend, monitor, region)
-            except Exception as e:
-                st.consecutive_errors += 1
-                log.warning("采集参数重建失败: %s（连续 %d 次）", e, st.consecutive_errors)
-                time.sleep(0.5)
-                continue
+            if not src.set_params(backend, monitor, region):
+                continue    # 参数重建失败：内部已计数并退避等待
             frame_interval = 1.0 / fps_now if fps_now > 0 else 0.0
             frame_start = time.perf_counter()
             ts_micros = int(time.time() * 1_000_000)  # 采集开始时刻
-            bgr, cap = _grab_with_recovery(cap, backend, monitor, region, st)
+            bgr = src.grab()
             if bgr is None:
-                continue
+                continue    # 重建/告警/等待已在 CaptureSource.grab 内部完成
             # ---- 静止检测闸门（画面无有效变化时不写 raw 槽，编码/发送自然停摆）----
             if p.still_enabled:
-                changed, still_ref, in_still, quiet_since, was_still = _still_gate_step(
-                    runtime, p, bgr, still_ref, in_still, quiet_since, was_still)
+                changed = gate.check(bgr)
                 if not changed:
-                    if in_still:
+                    if gate.in_still:
                         # 静止期：按探测间隔巡检，降低采集开销
                         time.sleep(p.still_probe_interval)
                     else:
@@ -1955,23 +1890,15 @@ def _capture_loop(runtime, p):
                 runtime.slot["raw_ts"] = ts_micros
             # 1 秒滑动窗口统计实际采集帧率
             fps_window.append(now)
-            while fps_window and now - fps_window[0] > 1.0:
-                fps_window.pop(0)
-            if len(fps_window) >= 2:
-                capture_fps = (len(fps_window) - 1) / (fps_window[-1] - fps_window[0])
-            elif fps_window:
-                capture_fps = 1.0
-            else:
-                capture_fps = 0.0
             with runtime.stats_lock:
-                runtime.stats["capture_fps"] = capture_fps
+                runtime.stats["capture_fps"] = _fps_from_window(fps_window, now)
             # 帧间节流：目标间隔 1/fps，按每次循环开始时刻计算剩余等待，避免累计漂移
             if frame_interval > 0:
                 wait = frame_interval - (time.perf_counter() - frame_start)
                 if wait > 0:
                     time.sleep(wait)
     finally:
-        cap.close()
+        src.close()
 def _store_encoded(runtime, ef, raw_ts):
     """把编码结果写进共享槽（发送线程据此广播）。"""
     with runtime.slot_lock:
@@ -2205,9 +2132,14 @@ def _perf_log_and_bandwidth(runtime, stats):
     第 100 条：只采信“仍然新鲜”的发送耗时样本（recent_send_ms 内部按 last_send_at
     过滤）。旧实现直接读 last_send_ms，一个已经切走观看源/不再收帧的慢客户端会把
     拥塞判据永久钉在高位。
+
+    第 112 条（C1）：顺带汇总各客户端最近 1 秒的**实测**发送速率（ClientInfo._window
+    里已有的字节数）写入 stats["egress_bps"]，供 ABR 按链路真实能力定码率——旧实现
+    只看配置的目标码率，链路跑不动也不知道。
     """
     client_send_ms = []
     recent_drop = False
+    egress_bps = 0.0
     now_mono = time.monotonic()
     with runtime.clients_lock:
         for info in runtime.clients.values():
@@ -2218,7 +2150,9 @@ def _perf_log_and_bandwidth(runtime, stats):
                 recent_drop = True
         bw_lines = []
         for info in runtime.clients.values():
-            rate = info.rate_kbps()
+            rate = info.rate_kbps(now_mono)   # 最近 1 秒实测速率（KB/s，日志用）
+            # ABR 用 3 秒窗口取平均：跨过一个 GOP，避开关键帧突发造成的 10 倍跳变
+            egress_bps += info.rate_kbps(now_mono, window=_ABR_EGRESS_WINDOW_S) * 8192.0
             lock = getattr(info, "_lock", None)
             if lock is not None:
                 with lock:
@@ -2232,13 +2166,15 @@ def _perf_log_and_bandwidth(runtime, stats):
                     rate, total_mb, info.dropped_frames))
     client_avg_ms = (sum(client_send_ms) / len(client_send_ms)) if client_send_ms else 0.0
     effective_send_ms = max(stats["avg_send_ms"], client_avg_ms)
+    stats["egress_bps"] = int(egress_bps)
     with runtime.stats_lock:
         runtime.stats["avg_send_ms"] = effective_send_ms
+        runtime.stats["egress_bps"] = int(egress_bps)
     log.info(
-        "性能: 采集 %d fps / 编码 %d fps / 发送 %d fps / 帧率 %d / 质量 %d / 缩放 %.2f / 输出 %dx%d / 编码 %.1f ms / 发送 %.1f ms%s",
+        "性能: 采集 %d fps / 编码 %d fps / 发送 %d fps / 帧率 %d / 质量 %d / 缩放 %.2f / 输出 %dx%d / 编码 %.1f ms / 发送 %.1f ms / 实测 %d Kbps%s",
         stats["capture_fps"], stats["encode_fps"], stats["send_fps"], stats["fps_now"],
         stats["quality"], stats["scale"], stats["out_w"], stats["out_h"],
-        stats["encode_ms"], effective_send_ms,
+        stats["encode_ms"], effective_send_ms, int(egress_bps) // 1000,
         "（画面静止，暂停发送）" if stats["still"] else
         ("（有客户端丢帧）" if recent_drop else ""),
     )
@@ -2260,15 +2196,28 @@ def _apply_slot_params(runtime, quality, scale, fps_now):
 def _abr_degrade(runtime, p, cur, effective_send_ms, recent_drop):
     """拥塞降级：视频模式 码率->缩放->帧率；JPEG 模式 质量->缩放->帧率。
 
-    已到降级下限（质量/缩放/帧率均不能再降）时 level 为空：不再重复打印空的“降级”
-    日志，避免持续拥塞时每秒一条噪音。
+    第 112 条（C1）：码率降级按**实测吞吐**定目标。旧实现固定 ×0.7，链路实际只跑得动
+    800 Kbps 时要从 6000 Kbps 连降 8 个评估周期（≈8 秒持续拥塞）才收敛；现在直接降到
+    “实测速率 ×0.9”一步到位；实测吞吐高于 ×0.7 档位时仍取 ×0.7（正常小步降级）。
+    实测值来自 ClientInfo._window 的字节数，与编码器目标码率无关，故内容稀疏（VBR
+    本就出得少）不会误触发——本分支只在已判定拥塞时才走到。
+
+    `level` 只在**真的重建了编码器**时才非空：否则持续拥塞/变化落在滞后带内时会每秒
+    打印一条并未发生的“降级”。已到降级下限时 level 同样为空。
     """
     quality, scale, fps_now = cur["quality"], cur["scale"], cur["fps_now"]
     level = ""
     if cur["video_mode"] and cur["cur_bitrate"] > p.min_bitrate:
-        new_b = max(p.min_bitrate, int(cur["cur_bitrate"] * 0.7))
-        _set_encoder_bitrate(runtime, new_b)
-        level = "码率 %d Kbps" % (new_b // 1000)
+        cur_b = cur["cur_bitrate"]
+        step_b = int(cur_b * 0.7)
+        egress_bps = int(cur.get("egress_bps", 0))
+        if egress_bps > 0:
+            # 实测吞吐就是链路当前真实上限（含背压下被跳过的帧），留 10% 余量
+            step_b = min(step_b, int(egress_bps * 0.9))
+        new_b = max(p.min_bitrate, step_b)
+        if _set_encoder_bitrate(runtime, new_b):
+            level = ("码率 %d Kbps（实测 %d Kbps）" % (new_b // 1000, egress_bps // 1000)
+                     if egress_bps > 0 else "码率 %d Kbps" % (new_b // 1000))
     elif not cur["video_mode"] and quality > p.quality_min:
         quality -= 10
         level = "质量 %d" % quality
@@ -2290,6 +2239,9 @@ def _abr_recover(runtime, p, cur, base_fps, base_quality, base_scale):
     活动门限 send_fps>=5（由调用方判定）：内容为稀疏/间歇变化（打字、低频 UI 更新）时
     发送耗时≈0 会让回升误判链路空闲，每 1-2s 重建一次编码器（关键帧风暴）；发送不足时
     冻结参数，密集内容恢复后自然回升。码率回升带 2 秒冷却，避免频繁重建。
+
+    第 112 条（C1）：码率档未真正重建（冷却中或变化落在 ±15% 滞后带内）时直接返回，
+    不再打印一条并未发生的“自适应回升: 码率 X”（旧实现每秒一条假日志）。
     """
     quality, scale, fps_now = cur["quality"], cur["scale"], cur["fps_now"]
     level = ""
@@ -2301,13 +2253,15 @@ def _abr_recover(runtime, p, cur, base_fps, base_quality, base_scale):
         level = "缩放 %.2f" % scale
     elif cur["video_mode"] and cur["cur_bitrate"] < p.max_bitrate:
         new_b = min(p.max_bitrate, int(cur["cur_bitrate"] * 1.3))
-        _set_encoder_bitrate(runtime, new_b, cooldown=2.0)
+        if not _set_encoder_bitrate(runtime, new_b, cooldown=2.0):
+            return          # 未真正重建：既不改动其它参数，也不打日志
         level = "码率 %d Kbps" % (new_b // 1000)
     else:
         quality = min(base_quality, quality + 10)
         level = "质量 %d" % quality
     _apply_slot_params(runtime, quality, scale, fps_now)
-    log.info("自适应回升: %s", level)
+    if level:
+        log.info("自适应回升: %s", level)
 
 
 def _perf_tick(runtime, p):

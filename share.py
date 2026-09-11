@@ -2,10 +2,11 @@
 """观看端共享上传会话（观看组 MultiView 成员端）。
 
 ScreenShareSession 在独立线程内完成 采集→静止门控→编码→发送：
-- 采集/静止门控复用 screen.py（与 host 共享端同构），参数读 cfg["host"]
-- 视频编码优先（host.codec.encoder），不可用自动回退 JPEG（与 host 一致）
-- 静止期收到 req_keyframe 时补一帧：视频路径强制 IDR（重建编码器后首帧），
-  JPEG 路径重发缓存帧（自包含）；保证新观众订阅静止画面可立即起解
+- 采集恢复与静止门控复用 pipeline.CaptureSource / pipeline.StillGate（第 111 条，
+  与 host 共享端同一实现，差异只在参数），参数读 cfg["host"]
+- 视频编码与 JPEG 回退复用 pipeline.FrameEncoder（第 110 条，与 host 一致）
+- 静止期收到 req_keyframe 时补一帧：视频路径强制 IDR，JPEG 路径重发缓存帧（自包含）；
+  保证新观众订阅静止画面可立即起解
 - 所有发送经调用方传入的 _tx_lock，与 ping/watch 等控制消息串行，防字节交错
 - 发送失败即停止（记日志），由 Channel 层负责提示与重连后的自动重启
 """
@@ -16,8 +17,6 @@ import time
 import logger
 import pipeline
 from common import pack_frame, pack_video
-from screen import (CaptureManager, downsample_frame, motion_changed,
-                    still_gate_update)
 
 log = logger.get_logger()
 
@@ -108,26 +107,29 @@ class ScreenShareSession:
     # ---------- 主循环 ----------
 
     def _run(self):
-        if self._cap is None:
-            try:
-                self._cap = CaptureManager(self._backend, self._monitor, self._region)
-            except Exception as e:
-                log.error("频道[%s] 共享采集初始化失败，已停止: %s", self._name, e)
-                return
+        """上传主循环：采集（含恢复）→ 静止门控 → 编码 → 发送。
+
+        第 111 条（阶段 2）：采集句柄的故障恢复与静止检测闸门改由
+        pipeline.CaptureSource / pipeline.StillGate 统一提供（与 host.py 共用同一实现）。
+        差异只在参数：注入的伪采集器不重建（owned=False）、连续空帧按"帧数"阈值重建
+        （host 按"秒数 + 后端已死"）、空帧等待取 min(10ms, 帧间隔)。
+        """
+        src = pipeline.CaptureSource(
+            self._backend, self._monitor, self._region, capture=self._cap,
+            owned=self._cap_owned, name=self._name,
+            none_rebuild_frames=max(10, self._fps * 5),
+            sleep_on_none=min(0.01, 1.0 / self._fps))
+        self._src = src
         # 第 5 条：采集器构造可能"成功"但无任何可用后端（dxgi 与 mss 都挂时句柄置 None），
         # 此后 grab() 恒返回 None，会话空转（每秒约 100 次无效采集且什么都不上传）。
         # 直接报错停止，由 Channel 层提示用户，而不是静默假活。
-        if not getattr(self._cap, "working", True):
+        if not src.working():
             log.error("频道[%s] 共享采集器无可用后端（dxgi/mss 均失败），已停止", self._name)
             self._close_resources()
             return
         interval = 1.0 / self._fps
-        still_ref = None
-        quiet_since = None
-        in_still = False
-        consecutive_errors = 0
-        consecutive_none = 0
-        none_rebuild_at = max(10, self._fps * 5)  # 连续约 5 秒空帧则尝试重建采集器
+        gate = (pipeline.StillGate(self._point_thr, self._ratio_thr, self._quiet_s)
+                if self._still_enabled else None)
         last_frame = None   # 最近一次成功发送的缩放后 BGR（静止补帧/强制 IDR 用）
         last_packed = None  # 最近一次发送的完整消息字节（JPEG 补帧用）
         last_is_video = False
@@ -138,67 +140,15 @@ class ScreenShareSession:
                 # 第 3 条：不在此处清除 key_evt。只有真正补出关键帧/发送成功后才清除，
                 # 避免 host 转达的唯一一次请求在 bgr=None/采集异常/静止无缓存路径上被丢掉。
                 key_wanted = self._key_evt.is_set()
-                try:
-                    bgr = self._cap.grab()
-                except Exception as e:
-                    consecutive_errors += 1
-                    log.warning("频道[%s] 共享采集错误: %s（连续 %d 次）",
-                                self._name, e, consecutive_errors)
-                    if consecutive_errors >= 5 and self._cap_owned:
-                        try:
-                            self._cap.close()
-                        except Exception:
-                            pass
-                        try:
-                            self._cap = CaptureManager(
-                                self._backend, self._monitor, self._region)
-                            log.info("频道[%s] 共享采集器已重建", self._name)
-                        except Exception as e2:
-                            log.error("频道[%s] 共享采集器重建失败: %s", self._name, e2)
-                        consecutive_errors = 0
-                    time.sleep(0.5)
-                    continue
+                bgr = src.grab()   # 恢复/重建/等待已在 CaptureSource 内部完成
                 if bgr is None:
-                    if consecutive_errors > 0:
-                        consecutive_errors = 0
-                    consecutive_none += 1
-                    # 第 5 条：采集器持续返回空帧（后端运行中死亡）→ 达阈值尝试重建并上报
-                    if (self._cap_owned and consecutive_none >= none_rebuild_at):
-                        log.error("频道[%s] 共享采集连续 %d 帧无画面，尝试重建采集器",
-                                  self._name, consecutive_none)
-                        try:
-                            self._cap.close()
-                        except Exception:
-                            pass
-                        try:
-                            self._cap = CaptureManager(
-                                self._backend, self._monitor, self._region)
-                            log.info("频道[%s] 共享采集器已重建", self._name)
-                        except Exception as e2:
-                            log.error("频道[%s] 共享采集器重建失败: %s", self._name, e2)
-                        consecutive_none = 0
                     # 采集空帧（dxgi 无新帧）：响应关键帧请求后短等再巡；成功才清事件
                     if key_wanted and last_packed is not None:
                         self._send_key_response(last_frame, last_packed, last_is_video)
                         self._key_evt.clear()
-                    time.sleep(min(0.01, interval))
                     continue
-                consecutive_none = 0
-                changed = True
-                if self._still_enabled:
-                    try:
-                        changed, still_ref = motion_changed(
-                            still_ref, downsample_frame(bgr),
-                            self._point_thr, self._ratio_thr)
-                    except Exception:
-                        # 探测异常按“有变化”处理：宁可多发一帧，不可画面冻结
-                        changed, still_ref = True, downsample_frame(bgr)
-                    in_still, quiet_since = still_gate_update(
-                        in_still, quiet_since, changed,
-                        time.perf_counter(), self._quiet_s)
+                changed = gate.check(bgr) if gate is not None else True
                 if changed:
-                    if consecutive_errors > 0:
-                        consecutive_errors = 0
                     res = self._encode_send(bgr, ts_us, force_key=key_wanted)
                     if res is not None:
                         last_frame, last_packed, last_is_video = res
@@ -212,7 +162,7 @@ class ScreenShareSession:
                 if key_wanted and last_packed is not None:
                     self._send_key_response(last_frame, last_packed, last_is_video)
                     self._key_evt.clear()
-                wait = self._probe_interval if in_still else interval
+                wait = self._probe_interval if gate.in_still else interval
                 elapsed = time.perf_counter() - t0
                 if wait - elapsed > 0:
                     time.sleep(wait - elapsed)
@@ -220,11 +170,17 @@ class ScreenShareSession:
             self._close_resources()
 
     def _close_resources(self):
+        """释放本会话持有的采集与编码资源（幂等；可由线程自身或 stop() 调用）。"""
         fe = getattr(self, "_fe", None)
         if fe is not None:
             fe.close()
-        # 注入的伪采集器也需关闭：stop() 语义是释放本会话持有的所有采集资源
-        if self._cap is not None:
+        src = getattr(self, "_src", None)
+        if src is not None:
+            # 注入的伪采集器也需关闭：stop() 语义是释放本会话持有的所有采集资源
+            src.close()
+            self._src = None
+            self._cap = None
+        elif self._cap is not None:
             try:
                 self._cap.close()
             except Exception:
