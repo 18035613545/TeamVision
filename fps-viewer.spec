@@ -24,19 +24,20 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# 第 131 条：由 onefile 改为 onedir（COLLECT），理由见 fps-host.spec——
+# 去掉"解压到 %TEMP% 再从临时目录执行"的启发式误报链，并显著缩短冷启动。
+# 仍然禁止 UPX。
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='fps-viewer',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -45,4 +46,14 @@ exe = EXE(
     entitlements_file=None,
     version='version_info.txt',
     icon=['assets\\app.ico'],
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='fps-viewer',
 )

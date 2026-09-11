@@ -61,13 +61,21 @@ _config_lock = threading.Lock()
 #: 直接砍半（解析在攒满声明长度前不会返回，长度头越大占用越久）。
 MAX_PAYLOAD = 32 * 1024 * 1024
 
+#: 配置结构版本：用于把 1.x 遗留配置一次性迁移到更安全的默认值（见 _upgrade_config）。
+#: 1 = 1.3.0 及更早（监听 0.0.0.0、准入默认关闭）；2 = 默认只监听本机 + 准入默认开启。
+CONFIG_VERSION = 2
+
 #: 默认配置
 DEFAULT_CONFIG = {
+    "config_version": CONFIG_VERSION,
     "logs": {
         "level": "info"
     },
     "host": {
-        "listen_host": "0.0.0.0",
+        # 默认只监听本机：默认形态下不存在对外监听的端口（局域网内其他人连不上，
+        # 杀软/审计也不会把「屏幕采集 + 对外监听 + 无鉴权」判成高危组合）。
+        # 需要局域网直连时在共享端控制台把监听地址改成 0.0.0.0；公网共享走 frp 隧道。
+        "listen_host": "127.0.0.1",
         "port": 5700,
         "fps": 30,
         "jpeg_quality": 80,
@@ -120,7 +128,14 @@ DEFAULT_CONFIG = {
             "public_addr": ""
         },
         "auth": {
-            "enabled": False,  # 默认关闭准入（向后兼容）：旧客户端/无配置环境可直接观看
+            # 默认开启准入：观看端必须注册/登录后才能取流。1.x 默认关闭（任何能连上
+            # 的人都能看屏），升级后由 _upgrade_config 做一次性迁移。
+            "enabled": True,
+            # 自助注册策略：
+            #   "open"      = 任何能连上共享端的客户端都可以自行注册（默认，兼容旧体验）
+            #   "bootstrap" = 只有第一个账户可以自助注册，此后注册关闭
+            #   "closed"    = 完全关闭自助注册，账户只能由共享端控制台添加
+            "allow_register": "open",
             # 认证阶段「总时限」（第 23 条防 slowloris）；须大于观看端登录框等待（120s），
             # 否则用户还在输入 host 就先断开、明明输对却登录失败（第 31 条）。
             "auth_timeout": 150
@@ -151,6 +166,41 @@ DEFAULT_CONFIG = {
 }
 
 
+#: 自助注册策略的合法取值（host.auth.allow_register）
+REGISTER_POLICIES = ("open", "bootstrap", "closed")
+
+
+def register_policy(auth_cfg):
+    """把 host.auth.allow_register 归一为 open / bootstrap / closed。
+
+    布尔与未知取值按兼容口径归一（True→open、False→closed、非法→open 并告警），
+    避免用户手改配置写成布尔或错别字时注册功能整个失灵。host 与共享端控制台共用
+    同一份语义，防止界面显示的策略与服务端实际执行的策略不一致。
+    """
+    raw = auth_cfg.get("allow_register", "open") if isinstance(auth_cfg, dict) else "open"
+    if raw is True:
+        return "open"
+    if raw is False:
+        return "closed"
+    policy = str(raw or "").strip().lower()
+    if policy in REGISTER_POLICIES:
+        return policy
+    try:
+        import logger
+        logger.get_logger().warning("host.auth.allow_register 取值非法（%r），按 open 处理", raw)
+    except Exception:
+        pass
+    return "open"
+
+
+# 第 114 条（C3）：预打包 Struct，替代原先 bytes((kind,))+struct.pack+... 的多段拼接。
+# 每帧从 5–6 次临时分配降到 1 次 header pack + 1 次 payload 连接。
+_FRAME_HDR = struct.Struct(">BIQ")      # kind, length, ts
+_VIDEO_HDR = struct.Struct(">BIQBB")    # kind, length, ts, codec, flags
+_MSG_HDR = struct.Struct(">BI")         # kind, length（中继/控制消息共用）
+_LEN_U32 = struct.Struct(">I")
+
+
 def pack_frame(jpeg_bytes, ts=None):
     """将 JPEG 数据打包为一帧消息，返回 [kind=1][4 字节大端长度][8 字节微秒时间戳 ">Q"][JPEG]。
 
@@ -158,7 +208,7 @@ def pack_frame(jpeg_bytes, ts=None):
     """
     if ts is None:
         ts = int(time.time() * 1_000_000)
-    return bytes((MSG_FRAME,)) + struct.pack(">I", 8 + len(jpeg_bytes)) + struct.pack(">Q", ts) + jpeg_bytes
+    return _FRAME_HDR.pack(MSG_FRAME, 8 + len(jpeg_bytes), ts) + jpeg_bytes
 
 
 def pack_video(video_bytes, ts=None, keyframe=False, codec=CODEC_H264):
@@ -170,8 +220,8 @@ def pack_video(video_bytes, ts=None, keyframe=False, codec=CODEC_H264):
     if ts is None:
         ts = int(time.time() * 1_000_000)
     flags = VIDEO_FLAG_KEY if keyframe else 0
-    return (bytes((MSG_VIDEO,)) + struct.pack(">I", 10 + len(video_bytes))
-            + struct.pack(">Q", ts) + bytes((codec,)) + bytes((flags,)) + video_bytes)
+    return (_VIDEO_HDR.pack(MSG_VIDEO, 10 + len(video_bytes), ts, codec, flags)
+            + video_bytes)
 
 
 def parse_video(payload):
@@ -196,7 +246,7 @@ def unpack_frame(data):
 def pack_msg(obj):
     """把 dict 序列化为 [kind=2][4 字节大端长度][UTF-8 JSON]，用于 auth/ping/pong 等控制消息。"""
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    return bytes((MSG_CTRL,)) + struct.pack(">I", len(data)) + data
+    return _MSG_HDR.pack(MSG_CTRL, len(data)) + data
 
 
 def send_msg(sock, obj):
@@ -215,7 +265,7 @@ def parse_message(buf):
     if len(buf) < 5:
         return 0, None, None
     kind = buf[0]
-    (length,) = struct.unpack(">I", buf[1:5])
+    (length,) = _LEN_U32.unpack(buf[1:5])
     if kind not in (MSG_FRAME, MSG_CTRL, MSG_VIDEO):
         raise ValueError("非法的消息类型: %d" % kind)
     if length <= 0 or length > MAX_PAYLOAD:
@@ -410,12 +460,42 @@ def _probe_writable(d):
         return False
 
 
+def app_dirs():
+    """与程序相关的目录列表（按优先级）：exe 目录，以及冻结运行时的上一级安装根目录。
+
+    onedir 打包（PyInstaller COLLECT）后 exe 位于 `<安装根>\\fps-host\\` 或
+    `<安装根>\\fps-viewer\\`，而 frpc.exe 等外部程序按习惯放在安装根。搜索外部程序
+    时必须把上一级一并纳入，否则同一条配置在 onefile（旧）与 onedir（新）下行为不同。
+    """
+    dirs = [exe_dir()]
+    if getattr(sys, "frozen", False):
+        parent = os.path.dirname(exe_dir())
+        if parent and os.path.abspath(parent) != os.path.abspath(exe_dir()):
+            dirs.append(parent)
+    return dirs
+
+
 def _data_dir_candidates():
-    """默认数据目录候选（按优先级）：exe 目录 → %LOCALAPPDATA%\\TeamVision → 临时目录。"""
-    candidates = [exe_dir()]
+    """默认数据目录候选（按优先级）。
+
+    冻结运行（exe）：先 `%LOCALAPPDATA%\\TeamVision`，再 exe 目录。
+      onedir 打包后共享端与观看端分处 `<安装根>\\fps-host\\`、`<安装根>\\fps-viewer\\`
+      两个子目录，各自以 exe 目录为数据目录会导致 config.json / accounts.json 分家
+      （观看端读不到共享端的频道与账户），而且安装包升级覆盖程序目录时会连配置一起删掉。
+      统一落到同一个用户目录即可让两端共享配置，也让升级不丢设置。
+    源码运行：exe_dir() 优先（开发/测试时配置就在项目目录里，便于直接查看与改动）。
+    两者最后都回退到临时目录。
+    """
+    candidates = []
     local = os.environ.get("LOCALAPPDATA")
-    if local:
-        candidates.append(os.path.join(local, "TeamVision"))
+    if getattr(sys, "frozen", False):
+        if local:
+            candidates.append(os.path.join(local, "TeamVision"))
+        candidates.append(exe_dir())
+    else:
+        candidates.append(exe_dir())
+        if local:
+            candidates.append(os.path.join(local, "TeamVision"))
     candidates.append(os.path.join(tempfile.gettempdir(), "TeamVision"))
     return candidates
 
@@ -448,29 +528,38 @@ def data_dir(candidates=None):
 
 
 def _migrate_from_exe_dir(name):
-    """返回可写数据目录下 name 的路径；若该文件只在 exe 目录存在则先复制过去。
+    """返回可写数据目录下 name 的路径；若该文件只在旧的 exe 目录存在则先复制过去。
 
     用于从"绿色版/机器级安装"平滑迁移：老用户 exe 同目录已有 config.json 或
     accounts.json，升级后数据目录变到 %LOCALAPPDATA%\\TeamVision 时不能丢设置与账户。
+    冻结运行（onedir）时 exe 位于 `<安装根>\\fps-host\\`，而 onefile 时代的配置就在
+    `<安装根>\\`，因此把安装根也作为旧位置候选，否则老用户升级后等于重置了设置。
     任何失败都静默（迁移只是尽力而为，绝不影响启动）。
     """
     base = data_dir() or exe_dir()
     path = os.path.join(base, name)
-    legacy = os.path.join(exe_dir(), name)
-    if os.path.abspath(legacy) == os.path.abspath(path):
-        return path
-    if os.path.exists(path) or not os.path.exists(legacy):
-        return path
-    try:
-        shutil.copyfile(legacy, path)
+    legacy_candidates = []
+    if getattr(sys, "frozen", False):
+        parent = os.path.dirname(exe_dir())
+        if parent:
+            legacy_candidates.append(os.path.join(parent, name))
+    legacy_candidates.append(os.path.join(exe_dir(), name))
+    for legacy in legacy_candidates:
+        if os.path.abspath(legacy) == os.path.abspath(path):
+            continue
+        if os.path.exists(path) or not os.path.exists(legacy):
+            continue
         try:
-            import logger
-            logger.get_logger().info(
-                "%s 已从 %s 迁移到可写数据目录 %s", name, exe_dir(), base)
-        except Exception:
+            shutil.copyfile(legacy, path)
+            try:
+                import logger
+                logger.get_logger().info(
+                    "%s 已从 %s 迁移到可写数据目录 %s", name, os.path.dirname(legacy), base)
+            except Exception:
+                pass
+        except OSError:
             pass
-    except OSError:
-        pass
+        break
     return path
 
 
@@ -505,9 +594,64 @@ def _deep_merge(base, override):
     return result
 
 
+def _upgrade_config(raw):
+    """就地把 1.x 遗留配置升级到当前结构版本，返回改动说明列表（无改动返回 []）。
+
+    只处理「结构版本落后」这一种情况，且只在用户**显式**写了旧的安全默认值时才改
+    （0.0.0.0 / 准入关闭），以免覆盖用户自己的选择；改动会逐条写进日志，用户照着
+    就能在控制台改回去。迁移只发生一次：写回时同时写入 config_version。
+    """
+    try:
+        version = int(raw.get("config_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version >= CONFIG_VERSION:
+        return []
+    changes = []
+    host = raw.get("host")
+    if isinstance(host, dict):
+        if host.get("listen_host") in ("", "0.0.0.0", "::"):
+            host["listen_host"] = DEFAULT_CONFIG["host"]["listen_host"]
+            changes.append("监听地址 0.0.0.0 → %s（只允许本机与 frp 隧道接入）"
+                           % DEFAULT_CONFIG["host"]["listen_host"])
+        auth = host.get("auth")
+        if isinstance(auth, dict) and not auth.get("enabled", False):
+            auth["enabled"] = True
+            changes.append("账户准入 关闭 → 开启（观看端需注册/登录）")
+    if not changes:
+        return []
+    raw["config_version"] = CONFIG_VERSION
+    return changes
+
+
+def _persist_upgrade(path, raw, changes):
+    """把升级后的配置写回磁盘并记录改动清单；写失败只告警（下次启动会再试一次）。"""
+    try:
+        with _config_lock:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+    except OSError as e:
+        try:
+            import logger
+            logger.get_logger().warning("配置升级未能写回 %s（%s），本次运行按升级后的值生效", path, e)
+        except Exception:
+            pass
+        return
+    try:
+        import logger
+        logger.get_logger().warning(
+            "配置已升级到 v%d（更安全的默认值）：%s。需要局域网直连或匿名观看时，"
+            "请在共享端控制台的「传输参数」里改回并重新应用。",
+            CONFIG_VERSION, "；".join(changes))
+    except Exception:
+        pass
+
+
 def load_config():
     """加载配置：config.json 不存在时先写入 DEFAULT_CONFIG 再返回其深拷贝；
-    存在时读取并与 DEFAULT_CONFIG 做递归深合并后返回合并结果。
+    存在时读取、做一次结构升级（见 _upgrade_config）并与 DEFAULT_CONFIG 深合并后返回。
 
     第 16 条：文件损坏（非法 JSON / 顶层非字典 / 合并异常）时不再抛出原始
     traceback 让程序起不来，而是把损坏文件重命名留存、回退默认配置并重新落盘。
@@ -532,7 +676,11 @@ def load_config():
             cfg = json.load(f)
         if not isinstance(cfg, dict):
             raise ValueError("config.json 顶层不是对象（实际 %s）" % type(cfg).__name__)
-        return _deep_merge(DEFAULT_CONFIG, cfg)
+        changes = _upgrade_config(cfg)
+        merged = _deep_merge(DEFAULT_CONFIG, cfg)
+        if changes:
+            _persist_upgrade(path, cfg, changes)
+        return merged
     except Exception as e:
         _recover_corrupt_config(path, e)
         return copy.deepcopy(DEFAULT_CONFIG)

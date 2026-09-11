@@ -22,12 +22,26 @@ from unittest import mock
 import viewer
 
 
+class _FakeDecoder:
+    """切源路径复用的假解码器（第 116 条 / C6：不再每次 new VideoDecoder）。"""
+
+    def __init__(self):
+        self.set_codec_calls = []
+        self.reset_calls = 0
+
+    def set_codec(self, codec):
+        self.set_codec_calls.append(codec)
+
+    def reset(self):
+        self.reset_calls += 1
+
+
 class _Recorder:
-    """记录 send_msg 调用与 VideoDecoder 构造，可注入发送异常。"""
+    """记录 send_msg 调用；VideoDecoder 构造计数保留作对照（切源应不再构造）。"""
 
     def __init__(self, send_exc=None):
         self.sent = []           # [(sock, obj)]
-        self.decoders = []       # 每次 VideoDecoder(codec=...) 的 codec
+        self.decoders = []       # 每次 VideoDecoder(codec=...) 的 codec（切源路径应为空）
         self.send_exc = send_exc
 
     def send_msg(self, sock, obj):
@@ -37,7 +51,7 @@ class _Recorder:
 
     def VideoDecoder(self, codec=None):
         self.decoders.append(codec)
-        return "DECODER(%s)" % codec
+        return _FakeDecoder()
 
 
 def _channel(rec, peers, watch_source="local", sock=object()):
@@ -50,7 +64,7 @@ def _channel(rec, peers, watch_source="local", sock=object()):
     ch._got_key = True
     ch.video_mode = True
     ch.cur_codec = viewer.CODEC_HEVC   # 故意非 H264：验证提交/回滚都重置为 H264
-    ch._decoder = "OLD_DECODER"
+    ch._decoder = _FakeDecoder()
     ch.last_frame = "LASTFRAME"
     ch.frame_serial = 5
     ch._active_sock = sock
@@ -99,8 +113,8 @@ class TestSwitchSourceRollbackOnFailure(unittest.TestCase):
         self.assertEqual(ch.frame_serial, 6)          # 提交时已递增，不回退
 
     def test_rollback_resets_decode_gating(self):
-        # 解码器已在提交时重建一次并门控；回滚不再二次重建，_decode_video_batch
-        # 会在原源下一帧到达时按 codec 自行纠正。
+        # 解码器已在提交时 set_codec+reset 门控；回滚不再二次重建，_decode_video_batch
+        # 会在原源下一帧到达时按 codec 自行纠正。第 116 条（C6）：不再 new VideoDecoder。
         rec = _Recorder(send_exc=OSError("boom"))
         ch = _channel(rec, peers=[{"id": "peer:1"}], watch_source="local")
         p1, p2 = _patched(rec)
@@ -109,7 +123,9 @@ class TestSwitchSourceRollbackOnFailure(unittest.TestCase):
         self.assertFalse(ch._got_key)
         self.assertFalse(ch.video_mode)
         self.assertEqual(ch.cur_codec, viewer.CODEC_H264)
-        self.assertEqual(rec.decoders, [viewer.CODEC_H264])  # 仅提交时重建一次
+        self.assertEqual(rec.decoders, [])  # 切源不再构造新解码器
+        self.assertEqual(ch._decoder.set_codec_calls, [viewer.CODEC_H264])
+        self.assertEqual(ch._decoder.reset_calls, 1)
 
 
 class TestSwitchSourceSuccessCommits(unittest.TestCase):

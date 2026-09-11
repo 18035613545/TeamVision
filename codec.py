@@ -392,11 +392,31 @@ class VideoDecoder:
             self._ctx = None
 
     def set_codec(self, codec):
-        """流中编码切换（H.264 <-> HEVC）时重建解码器。"""
+        """流中编码切换（H.264 <-> HEVC）时重建解码器。
+
+        第 116 条（C6）：重建前先关旧上下文，避免 PyAV CodecContext 只靠 GC 释放
+        （重连风暴下会堆积线程/显存）。
+        """
         if codec == self._codec and self._ctx is not None:
             return
+        self.close()
         self._codec = codec
-        self._ctx = None
+        self._init_ctx()
+
+    def reset(self):
+        """清空解码参考状态（重连/切源），尽量复用已有上下文。
+
+        flush_buffers 比新建 CodecContext 便宜一个数量级；flush 失败才整体重开。
+        第 116 条（C6）：观看端原先每次重连/切源都 `VideoDecoder(...)` 新建上下文，
+        长跑 RSS/线程随重连上涨。
+        """
+        if self._ctx is not None:
+            try:
+                self._ctx.flush_buffers()
+                return
+            except Exception:
+                pass
+        self.close()
         self._init_ctx()
 
     def decode(self, annexb):
@@ -410,6 +430,9 @@ class VideoDecoder:
             try:
                 self._ctx.flush_buffers()
             except Exception:
+                # 第 116 条补丁：flush 失败必须先 close 旧上下文再重建，
+                # 否则 _init_ctx 直接覆盖 self._ctx，旧 PyAV 对象泄漏（线程/显存堆积）。
+                self.close()
                 try:
                     self._init_ctx()
                 except Exception:
@@ -425,7 +448,14 @@ class VideoDecoder:
         return out
 
     def close(self):
+        """释放解码上下文（幂等）。"""
+        ctx = self._ctx
         self._ctx = None
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
 
 def log_note(msg):

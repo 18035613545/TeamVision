@@ -30,9 +30,10 @@ _DIM = "#8a8a9a"
 def _splash_path():
     """返回启动画面图片路径（assets/splash.png）。
 
-    冻结运行时优先取 PyInstaller onefile 解包目录 sys._MEIPASS 内嵌的启动图
-    （由 spec 的 datas 打入 exe，程序自带、不依赖外部 assets 目录）；
-    源码运行（无 _MEIPASS）时回退到程序资源目录 common.exe_dir()/assets。
+    冻结运行时优先取 PyInstaller 解包目录 sys._MEIPASS 内嵌的启动图
+    （onedir 下即 `<程序目录>\_internal`，由 spec 的 datas 打入，程序自带、
+    不依赖外部 assets 目录）；源码运行（无 _MEIPASS）时回退到
+    程序资源目录 common.exe_dir()/assets。
     """
     base = getattr(sys, "_MEIPASS", None) or common.exe_dir()
     return os.path.join(base, "assets", "splash.png")

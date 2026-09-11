@@ -8,14 +8,14 @@ echo   安装包生成脚本 (Inno Setup 6)
 echo ============================================
 echo.
 
-rem ===== [1/3] 前置检查：提醒先打包 exe =====
-echo [1/3] 检查 dist 目录下的编译产物...
+rem ===== [1/4] 前置检查：提醒先打包 exe =====
+echo [1/4] 检查 dist 目录下的编译产物...
 set "HAS_FRPC=1"
-if not exist "dist\fps-host.exe" (
-    echo [提示] 未找到 dist\fps-host.exe，请先运行 build_exe.bat 生成共享端。
+if not exist "dist\fps-host\fps-host.exe" (
+    echo [提示] 未找到 dist\fps-host\fps-host.exe，请先运行 build_exe.bat 生成共享端。
 )
-if not exist "dist\fps-viewer.exe" (
-    echo [提示] 未找到 dist\fps-viewer.exe，请先运行 build_exe.bat 生成观看端。
+if not exist "dist\fps-viewer\fps-viewer.exe" (
+    echo [提示] 未找到 dist\fps-viewer\fps-viewer.exe，请先运行 build_exe.bat 生成观看端。
 )
 if not exist "dist\frpc.exe" (
     set "HAS_FRPC=0"
@@ -29,8 +29,8 @@ echo.
 echo 提醒：请确认已先运行 build_exe.bat 生成 dist\ 下的共享端/观看端 exe。
 echo.
 
-rem ===== [2/3] 检测 Inno Setup 6 编译器 =====
-echo [2/3] 检测 Inno Setup 6 编译器 (ISCC.exe)...
+rem ===== [2/4] 检测 Inno Setup 6 编译器 =====
+echo [2/4] 检测 Inno Setup 6 编译器 (ISCC.exe)...
 set "ISCC="
 where iscc >nul 2>nul
 if not errorlevel 1 set "ISCC=iscc"
@@ -51,10 +51,23 @@ if not defined ISCC (
 echo 检测到 ISCC：%ISCC%
 echo.
 
-rem ===== [3/3] 编译安装包 =====
-echo [3/3] 编译安装包 installer.iss ...
+rem ===== [3/4] 编译安装包 =====
+echo [3/4] 编译安装包 installer.iss ...
 "%ISCC%" installer.iss
 if errorlevel 1 goto :failed
+echo.
+
+rem ===== [4/4] 对安装包做 Authenticode 签名 =====
+echo [4/4] 签名安装包 ...
+if exist "dist\TeamVision-Setup-1.3.0.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1" ^
+        -Files "dist\TeamVision-Setup-1.3.0.exe"
+    if errorlevel 1 (
+        echo [警告] 安装包签名失败，产物仍可用。
+    )
+) else (
+    echo [警告] 未找到 dist\TeamVision-Setup-1.3.0.exe，跳过签名。
+)
 echo.
 echo ============================================
 if "%HAS_FRPC%"=="1" (

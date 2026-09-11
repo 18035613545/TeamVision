@@ -9,8 +9,8 @@ echo   共享端/观看端 一键打包脚本 (PyInstaller)
 echo ============================================
 echo.
 
-rem ===== [1/4] 检查 conda 并激活环境 =====
-echo [1/4] 检查 conda 环境...
+rem ===== [1/5] 检查 conda 并激活环境 =====
+echo [1/5] 检查 conda 环境...
 where conda >nul 2>nul
 if errorlevel 1 (
     echo.
@@ -33,8 +33,8 @@ if /i not "%CONDA_DEFAULT_ENV%"=="fps-screen" (
 echo 环境 fps-screen 激活成功。
 echo.
 
-rem ===== [2/4] 安装 PyInstaller（阿里云镜像仅本次命令生效，不改全局 pip 配置）=====
-echo [2/4] 从阿里源安装 PyInstaller 到当前环境 ...
+rem ===== [2/5] 安装 PyInstaller（阿里云镜像仅本次命令生效，不改全局 pip 配置）=====
+echo [2/5] 从阿里源安装 PyInstaller 到当前环境 ...
 rem 第 73 条：原 `pip config set global.index-url ...` 会永久修改本机全局 pip 配置
 rem （影响所有项目，超出本项目范围）；改用 -i/--trusted-host 只对这一条命令生效。
 rem python -m pip 确保装进上方已 conda activate 并校验过的 fps-screen 环境。
@@ -43,44 +43,60 @@ if errorlevel 1 goto :failed
 echo PyInstaller 安装完成。
 echo.
 
-rem ===== [3/4] 打包共享端（windowed 无黑窗 + 可选 dxcam 采集后端）=====
-echo [3/4] 打包共享端 fps-host.exe ...
+rem ===== [3/5] 打包共享端（windowed 无黑窗 + 可选 dxcam 采集后端）=====
+echo [3/5] 打包共享端 fps-host.exe ...
 rem 第 68 条：直接用仓库已提交的 fps-host.spec 打包，不再用 pyinstaller CLI 传参。
 rem CLI 传参会重新生成并覆盖 .spec，把其中的 collect_all('av') 抹掉——av.libs 的
 rem FFmpeg DLL 能否打进去就全看未固定版本的 pyinstaller-hooks-contrib；一旦漏打，
 rem import av 失败被 codec.py 静默吞掉，用户端无声退回 JPEG（带宽 5-20 倍回退）。
 rem fps-host.spec 内已含 pathex=['vendor']、collect_all('av')、hiddenimports=['dxcam']、
-rem console=False、version_info.txt、icon、onefile，等价于原 CLI 的全部参数。
+rem console=False、version_info.txt、icon、onedir，等价于原 CLI 的全部参数。
 pyinstaller --noconfirm --clean fps-host.spec
 if errorlevel 1 goto :failed
 echo 共享端打包完成。
 echo.
 
-rem ===== [4/4] 打包观看端（windowed 无黑窗）并处理 frpc =====
-echo [4/4] 打包观看端 fps-viewer.exe（windowed 无黑窗）...
+rem ===== [4/5] 打包观看端（windowed 无黑窗）并处理 frpc =====
+echo [4/5] 打包观看端 fps-viewer.exe（windowed 无黑窗）...
 rem 第 68 条：同上，用已提交的 fps-viewer.spec（含 collect_all('av') 供 H.264 解码、
-rem console=False、version_info.txt、icon、onefile），避免 CLI 覆盖 spec 抹掉 pyav 收集。
+rem console=False、version_info.txt、icon、onedir），避免 CLI 覆盖 spec 抹掉 pyav 收集。
 pyinstaller --noconfirm --clean fps-viewer.spec
 if errorlevel 1 goto :failed
 echo 观看端打包完成。
 echo.
 
+rem frpc.exe 放在 dist\ 根（= 两个 onedir 目录的上一级）：host/viewer 按
+rem common.app_dirs() 搜索 exe 目录与上一级，因此放在安装根即可被两端找到。
 if exist frpc.exe (
     copy /y frpc.exe dist\frpc.exe >nul
     if errorlevel 1 (
-        echo [警告] frpc.exe 复制失败，请手动将其放入 dist\ 目录。
+        echo [警告] frpc.exe 复制失败，请手动将其放入 dist\ 根目录。
     ) else (
-        echo 已复制 frpc.exe 到 dist\ 目录。
+        echo 已复制 frpc.exe 到 dist\ 根目录。
     )
 ) else (
-    echo frpc.exe 不存在，可稍后从樱花管理面板下载并放入 dist\ 目录。
+    echo frpc.exe 不存在，可稍后从樱花管理面板下载并放入 dist\ 根目录。
+)
+echo.
+
+rem ===== [5/5] Authenticode 签名（降低杀软/FPS 反作弊对未签名 PE 的误报）=====
+rem 不传 -Files：用 sign_exe.ps1 里的默认列表（正是刚打好的两个 exe）。
+rem 经 cmd 传 "-Files a,b" 会被当成单个字符串绑定到 [string[]]，参数绑定不可靠。
+echo [5/5] 对两个 exe 做代码签名 ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1"
+if errorlevel 1 (
+    echo [警告] 签名失败或部分失败，产物仍可用，但未签名 exe 更容易被误报。
+) else (
+    echo 代码签名完成。
 )
 echo.
 
 echo ============================================
-echo   打包完成！产物位于 dist\ 目录：
-echo     dist\fps-host.exe      共享端
-echo     dist\fps-viewer.exe    观看端
+echo   打包完成！产物位于 dist\ 目录（onedir）：
+echo     dist\fps-host\fps-host.exe      共享端
+echo     dist\fps-viewer\fps-viewer.exe  观看端
+echo     dist\frpc.exe                   公网隧道（可选）
+echo   说明：已关闭 UPX；请确认 Authenticode 已写入（sign_exe.ps1）。
 echo ============================================
 if not defined CI if not defined NOPAUSE pause
 exit /b 0

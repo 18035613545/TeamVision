@@ -21,6 +21,9 @@ config.json
 accounts.json
 frpc.exe
 
+# ---- 代码签名证书（自签 pfx 含私钥，禁止入库）----
+certs/
+
 # ---- 第三方依赖本地副本（可由 requirements.txt 重建）----
 vendor/
 

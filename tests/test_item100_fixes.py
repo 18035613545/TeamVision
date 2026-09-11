@@ -375,14 +375,23 @@ class TestSanitizeTokenType(unittest.TestCase):
 # ------------------------------------------- 9) 迟到 probe 有应答
 
 class TestLateProbeAnswered(unittest.TestCase):
-    """可选 auth 窗口（2s）之后到达的 probe 必须得到 auth_result。
+    """auth 阶段的 probe 必须有应答。
 
     旧行为：主循环没有 probe/login 分支 → 观看端把随后的 roster/pong 当认证回复
     → 在"无需登录"的服务端上弹登录框、最终报"需要登录"并反复重连。
+
+    第 131 条：准入默认值由「关闭」改为「开启」，因此这里把两种准入状态分别锁住——
+    兼容旧客户端的放行路径，和默认配置下必须明确回「需要登录」的路径。
     """
 
-    def test_probe_after_window_gets_auth_result(self):
-        rt = host.HostRuntime(copy.deepcopy(common.DEFAULT_CONFIG))
+    @staticmethod
+    def _runtime(auth_enabled):
+        cfg = copy.deepcopy(common.DEFAULT_CONFIG)
+        cfg["host"]["auth"]["enabled"] = auth_enabled
+        return host.HostRuntime(cfg)
+
+    def _late_probe_reply(self, rt):
+        """握手 → 等过可选 auth 窗口（2s）→ 发 probe → 返回收到的 auth_result。"""
         a, b = socket.socketpair()
         b.settimeout(10.0)
         th = threading.Thread(target=host.handle_client,
@@ -396,20 +405,29 @@ class TestLateProbeAnswered(unittest.TestCase):
             time.sleep(2.3)
             common.send_msg(b, {"action": "probe", "user": "", "pass": ""})
             deadline = time.time() + 8.0
-            got = None
             while time.time() < deadline:
                 msg = common.recv_msg(b)
                 if isinstance(msg, dict) and msg.get("action") == "auth_result":
-                    got = msg
-                    break
-            self.assertIsNotNone(got, "迟到的 probe 没有收到 auth_result")
-            self.assertTrue(got.get("ok"), "准入关闭时迟到 probe 应被放行：%r" % (got,))
+                    return msg
+            return None
         finally:
             try:
                 b.close()
             except OSError:
                 pass
             th.join(timeout=5.0)
+
+    def test_probe_after_window_gets_auth_result(self):
+        got = self._late_probe_reply(self._runtime(auth_enabled=False))
+        self.assertIsNotNone(got, "迟到的 probe 没有收到 auth_result")
+        self.assertTrue(got.get("ok"), "准入关闭时迟到 probe 应被放行：%r" % (got,))
+
+    def test_probe_after_window_requires_login_when_auth_enabled(self):
+        # 默认配置（准入开启）：迟到 probe 也必须被明确拒绝，而不是连接挂住无人应答
+        got = self._late_probe_reply(self._runtime(auth_enabled=True))
+        self.assertIsNotNone(got, "准入开启时迟到 probe 没有收到 auth_result")
+        self.assertFalse(got.get("ok"))
+        self.assertEqual(got.get("msg"), "需要登录")
 
 
 # ---------------------------------------- 11) viewer 工作线程异常兜底

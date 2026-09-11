@@ -44,6 +44,7 @@ from common import (
     recv_msg,
     parse_addr,
     exe_dir,
+    app_dirs,
     enable_dpi_awareness,
     tune_socket,
     parse_message,
@@ -111,6 +112,7 @@ def _thread_excepthook(args):
 #: 全局热键修饰键
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
+MOD_NOREPEAT = 0x4000  # Win7+：按住不连发，避免长按瞬间扫过全部频道
 #: 按键
 VK_X = 0x58
 VK_LEFT = 0x25
@@ -119,6 +121,7 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 VK_1 = 0x31
 WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
 #: 各热键独立 ID：1=Ctrl+Alt+X 切换穿透，2=Ctrl+Alt+← 上一个频道，3=Ctrl+Alt+→ 下一个频道，
 #: 4=Ctrl+Alt+↑ 上一个画面源，5=Ctrl+Alt+↓ 下一个画面源
 HOTKEY_ID_TOGGLE = 1
@@ -303,6 +306,7 @@ class Channel:
         self._retry_delay = 0.0  # 当前重连等待（指数退避）；成功收帧后归零
         # H.264/H.265(HEVC) 视频解码（host 视频编码路径）；JPEG 回退仍兼容
         self._decoder = codec_mod.VideoDecoder()
+        self._dec_lock_obj = None  # 惰性创建，见 _dec_lock()
         self._got_key = False          # 是否已收到关键帧（视频解码起点）
         # 第 105 条（B6）：解码"代数"。切源/重连时 +1，_decode_video_batch 进入时
         # 快照并逐帧校验——主线程切源会重置解码器，而接收线程可能正在用**旧源**的
@@ -343,6 +347,19 @@ class Channel:
         ).start()
 
     # ---------- 接收线程 ----------
+
+    def _dec_lock(self):
+        """解码器专用锁（惰性创建：测试常用 __new__ 构造 Channel，可能尚未跑 __init__）。
+
+        第 116 条补丁：切源/重连（主线程）set_codec/reset → close()，与接收线程
+        _ctx.decode 并发会拆掉正在用的 FFmpeg 上下文（未定义行为）。所有 decoder
+        操作都必须持此锁。
+        """
+        lock = self.__dict__.get("_dec_lock_obj")
+        if lock is None:
+            lock = threading.Lock()
+            self.__dict__["_dec_lock_obj"] = lock
+        return lock
 
     def _receiver_loop(self):
         """接收线程主循环：解析地址 → 连接 → 握手 → 实时收帧；异常时指数退避重连。
@@ -392,8 +409,12 @@ class Channel:
                 self.video_mode = False
                 self._got_key = False
                 self._gen = getattr(self, "_gen", 0) + 1   # 第 105 条（B6）：作废在途批次（旧连接的 NAL）
-                # 重连后重建解码器：丢弃旧连接的参考帧，避免新流 P 帧对着旧参考解码出脏画面
-                self._decoder = codec_mod.VideoDecoder(codec=self.cur_codec)
+                # 第 116 条（C6）：重连尽量复用已有解码上下文（flush_buffers），
+                # 编码类型变化时才 set_codec 重建；原先每次重连都 new VideoDecoder。
+                # 持 _dec_lock：接收线程可能正卡在 decode() 里。
+                with self._dec_lock():
+                    self._decoder.set_codec(self.cur_codec)
+                    self._decoder.reset()
                 # MultiView：重置能力状态并发 cap_probe；host 侧新连接默认 local，
                 # 若上次在观看 peer 源则重新订阅；成功后按需自动重启共享
                 self.multiview = False
@@ -607,14 +628,16 @@ class Channel:
                 return
             if codec != self.cur_codec:
                 # 编码切换（H.264 <-> HEVC）：重建解码器并从关键帧重新开始
-                self._decoder.set_codec(codec)
+                with self._dec_lock():
+                    self._decoder.set_codec(codec)
                 self.cur_codec = codec
                 self._got_key = False
                 self._request_keyframe(sock)
             if flags & VIDEO_FLAG_KEY:
                 self._got_key = True
                 self.video_mode = True
-            frames = self._decoder.decode(nal)
+            with self._dec_lock():
+                frames = self._decoder.decode(nal)
             if frames and self._got_key:
                 # 仅在收到关键帧后显示：重连/编码切换后首个关键帧前的 P 帧可能对旧参考
                 # 解码出脏画面，一律丢弃并请求关键帧。批次内逐帧喂解码器维持参考链，
@@ -750,6 +773,14 @@ class Channel:
                 self._prompt_blocked_until = time.time() + 30
                 self.auth_msg = "注册失败：用户名已被占用，请换一个或直接登录"
                 log.warning("频道[%s] 注册用户名已被占用：%s", self.name, user)
+                return False
+            if action == "register" and msg:
+                # 第 131 条：服务端关闭了自助注册（bootstrap/closed 策略）或账户文件写不
+                # 进去时，必须把原因显示出来并停止本轮重试；否则用户看到的只是"输完又弹
+                # 框"，误以为是自己密码打错了。
+                self._prompt_blocked_until = time.time() + 30
+                self.auth_msg = "注册失败：%s" % msg
+                log.warning("频道[%s] 注册被拒绝：%s", self.name, msg)
                 return False
             if msg in ("用户名或密码错误", "账号不存在"):
                 self._prompt_blocked_until = time.time() + 30
@@ -930,9 +961,12 @@ class Channel:
             self._got_key = False
             self.video_mode = False
             self.cur_codec = CODEC_H264
-            # 第 1 条：cur_codec 强设为 H264 后必须同步重建解码器，否则从 HEVC 源
-            # 切到 H.264 源时旧 HEVC 解码器被喂 H.264 数据 → 解码恒失败 → 永久黑屏。
-            self._decoder = codec_mod.VideoDecoder(codec=CODEC_H264)
+            # 第 116 条（C6）：切源复用解码上下文 + flush，不再 new VideoDecoder
+            # （原先从 HEVC 源切回 H.264 时靠重建切换编码器；现走 set_codec）。
+            # 持 _dec_lock：防止与接收线程 decode 并发 close 上下文。
+            with self._dec_lock():
+                self._decoder.set_codec(CODEC_H264)
+                self._decoder.reset()
             self.last_frame = None
             # 第 105 条（B6）：切源同时作废在途解码批次——接收线程可能正拿着旧源的
             # NAL 循环，不校验会把旧源帧喂进刚建好的解码器、或把旧源画面贴到新源
@@ -1161,6 +1195,12 @@ class ViewerApp:
         self.panel = None
         self._share_toggle_busy = False  # 第 60 条：共享开关异步执行期间的重入护栏
         self._save_after_id = None  # 第 64 条：viewer 配置去抖落盘的 root.after 句柄
+        # 全局热键状态（注册结果供面板提示/失败上屏；tid 供退出时 PostThreadMessage 唤醒）
+        self._hotkey_tid = None
+        self._hotkey_registered = set()
+        self._hotkey_failed = []
+        self._hint_label = None
+        self._hotkey_notice_synced = False
         self.channels = []
         self.active_idx = 0
 
@@ -1210,6 +1250,7 @@ class ViewerApp:
             self.root.mainloop()
         finally:
             self.running = False
+            self._stop_hotkeys()  # 第 C8 条：打断 GetMessageW，释放全局热键
             self._flush_pending_save()  # 第 64 条：兜底落盘去抖期间未写出的 viewer 配置
             # 第 60 条：两阶段停止——先并发给所有频道发停止信号（非阻塞），再逐个 join，
             # 避免 N 个共享频道各 join 2 秒串行冻结退出（详见 quit）。
@@ -1225,6 +1266,7 @@ class ViewerApp:
     def quit(self):
         """退出：停止所有频道、退出主循环并销毁窗口。"""
         self.running = False
+        self._stop_hotkeys()  # 第 C8 条：打断 GetMessageW，释放全局热键
         self._flush_pending_save()  # 第 64 条：兜底落盘去抖期间未写出的 viewer 配置
         # 第 60 条：两阶段停止——先并发给所有频道发停止信号（非阻塞），再逐个 join。
         # 否则每个 ch.stop() 的 share.stop() 各 join 2 秒，N 个共享频道串行冻结主线程 2N 秒。
@@ -1511,7 +1553,7 @@ class ViewerApp:
     def _build_panel(self):
         """创建"FPS 队友画面控制台"控制面板（深色主题，纯 tkinter/ttk）。"""
         panel = tk.Toplevel(self.root)
-        panel.title("%s · FPS 画面控制台" % APP_TITLE)
+        panel.title("%s · 画面控制台" % APP_TITLE)
         panel.configure(bg=COL_BG)
         self.panel = panel
         if self.panel_topmost:
@@ -1569,8 +1611,9 @@ class ViewerApp:
                     "Alt+1..9 直达   Ctrl+Alt+X 穿透")
         else:
             hint = "Ctrl+Alt+←/→ 换频道   Ctrl+Alt+↑/↓ 换画面源   Ctrl+Alt+X 穿透"
-        ttk.Label(header, text=hint,
-                  style="Subtitle.TLabel").pack(anchor="w", pady=(2, 0))
+        self._hint_label = ttk.Label(header, text=hint,
+                                     style="Subtitle.TLabel")
+        self._hint_label.pack(anchor="w", pady=(2, 0))
 
         # ---------- 频道区（卡片） ----------
         card = ttk.Frame(panel, style="Card.TFrame")
@@ -1721,6 +1764,7 @@ class ViewerApp:
         self._status_after_id = None         # 底部状态标签的恢复定时器
         self._panel_last_serial = -1         # 预览已绘制的帧序号，避免重复缩放
         self._panel_last_idx = -1            # 预览已绘制的频道下标
+        self._preview_info_cache = None      # 预览小字缓存 (text, fg)，未变则跳过 configure
 
         # 关闭面板 = 隐藏（不退出程序）；overlay 右键菜单增加"显示控制台"
         panel.protocol("WM_DELETE_WINDOW", self._panel_hide)
@@ -1765,7 +1809,11 @@ class ViewerApp:
     # ---------- 面板：列表/预览刷新（均为主线程 after 调度） ----------
 
     def _panel_refresh_list(self):
-        """每 500ms 重建频道列表：状态点、帧率、活动行高亮，保留选中行。"""
+        """每 500ms 刷新频道列表：状态点、帧率、活动行高亮，保留选中行。
+
+        第 115 条（C4）：行数不变时只 `tree.item(...)` 更新值/标签发生变化的行，
+        不再全删全建（原先每 500ms delete+insert 全部行，滚动位置与焦点都被拽动）。
+        """
         if not self.running or self.panel is None:
             return
         if not self._panel_visible():
@@ -1783,35 +1831,59 @@ class ViewerApp:
                 self._panel_selected = self.active_idx if n else None
                 self._panel_known_count = n
             tree = self._tree
-            # item 40：全删全建会把滚动位置拽回顶部；重建前记下顶部可见比例，重建后恢复
-            try:
-                y_top = tree.yview()[0]
-            except Exception:
-                y_top = 0.0
+            children = tree.get_children()
             self._panel_suppress_select = True
-            tree.delete(*tree.get_children())
-            for i, item in enumerate(snapshot):
-                tags = ["st_%s" % item["status"]]
-                if i == self.active_idx:
-                    tags.insert(0, "row_active")
-                latency = item["latency"]
-                name_txt = item["name"]
-                if item.get("video"):
-                    codec_tag = "HEVC" if item.get("codec") == CODEC_HEVC else "H264"
-                    name_txt = codec_tag + "·" + name_txt
-                tree.insert("", "end", iid=str(i),
-                            values=("●", name_txt, item["addr"],
-                                    "%d" % round(item["fps"]),
-                                    "-" if latency <= 0 else "%d" % round(latency)),
-                            tags=tags)
+            if len(children) != n or n == 0:
+                # 行数变化/首次：全量重建；item 40：记下顶部可见比例，重建后恢复
+                try:
+                    y_top = tree.yview()[0]
+                except Exception:
+                    y_top = 0.0
+                tree.delete(*tree.get_children())
+                for i, item in enumerate(snapshot):
+                    tags = ["st_%s" % item["status"]]
+                    if i == self.active_idx:
+                        tags.insert(0, "row_active")
+                    latency = item["latency"]
+                    name_txt = item["name"]
+                    if item.get("video"):
+                        codec_tag = "HEVC" if item.get("codec") == CODEC_HEVC else "H264"
+                        name_txt = codec_tag + "·" + name_txt
+                    tree.insert("", "end", iid=str(i),
+                                values=("●", name_txt, item["addr"],
+                                        "%d" % round(item["fps"]),
+                                        "-" if latency <= 0 else "%d" % round(latency)),
+                                tags=tags)
+                if y_top:
+                    try:
+                        tree.yview("moveto", y_top)
+                    except Exception:
+                        pass
+            else:
+                # 行数不变：只更新值/标签变化的行（C4 增量刷新）
+                for i, item in enumerate(snapshot):
+                    latency = item["latency"]
+                    name_txt = item["name"]
+                    if item.get("video"):
+                        codec_tag = "HEVC" if item.get("codec") == CODEC_HEVC else "H264"
+                        name_txt = codec_tag + "·" + name_txt
+                    values = ("●", name_txt, item["addr"],
+                              "%d" % round(item["fps"]),
+                              "-" if latency <= 0 else "%d" % round(latency))
+                    tags = ["st_%s" % item["status"]]
+                    if i == self.active_idx:
+                        tags.insert(0, "row_active")
+                    iid = str(i)
+                    try:
+                        cur_values = tuple(tree.item(iid, "values"))
+                        cur_tags = tuple(tree.item(iid, "tags"))
+                    except Exception:
+                        continue
+                    if cur_values != values or cur_tags != tuple(tags):
+                        tree.item(iid, values=values, tags=tags)
             if self._panel_selected is not None and n and 0 <= self._panel_selected < n:
                 tree.selection_set(str(self._panel_selected))
                 tree.focus(str(self._panel_selected))
-            if y_top:
-                try:
-                    tree.yview("moveto", y_top)
-                except Exception:
-                    pass
             self._panel_suppress_select = False
             self._sync_share_button()
             self._panel_refresh_sources()
@@ -1898,15 +1970,18 @@ class ViewerApp:
                     # exist（实测每次切源必现，预览永久失效并刷屏）。
                     self._preview_label.configure(image="", text="暂无画面")
                     self._panel_photo = None
-            # 预览小字：频道名称与状态
+            # 预览小字：频道名称与状态（C4：文本未变则跳过 configure）
             if name is None:
-                self._preview_info.configure(text="", fg=COL_DIM)
+                info_text, info_fg = "", COL_DIM
             else:
-                self._preview_info.configure(
-                    # 第 104 条（B10）：认证失败显示具体原因（密码错/撞名/取消/通信失败）
-                    text="%s · %s" % (name, auth_msg if status == "auth" and auth_msg
-                                      else STATUS_TEXT.get(status, status)),
-                    fg=STATUS_COLOR.get(status, COL_DIM))
+                info_text = "%s · %s" % (
+                    name, auth_msg if status == "auth" and auth_msg
+                    else STATUS_TEXT.get(status, status))
+                info_fg = STATUS_COLOR.get(status, COL_DIM)
+            prev_info = getattr(self, "_preview_info_cache", None)
+            if prev_info != (info_text, info_fg):
+                self._preview_info_cache = (info_text, info_fg)
+                self._preview_info.configure(text=info_text, fg=info_fg)
         except Exception:
             # 第 91 条：cvtColor/fromarray/resize/PhotoImage/configure 原全裸奔，一帧异常形状
             # （如解码出灰度 (H,W) 而非 (H,W,3)、或通道数不符）的图像会让 cv2.cvtColor 抛异常，
@@ -2004,7 +2079,11 @@ class ViewerApp:
             style="Panel.TButton" if on else "Accent.TButton")
 
     def _panel_refresh_sources(self):
-        """重建"画面源"卡片行：目标频道的 local + peers，活动频道行加观看标记。"""
+        """重建"画面源"卡片行：目标频道的 local + peers，活动频道行加观看标记。
+
+        第 115 条（C4）：行数与 (mark, source, info, sid) 序列均未变时跳过全删全建；
+        仅值变化的行走 tree.item 更新。
+        """
         if self._src_tree is None:
             return
         ch = self._target_channel()
@@ -2018,7 +2097,6 @@ class ViewerApp:
                     keep = self._src_rows[row_idx]
             except (ValueError, TypeError):
                 keep = None
-        self._src_rows = []
         rows = []
         if ch is not None:
             with ch.lock:
@@ -2035,11 +2113,28 @@ class ViewerApp:
                 rows.append(("▶ 观看中" if (active and watching == sid) else "",
                              "队友 · %s" % (p.get("name") or sid),
                              p.get("addr") or "", sid))
+        # 结构（sid 序列）未变：只更新值变化的行，避免每 500ms 全删全建
+        if (self._src_rows
+                and len(self._src_rows) == len(rows)
+                and [r[3] for r in rows] == list(self._src_rows)):
+            for i, (mark, source, info, _sid) in enumerate(rows):
+                values = (mark, source, info)
+                tags = ("src_watching",) if mark else ()
+                iid = str(i)
+                try:
+                    cur_values = tuple(tree.item(iid, "values"))
+                    cur_tags = tuple(tree.item(iid, "tags"))
+                except Exception:
+                    continue
+                if cur_values != values or cur_tags != tags:
+                    tree.item(iid, values=values, tags=tags)
+            return
         # item 40：同样全删全建，记下滚动比例，重建后恢复，避免源列表被拽回顶部
         try:
             y_top = tree.yview()[0]
         except Exception:
             y_top = 0.0
+        self._src_rows = []
         tree.delete(*tree.get_children())
         for i, (mark, source, info, sid) in enumerate(rows):
             tags = ("src_watching",) if mark else ()
@@ -2434,7 +2529,8 @@ class ViewerApp:
             candidates.append(os.path.join(exe_dir(), frpc_path))
             for alt_name in ("frpc_windows_amd64.exe", "frpc_windows_386.exe"):
                 candidates.append(os.path.join(exe_dir(), alt_name))
-        search_bases = [exe_dir()]
+        # app_dirs()：onedir 打包时 exe 在 <安装根>\fps-viewer\，frpc.exe 通常放在安装根
+        search_bases = list(app_dirs())
         for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "ProgramW6432"):
             base = os.environ.get(env_name)
             if base:
@@ -2566,6 +2662,19 @@ class ViewerApp:
         box["result"] = result
         done.set()
 
+    def _sync_hotkey_notice_once(self):
+        """poll 首次拿到注册结果时上屏（覆盖 _post_ui 在 mainloop ready 前丢弃的窗口）。"""
+        if getattr(self, "_hotkey_notice_synced", False):
+            return
+        if not self._hotkey_registered and not self._hotkey_failed:
+            return  # 热键线程尚未完成注册
+        self._hotkey_notice_synced = True
+        try:
+            self._notify_hotkey_result(
+                list(self._hotkey_registered), list(self._hotkey_failed))
+        except Exception:
+            pass
+
     def poll(self):
         """主循环轮询：每 15ms 检查活动频道是否有新帧。"""
         if not self.running:
@@ -2577,6 +2686,7 @@ class ViewerApp:
         # （嵌套循环照常触发 after 定时器），且每次只排一个后继，不会形成定时器风暴。
         self.root.after(15, self.poll)
         self._drain_ui_queue()          # 第 108 条（B14）：执行工作线程投递的 UI 回调
+        self._sync_hotkey_notice_once()  # 热键注册结果若在 ready 前被丢弃，这里补上屏
         self._process_cred_requests()
         if not self.channels:
             self._show_text("无频道")
@@ -2753,40 +2863,58 @@ class ViewerApp:
             log.info("鼠标穿透已关闭，可拖动窗口，右键菜单/Esc 可用")
 
     def apply_click_through(self):
-        """设置/清除 WS_EX_TRANSPARENT（穿透）与 WS_EX_LAYERED（穿透或半透明所需）。
+        """设置/清除悬浮窗扩展样式，兼顾可用性与反作弊误报特征。
+
+        - WS_EX_TRANSPARENT：鼠标穿透（仅穿透开启时）
+        - WS_EX_LAYERED：穿透或半透明所需
+        - WS_EX_NOACTIVATE：穿透时点击不抢游戏焦点（Discord/OBS 悬浮层同款）
+        - WS_EX_TOOLWINDOW：穿透时不进 Alt+Tab / 任务栏，避免被当成前台应用窗口
 
         WS_EX_LAYERED 不能与 Tk 的 -alpha 互相踩踏：只要开启穿透或 alpha<1.0
         就必须保持 LAYERED，并在每次切换后重新写入 alpha，否则分层窗口会失去
         透明属性（关掉穿透后变全不透明）或在 alpha==1.0 时根本不渲染。
+
+        第 C10 条：hwnd 失效/样式写失败只记日志不抛——从 _build_ui 抛出会启动即
+        弹框退出；从热键抛出会打断 toggle 且 click_through 标志与 win32 实态不一致。
         """
+        hwnd = getattr(self, "hwnd", None)
+        if not hwnd:
+            return
         try:
-            alpha = float(getattr(self, "alpha", 1.0))
-        except (TypeError, ValueError):
-            alpha = 1.0
-        alpha = max(0.0, min(1.0, alpha))
-        need_layered = bool(self.click_through) or alpha < 1.0
-        ex_style = win32gui.GetWindowLong(self.hwnd, win32con.GWL_EXSTYLE)
-        if self.click_through:
-            ex_style |= win32con.WS_EX_TRANSPARENT
-        else:
-            ex_style &= ~win32con.WS_EX_TRANSPARENT
-        if need_layered:
-            ex_style |= win32con.WS_EX_LAYERED
-        else:
-            ex_style &= ~win32con.WS_EX_LAYERED
-        win32gui.SetWindowLong(self.hwnd, win32con.GWL_EXSTYLE, ex_style)
-        if need_layered:
             try:
-                win32gui.SetLayeredWindowAttributes(
-                    self.hwnd, 0, int(round(alpha * 255)), win32con.LWA_ALPHA,
-                )
-            except Exception:
-                log.debug("SetLayeredWindowAttributes 失败", exc_info=True)
-        win32gui.SetWindowPos(
-            self.hwnd, 0, 0, 0, 0, 0,
-            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
-            | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
-        )
+                alpha = float(getattr(self, "alpha", 1.0))
+            except (TypeError, ValueError):
+                alpha = 1.0
+            alpha = max(0.0, min(1.0, alpha))
+            need_layered = bool(self.click_through) or alpha < 1.0
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            if self.click_through:
+                ex_style |= win32con.WS_EX_TRANSPARENT
+                ex_style |= win32con.WS_EX_NOACTIVATE
+                ex_style |= win32con.WS_EX_TOOLWINDOW
+            else:
+                ex_style &= ~win32con.WS_EX_TRANSPARENT
+                ex_style &= ~win32con.WS_EX_NOACTIVATE
+                ex_style &= ~win32con.WS_EX_TOOLWINDOW
+            if need_layered:
+                ex_style |= win32con.WS_EX_LAYERED
+            else:
+                ex_style &= ~win32con.WS_EX_LAYERED
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+            if need_layered:
+                try:
+                    win32gui.SetLayeredWindowAttributes(
+                        hwnd, 0, int(round(alpha * 255)), win32con.LWA_ALPHA,
+                    )
+                except Exception:
+                    log.debug("SetLayeredWindowAttributes 失败", exc_info=True)
+            win32gui.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
+            )
+        except Exception:
+            log.warning("应用鼠标穿透样式失败（hwnd 可能已失效）", exc_info=True)
 
     # ---------- 全局热键（Ctrl+Alt+X 穿透 / Ctrl+Alt+←→ 切频道 / Ctrl+Alt+↑↓ 切画面源） ----------
 
@@ -2795,12 +2923,80 @@ class ViewerApp:
             target=self._hotkey_loop, name="viewer-hotkey", daemon=True
         ).start()
 
+    def _stop_hotkeys(self):
+        """退出时唤醒热键线程（GetMessageW 阻塞中），使其走到 UnregisterHotKey。
+
+        第 C8 条：原先 quit() 只置 running=False，热键线程卡在 GetMessageW，
+        finally 里的 UnregisterHotKey 基本执行不到；若进程未及时退出会残留占用
+        Ctrl+Alt+X / Alt+1..9。用 PostThreadMessageW(WM_QUIT) 打断消息等待。
+        """
+        tid = getattr(self, "_hotkey_tid", None)
+        if not tid:
+            return
+        try:
+            ctypes.windll.user32.PostThreadMessageW(int(tid), WM_QUIT, 0, 0)
+        except Exception:
+            log.debug("PostThreadMessageW(WM_QUIT) 失败", exc_info=True)
+
+    def _notify_hotkey_result(self, registered, failed):
+        """主线程：把热键注册结果反映到面板提示与状态栏。
+
+        此前只写 WARNING 日志——Ctrl+Alt+←/→/X 在 Windows 上极易被显卡驱动/
+        系统快捷键占用（ERROR_HOTKEY_ALREADY_REGISTERED），用户看不到原因，
+        只觉得「快捷键坏了」。
+        """
+        self._hotkey_registered = set(registered)
+        self._hotkey_failed = list(failed)
+        self._update_hotkey_hint()
+        if not registered:
+            msg = "全局热键全部注册失败（被其他程序占用），请用面板按钮操作"
+            if failed:
+                msg += "：" + "、".join(failed)
+            if self.panel is not None:
+                try:
+                    self._panel_set_status(msg, error=True)
+                except Exception:
+                    pass
+        elif failed:
+            if self.panel is not None:
+                try:
+                    self._panel_set_status(
+                        "部分热键被占用失效：" + "、".join(failed), error=True)
+                except Exception:
+                    pass
+
+    def _update_hotkey_hint(self):
+        """按实际注册成功的热键刷新面板副标题，避免提示与现实不符。"""
+        label = getattr(self, "_hint_label", None)
+        if label is None:
+            return
+        ok = getattr(self, "_hotkey_registered", set()) or set()
+        parts = []
+        if HOTKEY_ID_PREV in ok and HOTKEY_ID_NEXT in ok:
+            parts.append("Ctrl+Alt+←/→ 换频道")
+        if HOTKEY_ID_SRC_PREV in ok and HOTKEY_ID_SRC_NEXT in ok:
+            parts.append("Ctrl+Alt+↑/↓ 换画面源")
+        if any(HOTKEY_ID_DIRECT_BASE <= h < HOTKEY_ID_DIRECT_BASE + 9 for h in ok):
+            parts.append("Alt+1..9 直达")
+        if HOTKEY_ID_TOGGLE in ok:
+            parts.append("Ctrl+Alt+X 穿透")
+        text = "   ".join(parts) if parts else "全局热键均被占用，请用面板操作"
+        try:
+            label.configure(text=text)
+        except Exception:
+            pass
+
     def _hotkey_loop(self):
         user32 = ctypes.windll.user32
+        try:
+            self._hotkey_tid = int(threading.get_native_id())
+        except Exception:
+            self._hotkey_tid = None
         registered = []
         failed = []
+        mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT
         for hid, vk in HOTKEY_DEFS:
-            if user32.RegisterHotKey(None, hid, MOD_CONTROL | MOD_ALT, vk):
+            if user32.RegisterHotKey(None, hid, mods, vk):
                 registered.append(hid)
             else:
                 failed.append(HOTKEY_NAMES.get(hid, "热键ID %d" % hid))
@@ -2808,24 +3004,35 @@ class ViewerApp:
         if direct_enabled:
             for i in range(9):
                 hid = HOTKEY_ID_DIRECT_BASE + i
-                if user32.RegisterHotKey(None, hid, MOD_ALT, VK_1 + i):
+                if user32.RegisterHotKey(None, hid, MOD_ALT | MOD_NOREPEAT, VK_1 + i):
                     registered.append(hid)
                 else:
                     failed.append("Alt+%d 直达频道" % (i + 1))
+        self._hotkey_registered = set(registered)
+        self._hotkey_failed = list(failed)
         if not registered:
             log.warning("全局热键全部注册失败（可能已被其他程序占用）：%s",
                         "、".join(failed) if failed else "未知")
+            self._post_ui(lambda: self._notify_hotkey_result([], list(failed)))
             return
         if failed:
             log.warning("部分全局热键注册失败（可能已被其他程序占用）：%s", "、".join(failed))
+        else:
+            log.info("全局热键注册成功 %d 个", len(registered))
+        # 结果上屏：若此刻 mainloop 尚未 ready，回调会被 _post_ui 丢弃——
+        # poll 启动后由 _sync_hotkey_notice 补发（见 poll）。
+        self._post_ui(lambda: self._notify_hotkey_result(
+            list(registered), list(failed)))
         try:
             msg = ctypes.wintypes.MSG()
-            while self.running:
+            while True:
                 ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if ret <= 0:
+                if ret <= 0:  # WM_QUIT 或错误
                     break
                 if msg.message != WM_HOTKEY:
                     continue
+                if not self.running:
+                    break
                 try:
                     if msg.wParam == HOTKEY_ID_TOGGLE:
                         self._post_ui(self.toggle_click_through)
@@ -2841,14 +3048,26 @@ class ViewerApp:
                         self._post_ui(lambda idx=msg.wParam - HOTKEY_ID_DIRECT_BASE:
                                       self.switch_channel(idx))
                 except Exception:
-                    pass
+                    log.debug("热键回调入队失败", exc_info=True)
         finally:
             for hid in registered:
-                user32.UnregisterHotKey(None, hid)
+                try:
+                    user32.UnregisterHotKey(None, hid)
+                except Exception:
+                    pass
+            self._hotkey_tid = None
+            log.debug("热键已注销 %d 个", len(registered))
 
     def _step_channel(self, delta):
-        """按步长切换频道（-1 上一个 / +1 下一个），越界时 clamp。"""
-        self.switch_channel(self.active_idx + delta)
+        """按步长切换频道（-1 上一个 / +1 下一个），到头回绕（与切源一致）。
+
+        旧实现越界 clamp：停在首/末频道时按 ←/→ 看起来「热键失灵」。
+        """
+        if not self.channels:
+            return
+        n = len(self.channels)
+        cur = self.active_idx if 0 <= self.active_idx < n else 0
+        self.switch_channel((cur + delta) % n)
 
     def _step_source(self, delta):
         """按步长循环切换活动频道的画面源（-1 上一个 / +1 下一个），到头回绕。

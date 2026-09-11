@@ -375,7 +375,7 @@ class Viewer:
                 if win_class(h) != "TkTopLevel":
                     continue
                 t = win_title(h)
-                if "FPS 画面控制台" in t:
+                if "画面控制台" in t:
                     found["panel"] = h
                 else:
                     found.setdefault("float", h)
@@ -556,7 +556,8 @@ def main():
     # 改为先判存在并给出可操作提示，避免丑陋 traceback。
     if not os.path.exists(CONFIG):
         print("config.json 不存在（全新克隆？）。本测试需基于既有配置运行；"
-              "请先启动一次 fps-host.exe / fps-viewer.exe 生成默认 config.json 后重试。",
+              "请先启动一次 fps-host\\fps-host.exe / fps-viewer\\fps-viewer.exe "
+              "（或源码 python host.py）生成默认 config.json 后重试。",
               flush=True)
         sys.exit(2)
     shutil.copy2(CONFIG, backup)

@@ -714,6 +714,9 @@ class _FakeDecoder:
     def set_codec(self, codec):
         pass
 
+    def reset(self):
+        pass
+
 
 class TestDecoderGeneration(unittest.TestCase):
     def _channel(self, decoder):
@@ -766,10 +769,9 @@ class TestDecoderGeneration(unittest.TestCase):
         ch.last_frame = object()
         ch.frame_serial = 0
         ch._gen = 0
+        ch._decoder = _FakeDecoder()      # 第 116 条（C6）：切源复用，不再 new
         ch._active_sock = None            # 无连接 → 发包失败回滚，但代数已递增
-        with mock.patch.object(viewer.codec_mod, "VideoDecoder",
-                               lambda codec=None: _FakeDecoder()):
-            self.assertFalse(ch.switch_source("local"))
+        self.assertFalse(ch.switch_source("local"))
         self.assertEqual(ch._gen, 1)
 
 

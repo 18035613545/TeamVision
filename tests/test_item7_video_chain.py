@@ -26,6 +26,9 @@ class FakeDecoder:
     def set_codec(self, c):
         self.codecs.append(c)
 
+    def reset(self):
+        pass
+
     def decode(self, nal):
         self.decode_calls.append(nal)
         self._n += 1

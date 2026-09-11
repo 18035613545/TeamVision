@@ -13,7 +13,9 @@ from tkinter import ttk
 import mss
 
 import logger as logger_mod
-from common import APP_NAME, APP_VERSION, save_config
+from common import (
+    APP_NAME, APP_VERSION, save_config, register_policy, REGISTER_POLICIES,
+)
 
 log = logger_mod.get_logger()
 
@@ -26,6 +28,14 @@ COL_DIM = "#9a9ab0"
 COL_ACCENT = "#7c5cff"
 COL_ONLINE = "#4ade80"
 COL_OFFLINE = "#f87171"
+
+#: 注册策略 → 界面文案（顺序即下拉框顺序，首项为默认）
+REGISTER_LABELS = {
+    "open": "开放（任何客户端可自助注册）",
+    "bootstrap": "仅首个账户可注册",
+    "closed": "关闭（须由共享端添加）",
+}
+REGISTER_LABEL_TO_KEY = {label: key for key, label in REGISTER_LABELS.items()}
 
 
 class _LogQueueHandler(logging.Handler):
@@ -197,6 +207,25 @@ class HostConsole:
             value=bool(host_cfg.get("perf", {}).get("adaptive", True)))
         self._auth_var = tk.BooleanVar(
             value=bool(host_cfg.get("auth", {}).get("enabled", False)))
+        # 监听地址：空/0.0.0.0/:: 同为「全网卡」；默认 127.0.0.1 只允许本机与 frp 隧道
+        raw_listen = host_cfg.get("listen_host")
+        if not isinstance(raw_listen, str) or not raw_listen.strip():
+            raw_listen = "0.0.0.0"
+        self._listen_var = tk.StringVar(value=raw_listen.strip())
+        self._reg_var = tk.StringVar(
+            value=REGISTER_LABELS[register_policy(host_cfg.get("auth", {}))])
+        self._entry(trans_card, "监听地址", self._listen_var)
+        tk.Label(trans_card,
+                 text="127.0.0.1=仅本机与 frp 隧道可连（默认）；0.0.0.0=允许局域网直连",
+                 bg=COL_CARD, fg=COL_DIM,
+                 font=("Microsoft YaHei", 8)).pack(anchor="w", padx=10)
+        reg_row = tk.Frame(trans_card, bg=COL_CARD)
+        reg_row.pack(fill="x", padx=10, pady=2)
+        tk.Label(reg_row, text="账户注册", width=14, bg=COL_CARD, fg=COL_DIM,
+                 font=("Microsoft YaHei", 9)).pack(side="left")
+        ttk.Combobox(reg_row, textvariable=self._reg_var,
+                     values=[REGISTER_LABELS[k] for k in REGISTER_POLICIES],
+                     state="readonly", width=30).pack(side="left")
         self._entry(trans_card, "目标帧率 fps", self._fps_var)
         self._entry(trans_card, "JPEG 质量", self._quality_var)
         self._entry(trans_card, "缩放系数", self._scale_var)
@@ -396,7 +425,11 @@ class HostConsole:
         self._set_status("已恢复全屏采集")
 
     def _trans_save(self):
-        """保存并即时应用传输参数：fps / JPEG 质量 / 缩放 / 自适应 / 账户准入。"""
+        """保存并即时应用传输参数：监听地址 / 注册策略 / fps / JPEG 质量 / 缩放 / 自适应 / 准入。
+
+        监听地址只落盘，需重启共享端才生效（监听 socket 在启动时绑定一次）；重启前
+        在状态栏明确说明，避免用户以为「改了没用」。
+        """
         host = self.runtime.cfg["host"]
         try:
             fps = int(self._fps_var.get().strip())
@@ -411,20 +444,34 @@ class HostConsole:
         except ValueError as exc:
             self._set_status("传输参数格式错误（%s）" % exc, error=True)
             return
+        listen = self._listen_var.get().strip()
+        if not listen or any(ch.isspace() for ch in listen):
+            self._set_status(
+                "监听地址格式错误：仅本机填 127.0.0.1，允许局域网直连填 0.0.0.0", error=True)
+            return
+        policy = REGISTER_LABEL_TO_KEY.get(self._reg_var.get(), "open")
         host["fps"] = fps
         host["jpeg_quality"] = quality
         host["scale"] = scale
+        host["listen_host"] = listen
         host.setdefault("perf", {})["adaptive"] = bool(self._adaptive_var.get())
-        host.setdefault("auth", {})["enabled"] = bool(self._auth_var.get())
+        auth = host.setdefault("auth", {})
+        auth["enabled"] = bool(self._auth_var.get())
+        auth["allow_register"] = policy
         save_config(self.runtime.cfg, "host")
         with self.runtime.slot_lock:
             self.runtime.slot["fps"] = fps
             self.runtime.slot["quality"] = quality
             self.runtime.slot["scale"] = scale
-        self._set_status("传输设置已应用：fps=%d，质量=%d，缩放=%.2f，自适应=%s，准入=%s" % (
-            fps, quality, scale,
-            "开" if self._adaptive_var.get() else "关",
-            "开" if self._auth_var.get() else "关"))
+        bound = getattr(self.runtime, "bound_addr", None) or "0.0.0.0"
+        restart_hint = ""
+        if listen != bound:
+            restart_hint = "；监听地址改动需重启共享端生效"
+        self._set_status(
+            "传输设置已应用：监听=%s，注册=%s，fps=%d，质量=%d，缩放=%.2f，自适应=%s，准入=%s%s" % (
+                listen, policy, fps, quality, scale,
+                "开" if self._adaptive_var.get() else "关",
+                "开" if self._auth_var.get() else "关", restart_hint))
 
     def _on_quit(self):
         self._set_status("正在退出…")

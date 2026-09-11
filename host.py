@@ -35,10 +35,10 @@ import logger
 import pipeline
 
 from common import (
-    load_config, save_config, server_handshake, pack_frame, pack_video, exe_dir, APP_NAME,
-    enable_dpi_awareness, accounts_path,
+    load_config, save_config, server_handshake, pack_frame, pack_video, exe_dir, app_dirs,
+    APP_NAME, enable_dpi_awareness, accounts_path, register_policy,
     recv_msg, send_msg, tune_socket, parse_message, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
-    VIDEO_FLAG_KEY, CODEC_H264, parse_video,
+    VIDEO_FLAG_KEY, CODEC_H264, parse_video, _MSG_HDR,
 )
 
 # 采集/静止检测公共件从 screen.py 导入并保持同名（viewer 上传端复用同一实现）。
@@ -224,6 +224,11 @@ class AccountManager:
                 pass
             log.error("accounts.json 写入失败（%s）：账户改动未持久化", e)
             return False
+
+    def count(self):
+        """当前账户数（自助注册策略判定用；bootstrap 策略下 >0 即关闭注册）。"""
+        with self._lock:
+            return len(self._users)
 
     def register(self, user, password):
         """注册新账户，返回 (ok: bool, 提示语)。"""
@@ -546,14 +551,78 @@ class FrpManager:
         self._lock = threading.Lock()
 
     @staticmethod
+    def _iter_process_names():
+        """枚举本机进程映像名（Toolhelp32 系统快照）。
+
+        第 131 条：原实现 spawn `tasklist` 子进程做进程发现——在反作弊/EDR 眼里那是
+        「创建 cmd.exe 并枚举进程」（MITRE T1057），既慢又平白多出一条可疑行为记录。
+        CreateToolhelp32Snapshot 只读系统快照：不拉起子进程，也不打开目标进程的句柄。
+        非 Windows 或任一 API 不可用时返回空列表（调用方按「未检测到」处理）。
+        """
+        if sys.platform != "win32":
+            return []
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return []
+        TH32CS_SNAPPROCESS = 0x00000002
+        MAX_PATH = 260
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * MAX_PATH),
+            ]
+
+        names = []
+        snapshot = None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            kernel32.Process32FirstW.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            kernel32.Process32NextW.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+                return []
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return []
+            while True:
+                names.append(entry.szExeFile)
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        except Exception:
+            return []
+        finally:
+            if snapshot:
+                try:
+                    ctypes.windll.kernel32.CloseHandle(snapshot)
+                except Exception:
+                    pass
+        return names
+
+    @staticmethod
     def _sakura_service_running():
         """检测本机是否已运行 SakuraFrpService（樱花启动器守护进程）。"""
         try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq SakuraFrpService.exe", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=5,
+            return any(
+                (name or "").lower() == "sakurafrpservice.exe"
+                for name in FrpManager._iter_process_names()
             )
-            return "SakuraFrpService.exe" in (result.stdout or "")
         except Exception:
             return False
 
@@ -631,7 +700,9 @@ class FrpManager:
                 raw_dir = os.path.dirname(frpc_path)
                 if raw_dir:
                     search_dirs.append(raw_dir if os.path.isabs(raw_dir) else os.path.join(exe_dir(), raw_dir))
-                search_dirs.append(exe_dir())
+                # app_dirs()：onedir 打包时 exe 在 <安装根>\fps-host\，frpc.exe 通常
+                # 放在安装根，因此除了 exe 目录还要搜上一级
+                search_dirs.extend(app_dirs())
                 # SakuraFrpLauncher 的默认安装目录（用户常见安装位置）
                 for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "ProgramW6432"):
                     base = os.environ.get(env_name)
@@ -785,6 +856,11 @@ class HostRuntime:
             "backend": "dxgi" if capture.get("backend") == "dxgi" else "mss",
         }
         self.slot_lock = threading.Lock()
+        # 第 113 条（C2）：流水线唤醒事件。采集写 raw 槽后置 raw_evt，编码消费；
+        # 编码写 video/jpeg 槽后置 enc_evt，发送消费。替代原先 1ms/0.5ms 的 sleep 轮询
+        # ——静止/无新帧时 CPU 空转归零，有帧时零额外延迟。
+        self.raw_evt = threading.Event()
+        self.enc_evt = threading.Event()
         self.force_key = False  # 观看端请求关键帧（slot_lock 保护），编码线程消费后清空
         self.video_encoder = None  # 共享的 VideoEncoder 实例（编码线程创建，perf 线程调码率）
         self.codec_lock = threading.Lock()
@@ -1115,6 +1191,27 @@ def _do_handshake(sock, addr, net_cfg):
     return True
 
 
+def _register_allowed(runtime, auth_cfg, addr):
+    """判断本次自助注册是否放行，返回 (allowed, 拒绝原因)。
+
+    第 131 条：开启准入但注册完全开放时，任何能连上端口的人都可以自建账号看屏，
+    等于没做准入。默认仍保持 open（不改变既有使用习惯），但提供 bootstrap/closed
+    两种策略，并在共享端控制台暴露开关与提示。
+    """
+    policy = register_policy(auth_cfg)
+    if policy == "open":
+        return True, ""
+    if policy == "closed":
+        log.warning("客户端 %s 尝试注册，但自助注册已关闭", addr)
+        return False, "共享端已关闭自助注册，请向共享端索取账号"
+    # bootstrap：只允许创建第一个账户——公网隧道已暴露、账户表还是空的时候，
+    # 不能让人人都能自建账号，那样准入形同虚设。
+    if runtime.accounts.count() == 0:
+        return True, ""
+    log.warning("客户端 %s 尝试注册，但已有账户（bootstrap 策略），已拒绝", addr)
+    return False, "共享端已有账户，自助注册已关闭（请向共享端索取账号）"
+
+
 def _auth_required_phase(sock, addr, runtime, auth_cfg):
     """准入开启：循环处理 login/register/probe；返回 (放行?, 用户名)。
 
@@ -1151,7 +1248,11 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
             if action == "login":
                 ok, text = runtime.accounts.authenticate(user, password)
             elif action == "register":
-                ok, text = runtime.accounts.register(user, password)
+                allowed, why = _register_allowed(runtime, auth_cfg, addr)
+                if allowed:
+                    ok, text = runtime.accounts.register(user, password)
+                else:
+                    ok, text = False, why
             elif action == "probe":
                 # 观看端无凭据时的探测：告知需要登录，但不作为认证失败告警记录
                 ok, text = False, "需要登录"
@@ -1288,6 +1389,7 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
         else:
             with runtime.slot_lock:
                 runtime.force_key = True  # 原逻辑：本地下一帧 IDR
+            _wake_raw(runtime)  # C2：唤醒编码线程（静止期也在等 raw_evt）
             log.debug("客户端 %s 请求关键帧，已置位强制 IDR", addr)
     elif action in ("probe", "login", "register"):
         # 第 100 条：迟到超过 2 秒的认证消息。准入关闭时上面的可选 auth 窗口（select 2s）
@@ -1479,6 +1581,7 @@ def route_frame(runtime, source, frame, is_key=False, is_jpeg=False, send_timeou
                 info.need_key = True
                 with runtime.slot_lock:
                     runtime.force_key = True
+                _wake_raw(runtime)
                 # 第 104 条（B3）：source 为 peer:N 时，上面置的 force_key 只影响
                 # host 本地编码线程，**队友的编码器收不到任何请求**——订阅 peer 的
                 # 观看端只能等对方自然 keyint（默认 60 帧 ≈ 2s）才恢复。这里补一次
@@ -1559,8 +1662,9 @@ def _fwd_member_frame(runtime, sharer, kind, payload, is_key=False, is_jpeg=Fals
     """把成员上行帧原样重打包后路由给该 peer 源的订阅者。
 
     帧 payload 格式与下行完全一致，重打包字节序列等价原消息（kind+len+payload）。
+    第 114 条（C3）：header 用 common._MSG_HDR 一次 pack，避免多段临时 bytes。
     """
-    raw = bytes((kind,)) + struct.pack(">I", len(payload)) + payload
+    raw = _MSG_HDR.pack(kind, len(payload)) + payload
     route_frame(runtime, sharer.share_id, raw, is_key=is_key, is_jpeg=is_jpeg)
 
 
@@ -1706,6 +1810,37 @@ def _listen_target(cfg):
     return listen_host, port, listen_host in ("", "0.0.0.0", "::")
 
 
+def _log_security_notice(runtime):
+    """启动时把当前暴露面写清楚：监听全网卡 / 准入关闭 / 自助注册开放。
+
+    第 131 条：这些是"默认安全"之外的选择，用户有权这样配，但必须能从日志里一眼
+    看到自己把屏幕暴露给了谁——而不是靠猜。默认组合（127.0.0.1 + 准入开启）不产生
+    任何告警噪音。
+    """
+    host_cfg = runtime.cfg.get("host") if isinstance(runtime.cfg, dict) else None
+    host_cfg = host_cfg if isinstance(host_cfg, dict) else {}
+    _listen_host, port, bind_all = _listen_target(runtime.cfg)
+    auth_cfg = host_cfg.get("auth") if isinstance(host_cfg.get("auth"), dict) else {}
+    auth_on = bool(auth_cfg.get("enabled", False))
+    if not bind_all:
+        log.info("监听 %s:%d（仅本机与 frp 隧道可达，%s）",
+                 runtime.bound_addr, port, "需登录" if auth_on else "未开启账户准入")
+        return
+    if not auth_on:
+        log.warning(
+            "当前监听 0.0.0.0:%d 且账户准入关闭：同一网络中任何人都能直接观看你的屏幕，"
+            "不会要求登录。仅在对端完全可信时这样配置。", port)
+        return
+    policy = register_policy(auth_cfg)
+    if policy == "open":
+        log.warning(
+            "当前监听 0.0.0.0:%d，准入已开启但允许自助注册：同一网络中任何人都能"
+            "自行注册账号观看你的屏幕。如需收紧，请在「传输参数」里把账户注册改为 "
+            "bootstrap（仅首个账户可注册）或 closed（完全关闭）。", port)
+    else:
+        log.info("监听 0.0.0.0:%d（账户准入开启，注册策略 %s）", port, policy)
+
+
 def bind_listener(runtime):
     """建监听 socket 并登记到 runtime；失败时写 startup_error 并返回 None。
 
@@ -1782,6 +1917,7 @@ def run_server(runtime):
     _listen_host, port, _bind_all = _listen_target(runtime.cfg)
     log.info("服务已启动，监听 %s:%d（fps=%d 质量=%d，退出按钮/Ctrl+C 退出）",
              runtime.bound_addr, port, p.base_fps, p.base_quality)
+    _log_security_notice(runtime)
 
     # 第 102 条：接受循环在模块级（_accept_loop），瞬时 OSError 只重试不退出。
     # 采集、编码、发送与性能节拍线程均为 daemon，随 stop_event 置位后退出。
@@ -1888,6 +2024,7 @@ def _capture_loop(runtime, p):
             with runtime.slot_lock:
                 runtime.slot["raw"] = bgr
                 runtime.slot["raw_ts"] = ts_micros
+            _wake_raw(runtime)  # C2：唤醒编码线程
             # 1 秒滑动窗口统计实际采集帧率
             fps_window.append(now)
             with runtime.stats_lock:
@@ -1899,6 +2036,15 @@ def _capture_loop(runtime, p):
                     time.sleep(wait)
     finally:
         src.close()
+
+
+def _wake_raw(runtime):
+    """C2：唤醒编码线程（force_key 置位 / 采集新帧时调用）。测试替身无该属性时静默跳过。"""
+    evt = getattr(runtime, "raw_evt", None)
+    if evt is not None:
+        evt.set()
+
+
 def _store_encoded(runtime, ef, raw_ts):
     """把编码结果写进共享槽（发送线程据此广播）。"""
     with runtime.slot_lock:
@@ -1915,6 +2061,9 @@ def _store_encoded(runtime, ef, raw_ts):
         runtime.slot["encode_ms"] = ef.ms
         runtime.slot["out_w"] = ef.w
         runtime.slot["out_h"] = ef.h
+    enc_evt = getattr(runtime, "enc_evt", None)
+    if enc_evt is not None:
+        enc_evt.set()  # C2：唤醒发送线程
 
 
 def _fps_from_window(window, now):
@@ -1935,7 +2084,12 @@ def _encode_static_keyframe(runtime, fe, last_frame, error_cooldown_until):
     with runtime.slot_lock:
         need_key = runtime.force_key
         runtime.force_key = False
-    if not need_key or last_frame is None:
+    if not need_key:
+        return error_cooldown_until
+    if last_frame is None:
+        # 尚无缓存帧：保留请求，等首帧编码成功后再响应（原先直接丢弃）
+        with runtime.slot_lock:
+            runtime.force_key = True
         return error_cooldown_until
     res, err = fe.force_idr(last_frame)
     if err is not None:
@@ -1943,8 +2097,13 @@ def _encode_static_keyframe(runtime, fe, last_frame, error_cooldown_until):
         if now_k >= error_cooldown_until:
             log.warning("静止期关键帧编码错误: %s，10 秒内不再重复告警", err)
             error_cooldown_until = now_k + 10.0
+        # 编码失败：恢复请求，下轮/下一帧重试（原先丢弃后只能等自然 keyint ≈2s）
+        with runtime.slot_lock:
+            runtime.force_key = True
         return error_cooldown_until
     if res is None:
+        with runtime.slot_lock:
+            runtime.force_key = True
         return error_cooldown_until
     nal, is_key, encode_ms, out_ts = res
     with runtime.slot_lock:
@@ -1954,6 +2113,9 @@ def _encode_static_keyframe(runtime, fe, last_frame, error_cooldown_until):
         runtime.slot["video_codec"] = fe.encoder.codec_id
         runtime.slot["encode_ms"] = encode_ms
         runtime.slot["bitrate"] = fe.encoder.bitrate
+    enc_evt = getattr(runtime, "enc_evt", None)
+    if enc_evt is not None:
+        enc_evt.set()  # C2：唤醒发送线程，避免静止 IDR 再等 50ms 兜底
     with runtime.stats_lock:
         runtime.stats["encode_ms"] = encode_ms
     log.info("静止期响应关键帧请求（%d 字节）", len(nal))
@@ -2013,7 +2175,10 @@ def _encode_loop(runtime, p):
             if runtime.force_key:
                 error_cooldown_until = _encode_static_keyframe(
                     runtime, fe, last_frame, error_cooldown_until)
-            time.sleep(0.001)
+            # C2：等采集置位 raw_evt（或 force_key 路径主动唤醒）；50ms 兜底覆盖
+            # stop_event 与未走 _wake_raw 的测试替身。原先 1ms sleep 空转 CPU 1000 次/秒。
+            runtime.raw_evt.wait(0.05)
+            runtime.raw_evt.clear()
             continue
         # 有新帧即将编码：原子读取并清除强制关键帧标志（仅在真正编码时消费）
         with runtime.slot_lock:
@@ -2025,8 +2190,13 @@ def _encode_loop(runtime, p):
         ef = fe.encode(raw, raw_ts, force_key=force_key, scale=scale, quality=quality,
                        fps=fps_now, bitrate=target_b)
         if ef is None:
-            # 编码器初始化/pre-roll 或编码失败：不消费 raw_ts，下轮重试
-            time.sleep(0.001)
+            # 编码器初始化/pre-roll 或编码失败：恢复 force_key（请求未兑现），
+            # 不消费 raw_ts，下轮重试
+            if force_key:
+                with runtime.slot_lock:
+                    runtime.force_key = True
+            runtime.raw_evt.wait(0.05)
+            runtime.raw_evt.clear()
             continue
         last_frame = ef.frame  # 缓存缩放后帧：静止期强制关键帧恢复用
         _store_encoded(runtime, ef, raw_ts)
@@ -2040,6 +2210,8 @@ def _encode_loop(runtime, p):
     fe.close()
     with runtime.codec_lock:
         runtime.video_encoder = None
+
+
 def _send_loop(runtime):
     """发送线程：取共享槽最新帧广播并统计带宽；同帧去重，发送慢时跳过中间帧。
 
@@ -2077,7 +2249,10 @@ def _send_loop(runtime):
             except Exception as e:
                 log.warning("广播错误: %s", e)
         else:
-            time.sleep(0.0005)  # 槽内尚无新帧，短暂等待
+            # C2：等编码线程写入新帧（enc_evt）；50ms 兜底覆盖 stop 与测试替身。
+            # 原先 0.5ms sleep 空转 CPU 2000 次/秒。
+            runtime.enc_evt.wait(0.05)
+            runtime.enc_evt.clear()
             continue
         send_ms = (time.perf_counter() - send_start) * 1000.0
         now = time.perf_counter()
@@ -2119,6 +2294,7 @@ def _set_encoder_bitrate(runtime, bps, cooldown=0.0):
     if changed:
         with runtime.slot_lock:
             runtime.force_key = True
+        _wake_raw(runtime)
         with runtime.stats_lock:
             runtime.stats["abr_changes"] += 1
             runtime.stats["last_abr_at"] = time.monotonic()

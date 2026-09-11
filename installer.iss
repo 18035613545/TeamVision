@@ -1,4 +1,4 @@
-; 队友视野 TeamVision v1.3.0 安装脚本 (Inno Setup 6)
+﻿; 队友视野 TeamVision v1.3.0 安装脚本 (Inno Setup 6)
 ; 使用方法: 运行 build_installer.bat，或手动执行 ISCC.exe installer.iss
 
 [Setup]
@@ -18,7 +18,7 @@ DefaultGroupName=队友视野
 OutputDir=dist
 OutputBaseFilename=TeamVision-Setup-1.3.0
 SetupIconFile=assets\app.ico
-UninstallDisplayIcon={app}\fps-viewer.exe
+UninstallDisplayIcon={app}\fps-viewer\fps-viewer.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -28,8 +28,13 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Name: desktopicon; Description: 创建桌面快捷方式; GroupDescription: 附加任务
 
 [Files]
-Source: "dist\fps-host.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\fps-viewer.exe"; DestDir: "{app}"; Flags: ignoreversion
+; 第 131 条：打包形态由 onefile 改为 onedir，两个程序各自是完整目录
+; （<name>.exe + _internal\，含 Python 运行时与 FFmpeg/NVENC DLL），因此整目录安装。
+; 好处：启动时不再把自身解压到 %TEMP% 再从临时目录执行，去掉杀软/EDR 的经典误报链。
+Source: "dist\fps-host\*"; DestDir: "{app}\fps-host"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\fps-viewer\*"; DestDir: "{app}\fps-viewer"; Flags: ignoreversion recursesubdirs createallsubdirs
+; frpc.exe 放在安装根：host/viewer 按 common.app_dirs() 搜索 exe 目录与上一级，
+; 因此放在 {app} 即可被两端的「启动隧道」找到。
 Source: "dist\frpc.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "assets\app.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 ; 启动图 splash.png 已由 spec 的 datas 内嵌进 exe（splash.py 冻结时从 sys._MEIPASS/assets 读取），
@@ -37,15 +42,17 @@ Source: "assets\app.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 ; app.ico 仍随包安装到 {app}\assets，供下方 [Icons] 快捷方式与 UninstallDisplayIcon 使用。
 
 [Icons]
-Name: "{group}\队友视野-共享端"; Filename: "{app}\fps-host.exe"; IconFilename: "{app}\assets\app.ico"
-Name: "{group}\队友视野-观看端"; Filename: "{app}\fps-viewer.exe"
-Name: "{autodesktop}\队友视野-观看端"; Filename: "{app}\fps-viewer.exe"; Tasks: desktopicon
+Name: "{group}\队友视野-共享端"; Filename: "{app}\fps-host\fps-host.exe"; IconFilename: "{app}\assets\app.ico"
+Name: "{group}\队友视野-观看端"; Filename: "{app}\fps-viewer\fps-viewer.exe"
+Name: "{autodesktop}\队友视野-观看端"; Filename: "{app}\fps-viewer\fps-viewer.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\fps-viewer.exe"; Description: 运行队友视野观看端; Flags: nowait postinstall skipifsilent
+Filename: "{app}\fps-viewer\fps-viewer.exe"; Description: 运行队友视野观看端; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; 第 24 条：卸载清理凭据/配置残渣，避免二手或共用机器上留下 frp token 与口令哈希。
+; 冻结运行的数据目录是 %LOCALAPPDATA%\TeamVision（见 common.data_dir），
+; 一并删除；同时兜底清理可能残留在安装目录的旧版配置。
 Type: files; Name: "{app}\accounts.json"
 Type: files; Name: "{app}\accounts.json.corrupt-*"
 Type: files; Name: "{app}\config.json"
