@@ -18,10 +18,29 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 阶段 B1（优化方案 2026-09-17）：显式排除用不到的重模块，防止在"非干净"构建机上
+    # 被依赖图意外吸入（当前实测环境中它们本就不在图中，收益≈0，属防御性配置）。
+    # tkinter 绝不能出现在这里——host_ui.py 的 UI 全靠它。
+    excludes=[
+        'unittest', 'doctest', 'pydoc', 'test', 'lib2to3',
+        'distutils', 'setuptools', 'pkg_resources', 'pip', 'wheel',
+        'IPython', 'jupyter', 'pytest',
+        'matplotlib', 'scipy', 'pandas', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'wx',
+    ],
     noarchive=False,
     optimize=0,
 )
+
+# 阶段 B1（优化方案 2026-09-17）：剔除明确用不到的大二进制（单端省约 39MB，实测已验证）。
+# - cv2\opencv_videoio_ffmpeg*.dll（~31MB）：视频编解码走 PyAV，图像路径只用
+#   imencode/imdecode/resize/cvtColor，从不创建 VideoCapture/VideoWriter；OpenCV 对该
+#   DLL 是首次使用 FFMPEG 视频后端时才惰性加载（删除后 imencode/imdecode 全链路实测可用）。
+# - PIL\_avif*.pyd / _webp*.pyd（~8MB）：不处理 AVIF/WebP 图片；Pillow 插件机制允许对应
+#   pyd 缺失（仅该格式不可用，Image.init() 全插件注册实测不受影响）。
+_B1_PRUNE = ('cv2\\opencv_videoio_ffmpeg', 'pil\\_avif', 'pil\\_webp')
+a.binaries = [b for b in a.binaries
+              if not any(p in b[0].lower().replace('/', '\\') for p in _B1_PRUNE)]
+
 pyz = PYZ(a.pure)
 
 # 第 131 条：由 onefile 改为 onedir（COLLECT）。

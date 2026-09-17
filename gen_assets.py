@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""品牌资源生成脚本（基于 Pillow）。
+r"""品牌资源生成脚本（基于 Pillow）。
 
 用法（cwd 为本文件所在目录，即项目根目录）：
     F:\conda\envs\fps-screen\python.exe gen_assets.py
@@ -132,7 +132,7 @@ def _make_icon(size):
 
 
 def gen_icon():
-    """生成 assets\app.ico，一次写出 16/32/48/64/128/256 多尺寸。"""
+    r"""生成 assets\app.ico，一次写出 16/32/48/64/128/256 多尺寸。"""
     sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
     images = [_make_icon(w) for w, _ in sizes]
     path = os.path.join(ASSETS_DIR, "app.ico")
@@ -143,7 +143,7 @@ def gen_icon():
 
 
 def gen_splash():
-    """生成 assets\splash.png：480x300 深色渐变底 + 居中品牌图形 + 产品名。"""
+    r"""生成 assets\splash.png：480x300 深色渐变底 + 居中品牌图形 + 产品名。"""
     w, h = 480, 300
     img = _diag_gradient((w, h), SPLASH_BG_TOP, SPLASH_BG_BOTTOM)
     draw = ImageDraw.Draw(img)

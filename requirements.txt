@@ -4,7 +4,10 @@
 # 下限锚定到与实测兼容的版本、上限挡住下一个大版本（破坏性变更通常发生在大版本）。
 # 注释里的「实测」= 本项目实际跑通 H.264/NVENC 的 fps-screen 环境版本（2026-09-03）。
 mss>=9.0.1,<11              # 实测 10.2.0
-opencv-python>=4.10,<6      # 实测 5.0.0.93；>=4.10 是首个提供 numpy2 兼容 wheel 的系列
+# 阶段 B1（优化方案 2026-09-17）：opencv-python → headless。本项目 UI 全走 Tk，从不调用
+# cv2.imshow/waitKey/namedWindow，headless 在 Linux/CI 上不会拖入 Qt/GTK 依赖链；
+# Windows 上两者 wheel 内容等价（仅元数据差异），体积中性。
+opencv-python-headless>=4.10,<6  # 实测 5.0.0.93；>=4.10 是首个提供 numpy2 兼容 wheel 的系列
 numpy>=1.26,<3              # 实测 2.2.6；与 opencv>=4.10 配对安全
 pillow>=10.0.0,<13          # 实测 12.3.0
 pywin32>=306,<400           # 实测 312

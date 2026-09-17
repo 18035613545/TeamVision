@@ -28,7 +28,7 @@ _DIM = "#8a8a9a"
 
 
 def _splash_path():
-    """返回启动画面图片路径（assets/splash.png）。
+    r"""返回启动画面图片路径（assets/splash.png）。
 
     冻结运行时优先取 PyInstaller 解包目录 sys._MEIPASS 内嵌的启动图
     （onedir 下即 `<程序目录>\_internal`，由 spec 的 datas 打入，程序自带、

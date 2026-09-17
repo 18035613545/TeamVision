@@ -89,8 +89,10 @@ def _draw_app():
 
 
 def _fake_pil():
-    """返回替换 viewer.cv2/Image/ImageTk 的桩（fromarray 读 .shape，cvtColor 保形）。"""
+    """返回替换 viewer.cv2/Image/ImageTk 的桩（fromarray 读 .shape，cvtColor 保形，
+    resize 返回目标尺寸的保形数组——阶段 A1 起绘制链为先缩放后转换）。"""
     fake_cv2 = mock.MagicMock()
+    fake_cv2.resize = lambda arr, size, interpolation=None: _FakeArr((size[1], size[0], 3))
     fake_cv2.cvtColor = lambda arr, code: _FakeArr(arr.shape)
     fake_Image = mock.MagicMock()
     fake_Image.fromarray = lambda rgb: _FakeImg(rgb.shape[1], rgb.shape[0])

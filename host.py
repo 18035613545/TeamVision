@@ -25,7 +25,6 @@ import queue
 import select
 import secrets
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -34,19 +33,25 @@ import time
 import logger
 import pipeline
 
-from common import (
+# 注（C9）：MSG_CTRL 属协议常量，本模块只在注释里提到它；保留导入以便
+# `host.MSG_CTRL` 这类既有引用不失效（pyflakes F401 已知无害）。
+from common import (  # noqa: F401
     load_config, save_config, server_handshake, pack_frame, pack_video, exe_dir, app_dirs,
     APP_NAME, enable_dpi_awareness, accounts_path, register_policy,
     recv_msg, send_msg, tune_socket, parse_message, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
-    VIDEO_FLAG_KEY, CODEC_H264, parse_video, _MSG_HDR,
+    VIDEO_FLAG_KEY, CODEC_H264, parse_video, _MSG_HDR, MAGIC_CLIENT, MAGIC_SERVER,
+    AUTH_TIMEOUT_DEFAULT_S, AUTH_TIMEOUT_MIN_S,
+    # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
+    # 各有一套 clamp），share.py 不再反向 import host。
+    normalize_region, safe_float, safe_int,
 )
 
 # 采集/静止检测公共件从 screen.py 导入并保持同名（viewer 上传端复用同一实现）。
 # 第 110/111 条后 host 本模块已不再直接调用这些符号——采集句柄与静止门控在
 # pipeline.CaptureSource / pipeline.StillGate，编码与回退在 pipeline.FrameEncoder，
 # 但按 test_multiview.TestScreenExtraction 锁定的"host 转发 screen 公共件"契约继续保留
-# （外部/测试按 host.encode_bgr、host.CaptureManager 等取用）。
-from screen import (
+# （外部/测试按 host.encode_bgr、host.CaptureManager 等取用）。pyflakes F401 已知无害。
+from screen import (  # noqa: F401
     CaptureManager, STILL_STEP, downsample_frame, motion_changed,
     still_gate_update, calc_output_size, encode_bgr,
 )
@@ -74,6 +79,10 @@ _ABR_EGRESS_WINDOW_S = 3.0
 #: 慢客户端会把 effective_send_ms 永久钉在高位，使码率/缩放/帧率一路降到地板且永不回升。
 SEND_MS_WINDOW_S = 2.0
 
+#: B8：共享成员超过该时长没有任何上行帧，就在 roster 里标注为"无信号"（幽灵源）。
+#: 成员侧共享会话自行终止时既不发 unshare 也不产帧，观众选中它只会停在最后一帧。
+_MEMBER_STALE_S = 10.0
+
 
 def _sanitize(text, token):
     """把文本中可能出现的 frp token 替换为打码形式，防止敏感信息写入日志。
@@ -93,71 +102,6 @@ def _sanitize(text, token):
     if token in text:
         return text.replace(token, logger.mask_secret(token))
     return text
-
-
-def _safe_int(value, default, lo=None, hi=None, warn=True):
-    """把配置值安全转为 int：非法（字符串/None/布尔/超出范围）时回退 default。
-
-    第 100 条：`config.json` 手改成 `"fps": "60"` 时，`slot["fps"]` 是 str，采集线程
-    的 `fps_now > 0` 会抛 TypeError 并把线程直接打死（服务仍在 accept、观看端能收
-    pong，但一帧都没有）。所有来自配置的数值都经此转换。
-
-    warn=False 用于每秒/每帧执行的热路径（避免同一条告警刷满日志）。
-    """
-    if isinstance(value, bool):
-        value = int(value)
-    try:
-        out = int(value)
-    except (TypeError, ValueError):
-        if warn:
-            log.warning("配置值 %r 不是整数，回退默认值 %r", value, default)
-        out = int(default)
-    if lo is not None and out < lo:
-        out = int(lo)
-    if hi is not None and out > hi:
-        out = int(hi)
-    return out
-
-
-def _safe_float(value, default, lo=None, hi=None, warn=True):
-    """把配置值安全转为 float：非法时回退 default，并按需夹到 [lo, hi]。"""
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        if warn:
-            log.warning("配置值 %r 不是数字，回退默认值 %r", value, default)
-        out = float(default)
-    if lo is not None and out < lo:
-        out = float(lo)
-    if hi is not None and out > hi:
-        out = float(hi)
-    return out
-
-
-def _normalize_region(region):
-    """校验并规范化采集区域；非法（缺键/非数字/宽高非正）时返回 None（全屏）。
-
-    第 100 条：旧实现把配置里的 region 原样透传，缺键时 screen.CaptureManager.grab
-    每次 KeyError 被吞成 None（画面永久冻结、无任何提示），host_ui._region_text 也会
-    KeyError 让整个图形控制台起不来。
-    """
-    if region is None:
-        return None
-    if not isinstance(region, dict):
-        log.warning("采集区域配置不是对象（%r），按全屏处理", region)
-        return None
-    try:
-        left = int(region["left"])
-        top = int(region["top"])
-        width = int(region["width"])
-        height = int(region["height"])
-    except (KeyError, TypeError, ValueError):
-        log.warning("采集区域配置缺少 left/top/width/height 或非整数（%r），按全屏处理", region)
-        return None
-    if left < 0 or top < 0 or width <= 0 or height <= 0:
-        log.warning("采集区域取值非法（%r），按全屏处理", region)
-        return None
-    return {"left": left, "top": top, "width": width, "height": height}
 
 
 def _hash_password(password, salt_hex):
@@ -301,6 +245,11 @@ class ClientInfo:
         self._window = []  # [(monotonic, bytes)]
         self._lock = threading.Lock()
         self.last_rx_at = time.monotonic()  # 最近一次收到客户端数据时刻（keepalive 判定）
+        # B8：最近一次收到该成员**上行视频帧**的时刻（roster 里标注"无信号"源用）。
+        # 成员侧共享会话自行终止时既不注销也不产帧，订阅它的观众会停在最后一帧且无提示；
+        # 观众端已按 B8 主修（会话自行终止 → unshare + UI 提示）上报，这里是共享端侧的
+        # 兜底标注，让"幽灵源"在源列表里可见。
+        self.last_up_at = 0.0
 
         # 独立发送通道：容量为 1，只保留最新帧；网络慢时自动丢弃中间帧
         self.send_queue = queue.Queue(maxsize=1)
@@ -334,14 +283,18 @@ class ClientInfo:
         正常共享的首帧）；持续超限才会被削，所以 1:N 放大仍被有效限制。
         """
         now = now if now is not None else time.monotonic()
-        burst_bytes = max(1.0, max_kbps * 250.0)      # kbps -> bytes/s = ×1000/8，容量 2 秒
+        # A1（2026-09-11）：补充速率与容量必须分开——名义速率 = max_kbps × 1000/8 = ×125
+        # 字节/秒，容量 = 2 秒额度。原实现把"2 秒额度"当成每秒补充量，持续补充速度
+        # 是名义值的 2 倍（实测 600 Kbps 档跑出 1312 Kbps），限速形同放宽一倍。
+        rate_bytes_s = max(1.0, max_kbps * 125.0)     # kbps -> bytes/s = ×1000/8
+        burst_bytes = rate_bytes_s * 2.0              # 容量 = 2 秒额度（容忍关键帧突发）
         max_fps = max(1.0, float(max_fps))
         if self._up_at <= 0.0:
             self._up_tokens = burst_bytes             # 首次：填满，不丢首帧
             self._up_frames = max_fps
         else:
             elapsed = max(0.0, now - self._up_at)
-            self._up_tokens = min(burst_bytes, self._up_tokens + elapsed * burst_bytes)
+            self._up_tokens = min(burst_bytes, self._up_tokens + elapsed * rate_bytes_s)
             self._up_frames = min(max_fps, self._up_frames + elapsed * max_fps)
         self._up_at = now
         if self._up_tokens < nbytes or self._up_frames < 1.0:
@@ -364,13 +317,31 @@ class ClientInfo:
         事件都挂在它上面，新客户端的 handle_client 在进 recv 循环前就卡死、永不回
         pong → 对端判停滞重连 → 线程堆积。超时抛 socket.timeout（OSError 子类），
         由调用方按发送失败处理。recv 循环用 select 门控，不受此超时影响。
+
+        C1（2026-09-11）：与 viewer._send_locked / share._send_msg 同一不变量——收紧的
+        超时必须在 finally 里还原，否则接收循环的"阻塞基线"被永久改写。
         """
         with self._write_lock:
+            prev = None
+            saved = False
             try:
-                sock.settimeout(send_timeout)
-            except OSError:
-                pass
-            send_msg(sock, obj)
+                prev = sock.gettimeout()
+                saved = True
+            except Exception:
+                saved = False
+            if saved:
+                try:
+                    sock.settimeout(send_timeout)
+                except Exception:
+                    saved = False
+            try:
+                send_msg(sock, obj)
+            finally:
+                if saved:
+                    try:
+                        sock.settimeout(prev)
+                    except Exception:
+                        pass
 
     def enqueue_frame(self, frame):
         """把最新一帧放入该客户端的发送队列，旧帧直接丢弃，绝不阻塞广播线程。
@@ -463,7 +434,21 @@ def _client_sender_loop(sock, info, runtime, send_timeout=2.0):
 
     使用容量为 1 的队列，发送慢时自动丢弃中间帧；任一客户端发送失败只移除
     该客户端，不会阻塞/拖累其他观看端。
+
+    C1（2026-09-11）：sendall 前的超时收紧在退出时还原（与本函数外的控制消息发送
+    同一不变量：接收循环的阻塞基线必须保持）。
     """
+    prev = None
+    saved = False
+    try:
+        prev = sock.gettimeout()
+        saved = True
+        try:
+            sock.settimeout(send_timeout)
+        except Exception:
+            saved = False
+    except Exception:
+        saved = False
     try:
         while not info.send_stop.is_set() and not runtime.stop_event.is_set():
             try:
@@ -471,7 +456,6 @@ def _client_sender_loop(sock, info, runtime, send_timeout=2.0):
             except queue.Empty:
                 continue
             try:
-                sock.settimeout(send_timeout)
                 start = time.perf_counter()
                 with info._write_lock:
                     sock.sendall(frame)
@@ -483,6 +467,11 @@ def _client_sender_loop(sock, info, runtime, send_timeout=2.0):
                 _drop_client(runtime, sock, info, "发送失败")
                 return
     finally:
+        if saved:
+            try:
+                sock.settimeout(prev)
+            except Exception:
+                pass
         info._sender_active = False
 
 
@@ -516,28 +505,6 @@ def _drop_client(runtime, sock, info, reason="断开"):
     log.info("客户端 %s %s已移除（累计发送 %.1f MB，剩余 %d 个客户端）",
              removed.addr, reason, total_mb, remaining)
     return True
-
-
-def _send_ctrl_or_drop(runtime, sock, info, obj, reason="控制消息写入失败"):
-    """发送控制消息；失败即移除连接（第 105 条 / B4）。
-
-    `sendall` 在超时（socket.timeout 是 OSError 子类）或对端不读时可能**已经写出**
-    「kind+长度头 + 半截 JSON」。此时连接若仍留在 clients 里，之后每一帧都会接在
-    半截消息后面 → 观看端 parse_message 读到错位字节、抛「非法的消息类型」→ 断开
-    重连（用户看到周期性掉线）。字节流一旦可能错位就无法恢复，唯一安全的处理是
-    关闭连接让观看端重连（重连成本 ~1 秒，错位抖动是永久性的）。
-
-    注意：调用方**不能**在持有 `_roster_lock` 时调用本函数——`_drop_client` →
-    `_unregister_sharer` → `broadcast_roster` 会再次获取同一把非可重入锁而自死锁。
-    """
-    try:
-        info.send_ctrl(sock, obj)
-        return True
-    except OSError as e:
-        log.debug("向 %s 发送控制消息失败，按连接损坏处理: %s", info.addr, e)
-        _drop_client(runtime, sock, info, reason)
-        return False
-
 
 
 class FrpManager:
@@ -768,21 +735,52 @@ class FrpManager:
             log.debug("frpc 输出读取结束: %s", _sanitize(str(e), token))
 
     def stop(self):
+        """停止自持有的 frpc。
+
+        B3（2026-09-11）：原实现在 `terminate()` 后就无条件宣告"frpc 已终止"，且**先把
+        `self._proc` 摘成 None**——若 frpc 卡死（网络中断后卡在 DNS/TLS 重试、被安全软件
+        挂起）导致 5 秒内不退出，异常被 `except Exception: pass` 吞掉，GUI 显示"已终止"，
+        而应用内再也点不停这个孤儿进程（再点只会得到"frpc 未在运行"）。孤儿 frpc 占着隧道
+        与本地端口，下次 start() 会再拉一个（同 token 互踢）→"隧道反复上下线"。
+
+        现在：wait 超时升级为 kill + 再 wait，**只有确认进程已退出才摘句柄并回报成功**；
+        仍失败则保留句柄，如实回报"未能停止 frpc（PID x）"。
+        """
         with self._lock:
             external = self._external_running
-            proc, self._proc = self._proc, None
+            proc = self._proc
         if external:
             log.info("SakuraFrpService 正在管理隧道，未停止外部樱花服务")
             return "樱花启动器正在托管隧道，未停止外部服务"
-        if proc is not None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                pass
+        if proc is None:
+            return "frpc 未在运行"
+        if proc.poll() is not None:
+            # 已经自己退出了：只需清句柄
+            with self._lock:
+                if self._proc is proc:
+                    self._proc = None
             log.info("frpc 已终止")
             return "frpc 已终止"
-        return "frpc 未在运行"
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            # terminate 失败或 5 秒未退出：升级为强杀
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+        if proc.poll() is None:
+            # 仍存活：保留句柄（下次还能再停），如实回报
+            pid = getattr(proc, "pid", "?")
+            log.warning("未能停止 frpc（PID %s），进程仍在运行；可稍后重试或手动结束", pid)
+            return "未能停止 frpc（PID %s）" % pid
+        with self._lock:
+            if self._proc is proc:
+                self._proc = None
+        log.info("frpc 已终止")
+        return "frpc 已终止"
 
     def is_running(self):
         with self._lock:
@@ -816,26 +814,31 @@ class HostRuntime:
         if not isinstance(net_cfg, dict):
             log.warning("配置 host.net 不是对象（%r），按默认网络参数处理", net_cfg)
             net_cfg = {}
-        self.max_clients = _safe_int(net_cfg.get("max_clients", 32), 32, 1, 4096)
-        self.msg_timeout = _safe_float(net_cfg.get("msg_timeout_s", 15.0), 15.0, 1.0, 600.0)
+        self.max_clients = safe_int(net_cfg.get("max_clients", 32), 32, 1, 4096)
+        self.msg_timeout = safe_float(net_cfg.get("msg_timeout_s", 15.0), 15.0, 1.0, 600.0)
         self._conn_lock = threading.Lock()
         self._conn_count = 0
         # 第 104 条（B3）：向 peer 共享者转发关键帧请求的冷却表（share_id -> 时刻）
         self._peer_key_lock = threading.Lock()
         self._peer_key_at = {}
         # 第 55 条：串行化 roster 广播（快照 + 发送），防陈旧快照覆盖新快照。
-        # 与 clients_lock 分离：clients_lock 只在快照瞬间持有，_roster_lock 跨越
-        # 整个发送过程；获取顺序恒为 _roster_lock → clients_lock，无环、不死锁。
+        # 与 clients_lock 分离：clients_lock 只在快照瞬间持有，_roster_lock 只保护
+        # 「谁是发送者 / 是否有未消化的脏标记」。获取顺序恒为 _roster_lock → clients_lock，
+        # 无环、不死锁。
+        # 阶段 A2（优化方案 2026-09-17）：单发送者 + 脏标记——同一时刻只有一个线程真正
+        # 发送（发送过程不持任何锁），并发调用者置脏即返，不再排队干等最坏 N×2s。
         self._roster_lock = threading.Lock()
+        self._roster_sending = False
+        self._roster_dirty = False
         host = cfg["host"]
         # 第 107 条（B8）：单个共享成员的上行限额。0=自动：带宽取目标码率×2，
         # 帧率取 2×fps（share.py 按 host.fps 上传，固定 8fps 会误伤正常共享）。
         codec_sec = host.get("codec", {}) if isinstance(host.get("codec"), dict) else {}
-        base_kbps = _safe_int(codec_sec.get("bitrate_kbps", 2500), 2500, 64)
-        self.up_max_kbps = _safe_int(net_cfg.get("upstream_max_kbps", 0), 0, 0) \
+        base_kbps = safe_int(codec_sec.get("bitrate_kbps", 2500), 2500, 64)
+        self.up_max_kbps = safe_int(net_cfg.get("upstream_max_kbps", 0), 0, 0) \
             or max(600, 2 * base_kbps)
-        self.up_max_fps = _safe_int(net_cfg.get("upstream_max_fps", 0), 0, 0) \
-            or max(8, 2 * _safe_int(host.get("fps", 30), 30, 1, 240))
+        self.up_max_fps = safe_int(net_cfg.get("upstream_max_fps", 0), 0, 0) \
+            or max(8, 2 * safe_int(host.get("fps", 30), 30, 1, 240))
         capture = host.get("capture", {})
         self.slot = {
             "jpeg": None,
@@ -844,15 +847,15 @@ class HostRuntime:
             "video_ts": 0,       # 该视频帧的采集时刻微秒（packet.pts 透传）
             "is_key": False,     # 视频帧是否关键帧
             "video_codec": CODEC_H264,  # 视频帧编码类型（协议 codec 字节，H.264/HEVC）
-            "quality": _safe_int(host.get("jpeg_quality", 80), 80, 1, 100),
-            "scale": _safe_float(host.get("scale", 1.0), 1.0, 0.05, 4.0),
-            "fps": _safe_int(host.get("fps", 30), 30, 1, 240),
+            "quality": safe_int(host.get("jpeg_quality", 80), 80, 1, 100),
+            "scale": safe_float(host.get("scale", 1.0), 1.0, 0.05, 4.0),
+            "fps": safe_int(host.get("fps", 30), 30, 1, 240),
             "encode_ms": 0.0,
             "bitrate": 0,        # 当前视频编码码率（bps，0=JPEG 模式）
             "out_w": 0,        # 最近一帧实际编码输出宽度（target_width 压制后）
             "out_h": 0,        # 最近一帧实际编码输出高度
-            "monitor": _safe_int(capture.get("monitor", 1), 1, 0),
-            "region": _normalize_region(capture.get("region")),
+            "monitor": safe_int(capture.get("monitor", 1), 1, 0),
+            "region": normalize_region(capture.get("region")),
             "backend": "dxgi" if capture.get("backend") == "dxgi" else "mss",
         }
         self.slot_lock = threading.Lock()
@@ -866,7 +869,7 @@ class HostRuntime:
         self.codec_lock = threading.Lock()
         # 当前 ABR 目标码率（bps）：ABR 调整后更新，编码线程重建编码器时沿用，
         # 避免重建回到基础码率导致码率震荡
-        self.target_bitrate = _safe_int(
+        self.target_bitrate = safe_int(
             host.get("codec", {}).get("bitrate_kbps", 2500), 2500, 64) * 1000
         self.stats = {"capture_fps": 0, "encode_fps": 0, "send_fps": 0,
                   "encode_ms": 0.0, "avg_send_ms": 0.0,
@@ -884,6 +887,9 @@ class HostRuntime:
         self.startup_error = None
         # 第 19 条：服务实际绑定地址（双栈为 "0.0.0.0"，指定地址时为该地址），供 GUI 诚实显示
         self.bound_addr = ""
+        # A0（2026-09-11）：全部监听 socket（回环双栈 = 127.0.0.1 + [::1]）；_server 为第一个
+        self._servers = []
+        self.listen_dual_loopback = False
 
     def start_server(self):
         """后台线程启动 TCP 服务与采集/发送流水线。"""
@@ -911,11 +917,13 @@ class HostRuntime:
 
     def shutdown(self):
         self.stop_event.set()
-        try:
-            if self._server is not None:
-                self._server.close()
-        except OSError:
-            pass
+        # A0：回环双栈会有两个监听 socket（127.0.0.1 + [::1]），全部关闭
+        for srv in list(getattr(self, "_servers", []) or []) + ([self._server] if self._server else []):
+            try:
+                srv.close()
+            except OSError:
+                pass
+        self._servers = []
         # 停止所有客户端发送线程并关闭连接，避免退出时残留 daemon 线程占用 socket
         with self.clients_lock:
             clients = list(self.clients.items())
@@ -936,6 +944,10 @@ class HostRuntime:
                 return info.share_id
             self._next_share_id += 1
             info.share_id = "peer:%d" % self._next_share_id
+            try:
+                info.last_up_at = time.monotonic()   # B8：登记即视为"刚活跃"
+            except Exception:
+                pass
         self.broadcast_roster()
         log.info("共享成员 %s 上线：%s（%s）", info.addr, info.share_id,
                  info.username or "-")
@@ -946,24 +958,51 @@ class HostRuntime:
         with self.clients_lock:
             if info.share_id is None:
                 return False
+            share_id = info.share_id
             info.share_id = None
+        # C5（2026-09-11）：关键帧冷却表按 share_id 记时且 share_id 单调递增不复用，
+        # 原来只增不减——每出现一个新的共享成员就留下一条永不清理的记录（长跑数月 /
+        # 反复开共享场景下可观测）。注销时一并弹出。
+        table = getattr(self, "_peer_key_at", None)
+        lock = getattr(self, "_peer_key_lock", None)
+        if table is not None and lock is not None:
+            try:
+                with lock:
+                    table.pop(share_id, None)
+            except Exception:
+                pass
         self.broadcast_roster()
         return True
 
     def broadcast_roster(self):
         """向所有存活客户端推送一次 peers 名单（id/name/addr）。
 
-        第 55 条：整个「快照 + 逐个发送」用 _roster_lock 串行化。此前注册/注销先释放
-        clients_lock 再广播，线程 A 拿到旧快照 {1} 后可能卡在发送循环里，线程 B 已广播
-        完 {1,2}，A 随后把陈旧的 {1} 送达 → 观看端源列表永久少一个正在共享的人（下次
-        roster 事件前不自愈）。串行化后每次广播都在持锁时重新快照当前状态，最后一个
-        完成的广播必然反映最新名单。send_ctrl 已有有限超时（第 54 条），持锁发送耗时
-        有界，不会因某个卡死客户端长期占用 _roster_lock。
+        第 55 条：陈旧快照不得**最后**送达（注册/注销先释放 clients_lock 再广播的旧实现
+        会让线程 A 的陈旧快照覆盖线程 B 已发的新名单，观看端源列表永久少一个共享者）。
+
+        阶段 A2（优化方案 2026-09-17）：实现改为「单发送者 + 脏标记」。旧实现让每个
+        调用线程各排队完整发送一轮——发送一个卡死客户端最长 2s（第 54 条有限超时），
+        争用时后面的调用者要在锁外干等最坏 N×2s，期间新成员的 roster 迟迟发不出。
+        现在同一时刻只有一个发送循环（发送过程不持任何锁）：并发调用者在 _roster_lock
+        内看到 _roster_sending=True 就置脏并立即返回；发送者收尾时发现脏标记，就以
+        最新客户端表再发一轮。第 55 条不变量仍在——最后送达的必然是最后快照的名单，
+        且任何一轮都从「当前」状态重新快照（不携带陈旧行）。
+
+        失败连接照旧出锁后经 `_drop_client` 移除：其内部 `_unregister_sharer` 会再次
+        调用本函数，此时要么发送者仍是自己（只置脏，收尾时重发一轮含"已移除"的最新
+        名单），要么发送者身份已让出（正常竞争）。
         """
-        failed = []
         with self._roster_lock:
-            with self.clients_lock:
-                snapshot = list(self.clients.items())
+            if self._roster_sending:
+                self._roster_dirty = True
+                return
+            self._roster_sending = True
+            self._roster_dirty = False
+        try:
+            while True:
+                failed = []
+                with self.clients_lock:
+                    snapshot = list(self.clients.items())
                 rows = []
                 for _, c in snapshot:
                     if not c.share_id:
@@ -975,21 +1014,37 @@ class HostRuntime:
                     if host.startswith("::ffff:"):
                         host = host[7:]  # IPv4-mapped 剥前缀，显示真实 IPv4
                     addr_txt = host if port is None else "%s:%s" % (host, port)
-                    rows.append({"id": c.share_id,
-                                 "name": (c.username or "").strip() or addr_txt,
-                                 "addr": addr_txt})
-            msg = {"action": "peers", "peers": rows}
-            for sock, info in snapshot:
-                try:
-                    info.send_ctrl(sock, msg)
-                except OSError as e:
-                    # 第 105 条（B4）：可能已写出半截消息，连接必须移除
-                    log.debug("向 %s 推送 roster 失败（按连接损坏处理）: %s", info.addr, e)
-                    failed.append((sock, info))
-        # 出 _roster_lock 后再移除：_drop_client → _unregister_sharer → broadcast_roster
-        # 会再次获取同一把非可重入锁，持锁调用会自死锁。
-        for sock, info in failed:
-            _drop_client(self, sock, info, "控制消息写入失败")
+                    row = {"id": c.share_id,
+                           "name": (c.username or "").strip() or addr_txt,
+                           "addr": addr_txt}
+                    # B8：超过 _MEMBER_STALE_S 没有上行帧的成员标注为"无信号"（它的共享
+                    # 会话很可能已自行终止），避免观众选中"幽灵源"停在最后一帧却毫无提示。
+                    # 只在真的无信号时才加这个键——roster 消息格式对旧观看端保持兼容。
+                    if time.monotonic() - getattr(c, "last_up_at", 0.0) > _MEMBER_STALE_S:
+                        row["stale"] = True
+                    rows.append(row)
+                msg = {"action": "peers", "peers": rows}
+                for sock, info in snapshot:
+                    try:
+                        info.send_ctrl(sock, msg)
+                    except OSError as e:
+                        # 第 105 条（B4）：可能已写出半截消息，连接必须移除
+                        log.debug("向 %s 推送 roster 失败（按连接损坏处理）: %s", info.addr, e)
+                        failed.append((sock, info))
+                # 出 _roster_lock 后再移除：_drop_client → _unregister_sharer →
+                # broadcast_roster 会再次进入本函数，绝不能在持锁时调用。
+                for sock, info in failed:
+                    _drop_client(self, sock, info, "控制消息写入失败")
+                with self._roster_lock:
+                    if not self._roster_dirty:
+                        self._roster_sending = False
+                        return
+                    self._roster_dirty = False
+        except BaseException:
+            # 异常不得让 _roster_sending 卡在 True（否则此后所有人只置脏、无人发送）
+            with self._roster_lock:
+                self._roster_sending = False
+            raise
 
     def update_capture(self, monitor=_UNSET, region=_UNSET, backend=_UNSET):
         """更新采集源配置并即时生效（写配置 + 写共享槽，采集线程每帧读取）。
@@ -999,11 +1054,11 @@ class HostRuntime:
         """
         capture = self.cfg["host"].setdefault("capture", {})
         if monitor is not _UNSET:
-            monitor = _safe_int(monitor, 1, 0)
+            monitor = safe_int(monitor, 1, 0)
             capture["monitor"] = monitor
         if region is not _UNSET:
             # 第 100 条：写入前规范化，杜绝"缺键/负值区域"进配置与共享槽
-            region = _normalize_region(region)
+            region = normalize_region(region)
             capture["region"] = region
         if backend is not _UNSET:
             backend = "dxgi" if backend == "dxgi" else "mss"
@@ -1018,25 +1073,31 @@ class HostRuntime:
                 self.slot["backend"] = backend
 
     def get_snapshot(self):
-        """返回供 GUI 刷新的状态快照（线程安全）。"""
+        """返回供 GUI 刷新的状态快照（线程安全）。
+
+        阶段 A2（优化方案 2026-09-17）：clients_lock 内只做列表快照，逐个客户端的
+        统计（rate_kbps 等）出锁计算——旧实现在锁内逐个统计，GUI 刷新频繁时会让
+        握手入册/连接注销的线程排在后面等这些计算。
+        """
         with self.clients_lock:
-            clients = []
-            for info in self.clients.values():
-                rate = info.rate_kbps()
-                lock = getattr(info, "_lock", None)
-                if lock is not None:
-                    with lock:
-                        total_mb = info.bytes_sent / (1024.0 * 1024.0)
-                else:
-                    total_mb = getattr(info, "bytes_sent", 0) / (1024.0 * 1024.0)
-                clients.append({
-                    "addr": info.addr,
-                    "username": info.username,
-                    "uptime_s": time.monotonic() - info.connected_at,
-                    "rate_kbps": rate,
-                    "total_mb": total_mb,
-                    "dropped_frames": info.dropped_frames,
-                })
+            infos = list(self.clients.values())
+        clients = []
+        for info in infos:
+            rate = info.rate_kbps()
+            lock = getattr(info, "_lock", None)
+            if lock is not None:
+                with lock:
+                    total_mb = info.bytes_sent / (1024.0 * 1024.0)
+            else:
+                total_mb = getattr(info, "bytes_sent", 0) / (1024.0 * 1024.0)
+            clients.append({
+                "addr": info.addr,
+                "username": info.username,
+                "uptime_s": time.monotonic() - info.connected_at,
+                "rate_kbps": rate,
+                "total_mb": total_mb,
+                "dropped_frames": info.dropped_frames,
+            })
         with self.stats_lock:
             perf = dict(self.stats)
         with self.slot_lock:
@@ -1122,13 +1183,16 @@ def _forward_upstream_frame(runtime, sock, info, kind, payload, addr):
     SOI(FFD8) 标记；0 字节/损坏负载不得直达订阅端。
     """
     if kind == MSG_VIDEO:
-        if info.share_id is None:
-            runtime._register_sharer(sock, info)
         try:
             _ts, _codec, flags, _nal = parse_video(payload)
         except ValueError:
             log.warning("客户端 %s 上行视频帧损坏，忽略", addr)
             return
+        # C8（2026-09-11）：**先校验负载、后登记共享者**。原实现先登记再 parse_video，
+        # 一条损坏视频帧即可让该连接出现在所有观看端的源列表里并触发一次 roster 广播
+        # （随后又因超限/断开消失）——表现为面板源列表抖动。
+        if info.share_id is None:
+            runtime._register_sharer(sock, info)
         if not _allow_upstream(runtime, info, payload, addr):   # 第 107 条（B8）
             return
         _fwd_member_frame(runtime, info, kind, payload,
@@ -1169,10 +1233,10 @@ def _do_handshake(sock, addr, net_cfg):
     """
     tune_socket(
         sock,
-        sndbuf=_safe_int(net_cfg.get("sndbuf_kb", 1024), 1024, 0) * 1024,
-        rcvbuf=_safe_int(net_cfg.get("rcvbuf_kb", 2048), 2048, 0) * 1024,
+        sndbuf=safe_int(net_cfg.get("sndbuf_kb", 1024), 1024, 0) * 1024,
+        rcvbuf=safe_int(net_cfg.get("rcvbuf_kb", 2048), 2048, 0) * 1024,
         keepalive=bool(net_cfg.get("keepalive", True)),
-        keepalive_idle=_safe_int(net_cfg.get("keepalive_idle_s", 60), 60, 1, 3600),
+        keepalive_idle=safe_int(net_cfg.get("keepalive_idle_s", 60), 60, 1, 3600),
     )
     try:
         sock.settimeout(HANDSHAKE_TIMEOUT_S)
@@ -1212,6 +1276,27 @@ def _register_allowed(runtime, auth_cfg, addr):
     return False, "共享端已有账户，自助注册已关闭（请向共享端索取账号）"
 
 
+def _str_field(msg, key, default=""):
+    """从控制/认证消息里安全取字符串字段，返回 (value, ok)。
+
+    B1（2026-09-11）：第 104 条（B11）只给 `_auth_required_phase` 补了 `isinstance`
+    校验，同一份输入却还出现在另外两条路径上——`{"user": 123}` 在 `_auth_optional_phase`
+    与 `_dispatch_ctrl` 的迟到认证分支里抛 `AttributeError`，被外层 `except` 记成"认证
+    解析失败/异常"并**悄悄断开连接**（日志原因与真实原因不符，排障困难）。
+
+    统一口径：字段缺失/为 None → 返回 (default, True)；存在但**非字符串** → 返回
+    (default, False)，由调用方决定是回 `auth_result ok=false` 还是忽略该字段。
+    """
+    if not isinstance(msg, dict):
+        return default, False
+    value = msg.get(key)
+    if value is None:
+        return default, True
+    if isinstance(value, str):
+        return value, True
+    return default, False
+
+
 def _auth_required_phase(sock, addr, runtime, auth_cfg):
     """准入开启：循环处理 login/register/probe；返回 (放行?, 用户名)。
 
@@ -1220,27 +1305,34 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
     第 104 条（B11）：user/pass 必须是字符串——旧写法 `(msg.get("user") or "").strip()`
     在 {"user":123} 上抛 AttributeError，被外层 except 记成"认证异常"并断开，用户看到
     的是"认证通信失败"，而不是"用户名或密码错误"。
+
+    B10（2026-09-11）：认证窗口下界不再是 1 秒。旧写法
+    `safe_float(..., 150, 1, 3600)` 会接受任何比客户端等待更小的值（随包 config.json
+    一度就是 60 秒），而观众端最坏要等 ≈180 秒（等界面就绪 60s + 登录框 120s）——
+    准入一开，"用户还在输入、服务端已断开"，正是第 31 条当年修掉的故障模式。
     """
-    auth_timeout = _safe_float(auth_cfg.get("auth_timeout", 150), 150, 1, 3600)
+    auth_timeout = safe_float(auth_cfg.get("auth_timeout", AUTH_TIMEOUT_DEFAULT_S),
+                               AUTH_TIMEOUT_DEFAULT_S, AUTH_TIMEOUT_MIN_S, 3600)
     deadline = time.monotonic() + auth_timeout
     sock.settimeout(auth_timeout)
     try:
         while True:
             msg = recv_msg(sock, deadline)
             action = msg.get("action")
-            raw_user, raw_pass = msg.get("user"), msg.get("pass")
-            if raw_user is not None and not isinstance(raw_user, str):
+            raw_user, ok_user = _str_field(msg, "user")
+            raw_pass, ok_pass = _str_field(msg, "pass")
+            if not ok_user:
                 send_msg(sock, {"action": "auth_result", "ok": False,
                                 "msg": "认证消息格式非法（user 必须是字符串）"})
                 log.warning("客户端 %s 认证消息 user 类型非法（%s），已拒绝",
-                            addr, type(raw_user).__name__)
+                            addr, type(msg.get("user")).__name__)
                 sock.close()
                 return False, None
-            if raw_pass is not None and not isinstance(raw_pass, str):
+            if not ok_pass:
                 send_msg(sock, {"action": "auth_result", "ok": False,
                                 "msg": "认证消息格式非法（pass 必须是字符串）"})
                 log.warning("客户端 %s 认证消息 pass 类型非法（%s），已拒绝",
-                            addr, type(raw_pass).__name__)
+                            addr, type(msg.get("pass")).__name__)
                 sock.close()
                 return False, None
             user = (raw_user or "").strip()
@@ -1304,7 +1396,14 @@ def _auth_optional_phase(sock, addr):
     try:
         sock.settimeout(2.0)
         msg = recv_msg(sock)
-        user = (msg.get("user") or "").strip()
+        # B1：非字符串 user 不再抛 AttributeError（那会被下面 except 记成"可选 auth 解析
+        # 失败"并断开连接）；这里忽略该字段继续放行，只留一条明确日志。
+        user, ok_user = _str_field(msg, "user")
+        if not ok_user:
+            log.warning("客户端 %s 可选 auth 消息 user 类型非法（%s），已忽略该字段",
+                        addr, type(msg.get("user") if isinstance(msg, dict) else None).__name__)
+            user = ""
+        user = (user or "").strip()
         send_msg(sock, {"action": "auth_result", "ok": True,
                         "msg": "账户准入已关闭，无需登录"})
         if user:
@@ -1339,6 +1438,14 @@ def _ctrl_watch(sock, info, runtime, msg, addr):
     上下行双倍流量，host 无环路保护。第 56 条：转达关键帧请求时成员掉线不拆观看者。
     """
     src = msg.get("source") or "local"
+    if not isinstance(src, str):
+        # B1：{"source": ["x"]} 会让 `src in _live_share_ids(runtime)` 抛
+        # TypeError: unhashable type: 'list'，连接被静默断开。非字符串源按"无效源"回绝。
+        log.debug("watch 拒绝非字符串源 %r（%s）", src, addr)
+        if not _reply_ctrl(sock, info, {"action": "watch_reject",
+                                        "source": None, "reason": "invalid"}, addr):
+            return "控制消息写入失败（连接已损坏）"
+        return None
     if src != "local" and src == info.share_id:
         log.debug("watch 拒绝订阅自身 %r（%s）", src, addr)
         if not _reply_ctrl(sock, info, {"action": "watch_reject",
@@ -1396,7 +1503,13 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
         # 已把本连接按"旧客户端"放行，此后到达的 probe/login 若无人应答，观看端会把
         # 下一条 roster/pong 当认证回复 → 在"无需登录"的服务端上反复弹登录框、最后报
         # "需要登录"。这里补一个明确答复（两种准入状态下都安全）。
-        late_user = (msg.get("user") or "").strip()
+        late_user, ok_late_user = _str_field(msg, "user")
+        if not ok_late_user:
+            # B1：{"user": 123} 不再抛 AttributeError 打断连接；忽略该字段即可
+            log.warning("客户端 %s 迟到的认证消息 user 类型非法（%s），已忽略",
+                        addr, type(msg.get("user")).__name__)
+            late_user = ""
+        late_user = (late_user or "").strip()
         if auth_cfg.get("enabled", False):
             if not _reply_ctrl(sock, info, {"action": "auth_result", "ok": False,
                                             "msg": "需要登录"}, addr):
@@ -1417,9 +1530,9 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
     用 select 空闲轮询 + 应用层活跃时间戳做半开连接检测，避免与发送线程共享
     settimeout 造成相互干扰；收到 ping 立即回 pong（同机测 RTT）。
     """
-    # 第 102 条：走 _safe_float——手改成 "abc" 时旧写法在每个客户端接入后立刻抛
-    # ValueError（表现为"连上就断"），且违反本文件"配置数值一律走 _safe_*"的约定。
-    idle_s = _safe_float(net_cfg.get("keepalive_idle_s", 60), 60, 1, 3600)
+    # 第 102 条：走 safe_float——手改成 "abc" 时旧写法在每个客户端接入后立刻抛
+    # ValueError（表现为"连上就断"），且违反本文件"配置数值一律走 safe_*"的约定。
+    idle_s = safe_float(net_cfg.get("keepalive_idle_s", 60), 60, 1, 3600)
     # 第 57 条：rx_buf 用 bytearray，+= 原地扩展（摊还 O(1)）；bytes 的 += 每次整份
     # 重拷，攒一条大帧时退化为 O(n²) memcpy。配套 del rx_buf[:consumed] 原地弹出已
     # 消费前缀，parse_message 已统一返回 bytes payload（不随缓冲区类型变化）。
@@ -1429,7 +1542,7 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
     # MAX_PAYLOAD(32MB)。这里给单条消息（头+体）设总时限，超时按协议错误断开——
     # 正常客户端一条控制消息是毫秒级，15 秒余量充足。
     partial_since = None
-    msg_timeout = _safe_float(getattr(runtime, "msg_timeout", 15.0), 15.0, 1.0, 600.0)
+    msg_timeout = safe_float(getattr(runtime, "msg_timeout", 15.0), 15.0, 1.0, 600.0)
     reason = "断开"
     try:
         while not runtime.stop_event.is_set():
@@ -1479,6 +1592,12 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
                     break
             if not rx_buf:
                 partial_since = None  # 缓冲区已清空：当前没有半截消息在等
+            else:
+                # C2（2026-09-11）：一段 recv 若"凑完上一条消息 + 留下下一条的半截"，
+                # partial_since 仍保留**上一条消息首字节**的时刻，第二条消息的
+                # "单条消息总时限"（msg_timeout_s，默认 15s）被提前起算——理论上可在
+                # 只收到它一小部分时被判定超时断开。消费完消息后缓冲区非空即重置计时。
+                partial_since = time.monotonic()
             if protocol_error:
                 break  # 协议错误：立即断开，避免异常字节滞留缓冲区导致内存增长
     except Exception as e:
@@ -1550,6 +1669,16 @@ def _handle_client_inner(sock, addr, runtime):
         auth_cfg = {}
     reason = _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg)
     _client_teardown(sock, info, runtime, addr, username, reason)
+def _subscriber_count(runtime, source="local"):
+    """当前订阅指定源的存活客户端数（B9：ABR 判据要区分"有订阅者"与"没人看"）。"""
+    try:
+        with runtime.clients_lock:
+            return sum(1 for info in runtime.clients.values()
+                       if getattr(info, "watch_source", None) == source)
+    except Exception:
+        return 0
+
+
 def route_frame(runtime, source, frame, is_key=False, is_jpeg=False, send_timeout=2.0):
     """把一帧消息投递给 watch_source == source 的存活客户端（订阅路由）。
 
@@ -1557,9 +1686,12 @@ def route_frame(runtime, source, frame, is_key=False, is_jpeg=False, send_timeou
     发送慢丢中间帧）；否则同步 sendall fallback（测试/旧式直连）。新增关键帧门控：
     视频订阅者在 need_key 期间（新连接/切换源后）只收关键帧，收到后清除；
     JPEG 帧自包含，始终放行。
+
+    B9（2026-09-11）：返回本次实际投递的客户端数（0 = 没有任何订阅者）——发送线程据此
+    区分"真的发出去了"与"根本没人订阅"，避免零观众时把码率一路顶到上限。
     """
     if not frame:
-        return
+        return 0
     with runtime.clients_lock:
         targets = []
         for sock, info in runtime.clients.items():
@@ -1597,6 +1729,7 @@ def route_frame(runtime, source, frame, is_key=False, is_jpeg=False, send_timeou
                     info.record_sent(len(frame))
                 except OSError:
                     _drop_client(runtime, sock, info, "发送失败")
+    return len(targets)
 
 
 def _live_share_ids(runtime):
@@ -1663,7 +1796,12 @@ def _fwd_member_frame(runtime, sharer, kind, payload, is_key=False, is_jpeg=Fals
 
     帧 payload 格式与下行完全一致，重打包字节序列等价原消息（kind+len+payload）。
     第 114 条（C3）：header 用 common._MSG_HDR 一次 pack，避免多段临时 bytes。
+    B8：顺带记录该成员最近一次产帧时刻（roster 的"无信号"标注依据）。
     """
+    try:
+        sharer.last_up_at = time.monotonic()
+    except Exception:
+        pass
     raw = _MSG_HDR.pack(kind, len(payload)) + payload
     route_frame(runtime, sharer.share_id, raw, is_key=is_key, is_jpeg=is_jpeg)
 
@@ -1697,6 +1835,32 @@ def _spawn_client(sock, addr, runtime):
     ).start()
 
 
+def _as_server_list(server):
+    """把单个监听 socket 或 socket 列表统一成列表（A0 回环双栈会同时监听 v4/v6）。"""
+    if server is None:
+        return []
+    if isinstance(server, (list, tuple)):
+        return [s for s in server if s is not None]
+    return [server]
+
+
+def _admit_client(sock, addr, runtime, spawn):
+    """连接上限判定 + 交给 spawn（第 103 条：快速路径，权威判定在 handle_client）。"""
+    limit = getattr(runtime, "max_clients", 32)
+    try:
+        current = runtime.conn_count()
+    except Exception:
+        current = 0
+    if current >= limit:
+        log.warning("连接数已达上限 %d，直接关闭来自 %s 的新连接", limit, addr)
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return
+    spawn(sock, addr, runtime)
+
+
 def _accept_loop(server, runtime, spawn=None):
     """接受循环：瞬时 OSError 不得让服务永久失去接受新连接的能力（第 102 条）。
 
@@ -1710,8 +1874,21 @@ def _accept_loop(server, runtime, spawn=None):
     告警 + 50ms 退避重试（同一轮故障最多每 20 次记一条，避免刷爆日志）。
 
     spawn 仅用于单测注入（默认 `_spawn_client`）。
+
+    A0（2026-09-11）：`server` 可以是**监听 socket 列表**（回环双栈 = 127.0.0.1 + [::1]）。
+    单 socket 时保持原有直连 accept 语义（单测用假 server 注入，必须照旧）；多 socket 时
+    用 select 同时等待，任一就绪即 accept。
     """
     spawn = spawn or _spawn_client
+    servers = _as_server_list(server)
+    if len(servers) == 1:
+        _accept_loop_single(servers[0], runtime, spawn)
+    elif servers:
+        _accept_loop_multi(servers, runtime, spawn)
+
+
+def _accept_loop_single(server, runtime, spawn):
+    """单监听 socket 的接受循环（原实现，单测注入假 server 走这条）。"""
     fails = 0
     while not runtime.stop_event.is_set():
         try:
@@ -1729,69 +1906,56 @@ def _accept_loop(server, runtime, spawn=None):
             time.sleep(0.05)
             continue
         fails = 0
-        # 第 103 条（B1）：超限时不 spawn 线程（快速路径；权威判定在 handle_client
-        # 的 acquire_conn 里，那里能看到"握手中"的连接，两者一致收敛）。
-        limit = getattr(runtime, "max_clients", 32)
-        try:
-            current = runtime.conn_count()
-        except Exception:
-            current = 0
-        if current >= limit:
-            log.warning("连接数已达上限 %d，直接关闭来自 %s 的新连接", limit, addr)
-            try:
-                sock.close()
-            except OSError:
-                pass
-            continue
-        spawn(sock, addr, runtime)
+        _admit_client(sock, addr, runtime, spawn)
 
 
-class PipelineParams:
-    """采集/编码/发送/性能四条流水线的派生参数（第 109 条 · 阶段 2 重构）。
+def _accept_loop_multi(servers, runtime, spawn):
+    """A0：多监听 socket（回环双栈）的接受循环，用 select 同时等待。
 
-    这些值原先散落在 run_server 开头的 60 余行局部变量里，被 4 个嵌套闭包共享。
-    抽成对象后四条流水线成为模块级函数（可单独构造参数测试），run_server 只做编排。
-    所有数值读取仍走 _safe_int/_safe_float（第 100 条），手改配置不会打死线程。
+    失效的监听 socket 只从集合里剔除，不会拖垮另一条地址族的服务；全部失效或
+    stop_event 置位时退出。
     """
-
-    __slots__ = ("base_fps", "base_quality", "base_scale", "quality_min", "scale_min",
-                 "fps_min", "still_enabled", "still_probe_interval", "still_quiet_s",
-                 "point_thr", "ratio_thr", "encoder_sel", "min_bitrate", "max_bitrate",
-                 "keyint", "codec_preset", "target_width")
-
-    def __init__(self, cfg):
-        cfg = cfg if isinstance(cfg, dict) else {}
-        host_cfg = cfg.get("host") if isinstance(cfg.get("host"), dict) else {}
-        perf_cfg = host_cfg.get("perf") if isinstance(host_cfg.get("perf"), dict) else {}
-        codec_cfg = host_cfg.get("codec") if isinstance(host_cfg.get("codec"), dict) else {}
-        self.base_fps = _safe_int(host_cfg.get("fps", 30), 30, 1, 240)
-        self.base_quality = _safe_int(host_cfg.get("jpeg_quality", 80), 80, 1, 100)
-        self.base_scale = _safe_float(host_cfg.get("scale", 1.0), 1.0, 0.05, 4.0)
-        self.quality_min = _safe_int(perf_cfg.get("quality_min", 40), 40, 1, 100)
-        self.scale_min = _safe_float(perf_cfg.get("scale_min", 0.25), 0.25, 0.05, 1.0)
-        self.fps_min = _safe_int(perf_cfg.get("fps_min", 10), 10, 1, 240)
-        # 静止检测（perf.still，全部可配；默认关闭——开启后小的锐利局部变化
-        # 会被整屏面积比判据误判为静止，帧率被压到 probe_fps）
-        still_cfg = perf_cfg.get("still") if isinstance(perf_cfg.get("still"), dict) else {}
-        self.still_enabled = bool(still_cfg.get("enabled", False))
-        self.still_probe_interval = 1.0 / _safe_int(
-            still_cfg.get("probe_fps", 5), 5, 1, 240)
-        still_frames = _safe_int(still_cfg.get("still_frames", 3), 3, 1, 3600)
-        self.point_thr = _safe_int(still_cfg.get("point_thr", 10), 10, 0, 255)
-        self.ratio_thr = _safe_float(still_cfg.get("ratio_thr", 0.005), 0.005, 0.0, 1.0)
-        # 连续无变化满该时长才判定静止（默认 3 次探测 × 0.2s = 0.6s，仅连续累计，
-        # 间歇内容不会因零星停顿跨帧累计误入静止）；单位**秒**（第 87 条）
-        self.still_quiet_s = still_frames * self.still_probe_interval
-        self.encoder_sel = codec_cfg.get("encoder", "auto")
-        # 注：原 run_server 里的 base_bitrate 局部量自始未被使用（死代码），
-        # 目标码率由 HostRuntime.__init__ 写入 runtime.target_bitrate，故不再保留。
-        self.min_bitrate = _safe_int(codec_cfg.get("min_bitrate_kbps", 400), 400, 64) * 1000
-        self.max_bitrate = _safe_int(codec_cfg.get("max_bitrate_kbps", 6000), 6000, 64) * 1000
-        if self.max_bitrate < self.min_bitrate:
-            self.min_bitrate, self.max_bitrate = self.max_bitrate, self.min_bitrate
-        self.keyint = _safe_int(codec_cfg.get("keyint", 60), 60, 1, 3600)
-        self.codec_preset = codec_cfg.get("preset", "") or ""
-        self.target_width = _safe_int(codec_cfg.get("target_width", 854) or 0, 854, 0)
+    fails = 0
+    while servers and not runtime.stop_event.is_set():
+        try:
+            ready, _w, _x = select.select(list(servers), [], [], 0.2)
+        except (OSError, ValueError) as e:
+            alive = []
+            for srv in servers:
+                try:
+                    if srv.fileno() >= 0:
+                        alive.append(srv)
+                except Exception:
+                    pass
+            if len(alive) == len(servers):
+                # 全部仍"看起来"有效却 select 失败：按瞬时错误退避重试
+                fails += 1
+                if fails == 1 or fails % 20 == 0:
+                    log.warning("accept 失败（已连续 %d 次，50ms 后重试）: %s", fails, e)
+                time.sleep(0.05)
+                continue
+            servers = alive
+            continue
+        if not ready:
+            continue
+        fails = 0
+        for srv in ready:
+            try:
+                sock, addr = srv.accept()
+            except OSError as e:
+                try:
+                    closed = srv.fileno() < 0
+                except Exception:
+                    closed = False
+                if runtime.stop_event.is_set() or closed:
+                    servers = [s for s in servers if s is not srv]
+                    continue
+                fails += 1
+                if fails == 1 or fails % 20 == 0:
+                    log.warning("accept 失败（已连续 %d 次，50ms 后重试）: %s", fails, e)
+                time.sleep(0.05)
+                continue
+            _admit_client(sock, addr, runtime, spawn)
 
 
 def _listen_target(cfg):
@@ -1801,13 +1965,141 @@ def _listen_target(cfg):
     IPv4/IPv6（frp 本地回连在 SYSTEM 上下文优先走 ::1，必须双栈，否则公网链路握手即断）；
     指定具体地址（如 127.0.0.1）→ 只绑该地址、该地址族，真正把共享限制在本机。
     手改成数字/对象时按全网卡处理而不是抛 TypeError（第 100 条口径：坏配置只回退）。
+
+    A0（2026-09-11）：具体回环地址（127.0.0.1 / localhost / ::1）不再只绑单一地址族——
+    frpc 的本地目标常写 `localhost`，Windows 解析优先 `::1`，只绑 IPv4 回环会让隧道永远
+    连不上本机（公网观众端"画面无法传递"且两端无日志）。见 `_is_loopback_alias`。
     """
     host_cfg = cfg.get("host") if isinstance(cfg, dict) and isinstance(cfg.get("host"), dict) else {}
     listen_host = host_cfg.get("listen_host")
     if not isinstance(listen_host, str):
         listen_host = ""
-    port = _safe_int(host_cfg.get("port", 5700), 5700, 1, 65535)
+    port = safe_int(host_cfg.get("port", 5700), 5700, 1, 65535)
     return listen_host, port, listen_host in ("", "0.0.0.0", "::")
+
+
+#: A0：回环别名——这些值都表示"只允许本机（与 frp 隧道）接入"，但必须**双栈**监听，
+#: 否则会漏掉 frpc 的 `::1` 回连（Windows 上 localhost 优先解析为 ::1）。
+_LOOPBACK_ALIASES = ("127.0.0.1", "localhost", "::1")
+
+
+def _is_loopback_alias(listen_host):
+    """listen_host 是否是"具体回环地址"（需要 IPv4 + IPv6 回环双监听）。"""
+    return isinstance(listen_host, str) and listen_host.strip().lower() in _LOOPBACK_ALIASES
+
+
+def _has_frp_tunnel(cfg):
+    """配置里是否声明了实际可用的樱花隧道（有 token 或 tunnel_ids）。
+
+    A0：仅用于启动自检与文档口径提示——"监听回环 + 配了隧道"这一组合下，隧道本地
+    地址若为 `localhost` 就会走 `::1`，必须有 IPv6 回环监听才可达。
+    """
+    if not isinstance(cfg, dict):
+        return False
+    frp = (cfg.get("host") or {}).get("frp") if isinstance(cfg.get("host"), dict) else None
+    if not isinstance(frp, dict):
+        return False
+    if str(frp.get("token") or "").strip():
+        return True
+    tids = frp.get("tunnel_ids")
+    if isinstance(tids, str):
+        return bool(tids.strip())
+    if isinstance(tids, (list, tuple)):
+        return any(str(t).strip() for t in tids)
+    return bool(str(frp.get("public_addr") or "").strip())
+
+
+def _frp_public_target(runtime):
+    """从配置取 (host, port) 形式的公网隧道地址；不可用时返回 None（C14/A0 自检用）。"""
+    try:
+        host_cfg = runtime.cfg.get("host") if isinstance(runtime.cfg, dict) else None
+        host_cfg = host_cfg if isinstance(host_cfg, dict) else {}
+        frp = host_cfg.get("frp") if isinstance(host_cfg.get("frp"), dict) else {}
+        raw = str(frp.get("public_addr") or "").strip()
+        if not raw:
+            return None
+        return _split_public_addr(raw)
+    except Exception:
+        return None
+
+
+def _split_public_addr(raw):
+    """把 "域名:端口" / "[v6]:端口" 解析成 (host, port)；解析不出返回 None。"""
+    raw = raw.strip()
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end < 0:
+            return None
+        host, rest = raw[1:end], raw[end + 1:]
+        if not rest.startswith(":"):
+            return None
+        port_s = rest[1:]
+    elif raw.count(":") == 1:
+        host, port_s = raw.split(":", 1)
+    else:
+        return None
+    host = host.strip()
+    try:
+        port = int(port_s.strip())
+    except (TypeError, ValueError):
+        return None
+    if not host or not (0 < port < 65536):
+        return None
+    return host, port
+
+
+def _start_tunnel_selfcheck(runtime, port, delay=3.0):
+    """A0/C14：共享端启动后异步自检"公网隧道是否真的打得到本机"。
+
+    只回答"frpc 进程在不在"是不够的——本次故障（A0）里 frpc 明明"运行中"，隧道却因为
+    只监听 IPv4 回环而永远连不上本机，两端日志都没有线索。这里做一次真实回连：
+    connect(public_addr) → 发 `FS02` → 等 `OK02`；失败则把可操作的结论写进日志
+    （含"隧道本地地址请填 127.0.0.1"和 frpc 日志里的关键字），成功则记一条 INFO。
+
+    无隧道配置或 frpc 未在运行时直接跳过；整个过程在 daemon 线程里做，不阻塞启动。
+    """
+    target = _frp_public_target(runtime)
+    if target is None:
+        return
+    if not runtime.frp.is_running():
+        return
+
+    def _probe():
+        host, pub_port = target
+        try:
+            runtime.stop_event.wait(delay)
+            if runtime.stop_event.is_set():
+                return
+            sock = socket.create_connection((host, pub_port), timeout=8)
+        except Exception as e:
+            log.warning("公网隧道自检失败：无法连接 %s:%s（%s）——请确认 frpc 已在运行、"
+                        "隧道已启用；若连接被拒绝，检查樱花控制台里隧道的本地地址/端口", host, pub_port, e)
+            return
+        try:
+            sock.settimeout(8)
+            sock.sendall(MAGIC_CLIENT)
+            try:
+                got = sock.recv(4)
+            except OSError as e:
+                got = b""
+                log.warning("公网隧道自检失败：TCP 已连通 %s:%s 但未收到握手（%s）。"
+                            "最常见原因是隧道本地地址/端口没指向共享端监听端口——樱花 frpc 日志会写"
+                            "「连接映射目标 [tcp://localhost:%d] 失败，连接被拒绝」。"
+                            "请把隧道本地地址显式写成 127.0.0.1，或确认共享端正在监听该端口。",
+                            host, pub_port, e, port)
+                return
+            if got == MAGIC_SERVER:
+                log.info("公网隧道自检通过：%s:%s 回连本机并完成握手", host, pub_port)
+            else:
+                log.warning("公网隧道自检异常：%s:%s 返回 %r（期望 %r）——"
+                            "该地址可能指向了别的服务", host, pub_port, got, MAGIC_SERVER)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=_probe, daemon=True, name="frp-selfcheck").start()
 
 
 def _log_security_notice(runtime):
@@ -1816,15 +2108,34 @@ def _log_security_notice(runtime):
     第 131 条：这些是"默认安全"之外的选择，用户有权这样配，但必须能从日志里一眼
     看到自己把屏幕暴露给了谁——而不是靠猜。默认组合（127.0.0.1 + 准入开启）不产生
     任何告警噪音。
+
+    A0（2026-09-11）：默认形态（回环 + 樱花 frp）现在**真的**可达——回环别名会同时
+    监听 `[::1]` 与 `127.0.0.1`，所以文案不再把"设计上可达"当成"已经可达"，并显式
+    写出隧道侧要满足的条件；IPv6 回环绑定失败时才发风险告警（D3）。
     """
     host_cfg = runtime.cfg.get("host") if isinstance(runtime.cfg, dict) else None
     host_cfg = host_cfg if isinstance(host_cfg, dict) else {}
-    _listen_host, port, bind_all = _listen_target(runtime.cfg)
+    listen_host, port, bind_all = _listen_target(runtime.cfg)
     auth_cfg = host_cfg.get("auth") if isinstance(host_cfg.get("auth"), dict) else {}
     auth_on = bool(auth_cfg.get("enabled", False))
     if not bind_all:
-        log.info("监听 %s:%d（仅本机与 frp 隧道可达，%s）",
-                 runtime.bound_addr, port, "需登录" if auth_on else "未开启账户准入")
+        dual = bool(getattr(runtime, "listen_dual_loopback", False))
+        if _is_loopback_alias(listen_host) and dual:
+            log.info("监听 %s:%d（仅本机与 frp 隧道可达；已同时监听 [::1] 与 127.0.0.1，"
+                     "兼容 frpc 以 localhost 回连，%s）",
+                     runtime.bound_addr, port, "需登录" if auth_on else "未开启账户准入")
+        else:
+            log.info("监听 %s:%d（仅本机与 frp 隧道可达，%s）",
+                     runtime.bound_addr, port, "需登录" if auth_on else "未开启账户准入")
+        if _is_loopback_alias(listen_host) and _has_frp_tunnel(runtime.cfg) and not dual:
+            # A0 兜底自检：只绑了单地址族回环，而 frpc 很可能走 localhost → ::1
+            log.warning(
+                "已配置 frp 隧道，但本机只监听了 %s:%d（未覆盖 IPv6 回环 [::1]）："
+                "樱花 frpc 的本地地址若为 localhost，Windows 会优先解析为 ::1，隧道将连不上"
+                "本机（公网观众端表现为「连接提前关闭」且本端零日志）。请把樱花隧道的本地地址"
+                "改成 127.0.0.1，或把 host.listen_host 设为 0.0.0.0 后重启共享端"
+                "（0.0.0.0 会以双栈监听，同时覆盖两种地址族）。",
+                runtime.bound_addr, port)
         return
     if not auth_on:
         log.warning(
@@ -1841,59 +2152,103 @@ def _log_security_notice(runtime):
         log.info("监听 0.0.0.0:%d（账户准入开启，注册策略 %s）", port, policy)
 
 
+def _listen_backlog(runtime):
+    """监听队列长度：按 max_clients 量级取（C7）。
+
+    原实现固定 `listen(5)`，而 `host.net.max_clients` 默认 32（含握手中）——多人同时
+    进入时内核 accept 队列只有 5，多余连接可能被直接拒绝（对端表现为连接重置）。
+    """
+    try:
+        max_clients = safe_int(getattr(runtime, "max_clients", 32), 32, 1, 4096)
+    except Exception:
+        max_clients = 32
+    return max(16, min(128, max_clients * 2))
+
+
+def _make_listener(family, addr, backlog, dual_v6only=None):
+    """建一个监听 socket（绑定失败抛 OSError，由调用方决定回退/报错）。"""
+    server = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if dual_v6only is not None:
+            try:
+                server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, dual_v6only)
+            except OSError:
+                pass
+        _apply_listen_reuse_opt(server)
+        server.bind(addr)
+        server.listen(backlog)
+    except OSError:
+        try:
+            server.close()
+        except OSError:
+            pass
+        raise
+    return server
+
+
 def bind_listener(runtime):
     """建监听 socket 并登记到 runtime；失败时写 startup_error 并返回 None。
 
     第 18 条：绑定失败（端口被占/权限不足/第二个实例撞 SO_EXCLUSIVEADDRUSE）时
     不再让线程静默消失——记一条致命错误并置 startup_error 供 GUI 显示，随后干净返回。
+
+    返回值：监听 socket 列表（成功）或 None（失败）。`runtime._server` 仍指向第一个
+    （主）socket，兼容既有调用方与测试的 `_server.getsockname()`。
+
+    A0（2026-09-11）：`listen_host` 为具体回环地址（127.0.0.1/localhost/::1）时同时监听
+    `127.0.0.1:port` 与 `[::1]:port`。两者都只绑回环，**不降低安全性**，但覆盖了 frpc
+    以 `localhost`（Windows 优先 ::1）回连的情形——否则公网隧道永远连不上本机。
     """
     listen_host, port, bind_all = _listen_target(runtime.cfg)
     bound_addr = "0.0.0.0" if bind_all else listen_host   # 诚实日志用（第 19 条）
-    server = None
+    backlog = _listen_backlog(runtime)
+    servers = []
+    loopback_dual = False
     try:
         if bind_all:
             try:
-                server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-                try:
-                    server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-                except OSError:
-                    pass
-                _apply_listen_reuse_opt(server)
-                server.bind(("::", port))
-                server.listen(5)
+                servers = [_make_listener(socket.AF_INET6, ("::", port), backlog, dual_v6only=0)]
             except OSError:
                 # IPv6 不可用（系统禁用 IPv6）时的回退：仅 IPv4 全网卡
-                try:
-                    if server is not None:
-                        server.close()
-                except OSError:
-                    pass
-                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                _apply_listen_reuse_opt(server)
-                server.bind(("0.0.0.0", port))
-                server.listen(5)
+                servers = [_make_listener(socket.AF_INET, ("0.0.0.0", port), backlog)]
+        elif _is_loopback_alias(listen_host):
+            # A0 正解：回环双栈。先绑 IPv4（主 socket，保持 bound_addr/getsockname 语义），
+            # 再尽力绑 IPv6 [::1]；IPv6 不可用时只保留 IPv4 并留下告警（自检在
+            # _log_security_notice 里发出）。
+            primary = _make_listener(socket.AF_INET, ("127.0.0.1", port), backlog)
+            servers = [primary]
+            try:
+                servers.append(_make_listener(
+                    socket.AF_INET6, ("::1", port), backlog, dual_v6only=1))
+                loopback_dual = True
+            except OSError as e:
+                log.warning("IPv6 回环 [::1]:%d 监听失败（%s）；"
+                            "frpc 若以 localhost 回连将连不上本机", port, e)
+            # bound_addr 保持基础地址：GUI/日志以它为准，双栈信息写在 _log_security_notice
+            bound_addr = "127.0.0.1"
         else:
             # 指定地址：按地址族绑定（含 ':' 视为 IPv6），绝不偷偷扩成全网卡
             family = socket.AF_INET6 if ":" in listen_host else socket.AF_INET
-            server = socket.socket(family, socket.SOCK_STREAM)
-            _apply_listen_reuse_opt(server)
-            server.bind((listen_host, port))
-            server.listen(5)
+            servers = [_make_listener(family, (listen_host, port), backlog)]
     except OSError as e:
-        try:
-            if server is not None:
-                server.close()
-        except OSError:
-            pass
+        for s in servers:
+            try:
+                s.close()
+            except OSError:
+                pass
         runtime._server = None
+        runtime._servers = []
+        runtime.listen_dual_loopback = False
         runtime.startup_error = (
             "无法监听 %s:%d（%s）；端口可能已被占用或权限不足。" % (bound_addr, port, e))
         log.error("服务启动失败：%s", runtime.startup_error)
         return None
-    runtime._server = server
+    runtime._server = servers[0]
+    runtime._servers = servers
+    runtime.listen_dual_loopback = loopback_dual
     runtime.startup_error = None
     runtime.bound_addr = bound_addr
-    return server
+    return servers
 
 
 def run_server(runtime):
@@ -1903,25 +2258,22 @@ def run_server(runtime):
     （_capture_loop/_encode_loop/_send_loop/_perf_loop），本函数只做编排：
     参数构造 → 绑定 → 起线程 → 等待停止 → 收尾。
 
-    流水线（每级只保留“最新一帧”，天然丢弃中间帧，采集与发送解耦）：
-      采集线程：按目标帧率把原始帧写入 raw 槽（编码不在采集线程，避免编码耗时
-                拖慢采集节奏；连续采集失败自动重建采集后端实现故障恢复）
-      编码线程：消费 raw 槽最新帧 -> H.264（NVENC/x264）或 JPEG 回退 -> 写共享槽
-      发送线程：消费共享槽最新帧 -> 广播到各客户端独立发送队列
-      性能线程：每秒输出统计 -> 自适应降级（码率/质量 -> 缩放 -> 帧率）
+    A0（2026-09-11）：`bind_listener` 现返回监听 socket **列表**（回环双栈时为两个），
+    接受循环对全部监听 socket 一起 select，收尾时全部关闭。
     """
-    p = PipelineParams(runtime.cfg)
-    server = bind_listener(runtime)
-    if server is None:
+    p = pipeline.PipelineParams(runtime.cfg)
+    servers = bind_listener(runtime)
+    if not servers:
         return
     _listen_host, port, _bind_all = _listen_target(runtime.cfg)
     log.info("服务已启动，监听 %s:%d（fps=%d 质量=%d，退出按钮/Ctrl+C 退出）",
              runtime.bound_addr, port, p.base_fps, p.base_quality)
     _log_security_notice(runtime)
+    _start_tunnel_selfcheck(runtime, port)
 
     # 第 102 条：接受循环在模块级（_accept_loop），瞬时 OSError 只重试不退出。
     # 采集、编码、发送与性能节拍线程均为 daemon，随 stop_event 置位后退出。
-    threads = [threading.Thread(target=_accept_loop, args=(server, runtime), daemon=True)]
+    threads = [threading.Thread(target=_accept_loop, args=(servers, runtime), daemon=True)]
     for target, args in ((_capture_loop, (runtime, p)),
                          (_encode_loop, (runtime, p)),
                          (_send_loop, (runtime,)),
@@ -1937,7 +2289,11 @@ def run_server(runtime):
     except KeyboardInterrupt:
         runtime.stop_event.set()
     finally:
-        server.close()
+        for s in servers:
+            try:
+                s.close()
+            except OSError:
+                pass
         # 第 66 条：5 个线程已被 stop_event 并发置位、同时收尾，改用共享 deadline 而非
         # 各自 timeout=2 串行 join——否则理论最坏 8s 会超过 shutdown 给 _server_thread 的
         # 3s 预算，join 超时返回时 run_server 仍在收尾、_encode_loop 尾部的 encoder.close()
@@ -1996,7 +2352,7 @@ def _capture_loop(runtime, p):
                 backend = runtime.slot["backend"]
                 monitor = runtime.slot["monitor"]
                 region = runtime.slot["region"]
-                fps_now = _safe_int(runtime.slot.get("fps", p.base_fps),
+                fps_now = safe_int(runtime.slot.get("fps", p.base_fps),
                                     p.base_fps, 1, 240, warn=False)
             if not src.set_params(backend, monitor, region):
                 continue    # 参数重建失败：内部已计数并退避等待
@@ -2167,7 +2523,7 @@ def _encode_loop(runtime, p):
             raw_ts = runtime.slot.get("raw_ts", 0)
             scale = runtime.slot["scale"]
             quality = runtime.slot["quality"]
-            fps_now = _safe_int(runtime.slot.get("fps", p.base_fps),
+            fps_now = safe_int(runtime.slot.get("fps", p.base_fps),
                                 p.base_fps, 1, 240, warn=False)
         if raw is None or raw_ts == last_raw_ts:
             # 无新帧：若画面静止且有观看端请求关键帧（新观众接入/花屏恢复），
@@ -2186,7 +2542,6 @@ def _encode_loop(runtime, p):
             runtime.force_key = False
         with runtime.codec_lock:
             target_b = runtime.target_bitrate   # ABR 可能已更新
-        now = time.perf_counter()
         ef = fe.encode(raw, raw_ts, force_key=force_key, scale=scale, quality=quality,
                        fps=fps_now, bitrate=target_b)
         if ef is None:
@@ -2201,6 +2556,10 @@ def _encode_loop(runtime, p):
         last_frame = ef.frame  # 缓存缩放后帧：静止期强制关键帧恢复用
         _store_encoded(runtime, ef, raw_ts)
         last_raw_ts = raw_ts
+        # C11（2026-09-11）：取**编码完成**后的时刻入窗。原实现在编码开始前取 now 再
+        # 追加进"编码完成时刻"窗口 → encode_fps 反映的是编码启动频率而非完成频率
+        # （高速编码器下差异小，但语义与注释不符）。
+        now = time.perf_counter()
         enc_window.append(now)
         with runtime.stats_lock:
             if ef.is_video:
@@ -2223,6 +2582,7 @@ def _send_loop(runtime):
     # 1 秒滑动窗口：元素为 (完成时刻, 发送耗时毫秒)
     send_window = []
     while not runtime.stop_event.is_set():
+        delivered = 0   # B9：本帧实际投递的订阅者数（route_frame 抛异常时保持 0）
         with runtime.slot_lock:
             video = runtime.slot["video"]
             video_ts = runtime.slot["video_ts"]
@@ -2233,7 +2593,7 @@ def _send_loop(runtime):
         if video is not None and video_ts != last_sent_video_ts:
             send_start = time.perf_counter()
             try:
-                route_frame(
+                delivered = route_frame(
                     runtime, "local",
                     pack_video(video, video_ts, is_key, codec=video_codec),
                     is_key=is_key, send_timeout=2.0)
@@ -2243,8 +2603,8 @@ def _send_loop(runtime):
         elif jpeg is not None and ts != last_sent_jpeg_ts:
             send_start = time.perf_counter()
             try:
-                route_frame(runtime, "local", pack_frame(jpeg, ts),
-                            is_jpeg=True, send_timeout=2.0)
+                delivered = route_frame(runtime, "local", pack_frame(jpeg, ts),
+                                        is_jpeg=True, send_timeout=2.0)
                 last_sent_jpeg_ts = ts  # 仅发送成功后才视为已发送
             except Exception as e:
                 log.warning("广播错误: %s", e)
@@ -2254,13 +2614,26 @@ def _send_loop(runtime):
             runtime.enc_evt.wait(0.05)
             runtime.enc_evt.clear()
             continue
+        # B9（2026-09-11）：本帧没有投递给任何订阅者（零观众/全部在等关键帧）时不登记
+        # 发送统计——旧实现统计的是"发送线程处理了多少帧"，与 route_frame 是否真的
+        # 投递无关。零观众时 send_fps≈27、avg_send_ms≈0 恰好满足 _abr_recover 的
+        # send_fps>=5 门槛，于是无人观看的 11 秒里码率被 2500→5492 Kbps，并反复强制
+        # IDR（实测 3 个 76–99 KB 白编码关键帧），首个观众从 5.5 Mbps 起跳。
+        if not delivered:
+            with runtime.stats_lock:
+                runtime.stats["send_fps"] = 0.0
+                runtime.stats["avg_send_ms"] = 0.0
+            continue
         send_ms = (time.perf_counter() - send_start) * 1000.0
         now = time.perf_counter()
         send_window.append((now, send_ms))
         while send_window and now - send_window[0][0] > 1.0:
             send_window.pop(0)
         if len(send_window) >= 2:
-            send_fps = (len(send_window) - 1) / (send_window[-1][0] - send_window[0][0])
+            span = send_window[-1][0] - send_window[0][0]
+            # C11：两个样本时刻理论上可能相同（同一 perf_counter 刻度）→ ZeroDivisionError
+            # 被 _perf_loop 兜住，但整拍统计会丢失。加分母保护。
+            send_fps = (len(send_window) - 1) / span if span > 0 else float(len(send_window))
         elif send_window:
             send_fps = 1.0
         else:
@@ -2292,6 +2665,14 @@ def _set_encoder_bitrate(runtime, bps, cooldown=0.0):
         log.warning("ABR 码率调整失败: %s", e)
         return False
     if changed:
+        # B9：没有订阅者时不必强制 IDR——白编码一个 76–99 KB 的关键帧既浪费 CPU/带宽，
+        # 又抬高"最后一帧"的体积。码率本身照常设置，等观众到来后的正常关键帧即可。
+        if _subscriber_count(runtime, "local") == 0:
+            log.info("ABR 码率调整: %d Kbps（当前无订阅者，不强制关键帧）", bps // 1000)
+            with runtime.stats_lock:
+                runtime.stats["abr_changes"] += 1
+                runtime.stats["last_abr_at"] = time.monotonic()
+            return changed
         with runtime.slot_lock:
             runtime.force_key = True
         _wake_raw(runtime)
@@ -2317,29 +2698,34 @@ def _perf_log_and_bandwidth(runtime, stats):
     recent_drop = False
     egress_bps = 0.0
     now_mono = time.monotonic()
+    # B9：订阅本机源的客户端数（独立短锁，不与客户端快照锁嵌套）
+    stats["subscribers"] = _subscriber_count(runtime, "local")
     with runtime.clients_lock:
-        for info in runtime.clients.values():
-            ms = info.recent_send_ms(now_mono)
-            if ms > 0:
-                client_send_ms.append(ms)
-            if info.has_recent_drop(now_mono):
-                recent_drop = True
-        bw_lines = []
-        for info in runtime.clients.values():
-            rate = info.rate_kbps(now_mono)   # 最近 1 秒实测速率（KB/s，日志用）
-            # ABR 用 3 秒窗口取平均：跨过一个 GOP，避开关键帧突发造成的 10 倍跳变
-            egress_bps += info.rate_kbps(now_mono, window=_ABR_EGRESS_WINDOW_S) * 8192.0
-            lock = getattr(info, "_lock", None)
-            if lock is not None:
-                with lock:
-                    total_mb = info.bytes_sent / (1024.0 * 1024.0)
-            else:
-                total_mb = getattr(info, "bytes_sent", 0) / (1024.0 * 1024.0)
-            bw_lines.append(
-                "%s%s %.0f KB/s %.1f MB（丢 %d 帧）" % (
-                    info.addr,
-                    ("(%s)" % info.username) if info.username else "",
-                    rate, total_mb, info.dropped_frames))
+        infos = list(runtime.clients.values())
+    # 阶段 A2（优化方案 2026-09-17）：出锁逐个统计——旧实现在 clients_lock 内对每个
+    # 客户端调用 recent_send_ms/rate_kbps/加 _lock，连接入册/注销要排在这些计算后面。
+    for info in infos:
+        ms = info.recent_send_ms(now_mono)
+        if ms > 0:
+            client_send_ms.append(ms)
+        if info.has_recent_drop(now_mono):
+            recent_drop = True
+    bw_lines = []
+    for info in infos:
+        rate = info.rate_kbps(now_mono)   # 最近 1 秒实测速率（KB/s，日志用）
+        # ABR 用 3 秒窗口取平均：跨过一个 GOP，避开关键帧突发造成的 10 倍跳变
+        egress_bps += info.rate_kbps(now_mono, window=_ABR_EGRESS_WINDOW_S) * 8192.0
+        lock = getattr(info, "_lock", None)
+        if lock is not None:
+            with lock:
+                total_mb = info.bytes_sent / (1024.0 * 1024.0)
+        else:
+            total_mb = getattr(info, "bytes_sent", 0) / (1024.0 * 1024.0)
+        bw_lines.append(
+            "%s%s %.0f KB/s %.1f MB（丢 %d 帧）" % (
+                info.addr,
+                ("(%s)" % info.username) if info.username else "",
+                rate, total_mb, info.dropped_frames))
     client_avg_ms = (sum(client_send_ms) / len(client_send_ms)) if client_send_ms else 0.0
     effective_send_ms = max(stats["avg_send_ms"], client_avg_ms)
     stats["egress_bps"] = int(egress_bps)
@@ -2458,14 +2844,22 @@ def _perf_tick(runtime, p):
     with runtime.slot_lock:
         stats["quality"] = runtime.slot["quality"]
         stats["scale"] = runtime.slot["scale"]
-        stats["fps_now"] = _safe_int(runtime.slot.get("fps", p.base_fps),
+        stats["fps_now"] = safe_int(runtime.slot.get("fps", p.base_fps),
                                      p.base_fps, 1, 240, warn=False)
         stats["out_w"] = runtime.slot.get("out_w", 0)
         stats["out_h"] = runtime.slot.get("out_h", 0)
     budget_ms = 1000.0 / max(stats["fps_now"], 1) * 0.8
     effective_send_ms, recent_drop = _perf_log_and_bandwidth(runtime, stats)
     # 每次评估时从 runtime.cfg 读取开关，让 GUI 修改可以即时生效
-    if not bool(runtime.cfg["host"].get("perf", {}).get("adaptive", True)):
+    # B2（2026-09-11）：`perf` / `host` 必须先做 isinstance 兜底——手改成 `"perf": 1` 时
+    # `1.get("adaptive", ...)` 抛 AttributeError，被 _perf_loop 的 log.exception 兜住后
+    # 每秒写一条完整堆栈（5MB 滚动日志几分钟被刷满），而 _perf_tick 在读取开关处提前退出
+    # → ABR 降级/回升永久失效（界面仍正常输出"性能:"行，看起来只是"自适应没反应"）。
+    # 项目其它位置均已用 isinstance 防御，只有此处遗漏。
+    host_cfg = runtime.cfg.get("host") if isinstance(runtime.cfg, dict) else None
+    host_cfg = host_cfg if isinstance(host_cfg, dict) else {}
+    perf_cfg = host_cfg.get("perf") if isinstance(host_cfg.get("perf"), dict) else {}
+    if not bool(perf_cfg.get("adaptive", True)):
         return
     if stats["still"]:
         # 画面静止停发：发送耗时≈0 会让常规评估误入“回升”分支，反复重建编码器
@@ -2473,9 +2867,9 @@ def _perf_tick(runtime, p):
         return
     # 同步读取用户最新基准值（GUI 修改 fps/质量/缩放后，回升目标随之更新，
     # 避免自适应回升“对抗”用户手动设置）
-    base_fps = _safe_int(runtime.cfg["host"].get("fps", 30), 30, 1, 240, warn=False)
-    base_quality = _safe_int(runtime.cfg["host"].get("jpeg_quality", 80), 80, 1, 100, warn=False)
-    base_scale = _safe_float(runtime.cfg["host"].get("scale", 1.0), 1.0, 0.05, 4.0, warn=False)
+    base_fps = safe_int(host_cfg.get("fps", 30), 30, 1, 240, warn=False)
+    base_quality = safe_int(host_cfg.get("jpeg_quality", 80), 80, 1, 100, warn=False)
+    base_scale = safe_float(host_cfg.get("scale", 1.0), 1.0, 0.05, 4.0, warn=False)
     with runtime.slot_lock:
         # 最新帧时间戳：视频路径只更新 video_ts，JPEG 回退路径只更新 ts，二者同为
         # 采集时刻微秒（同一时钟基），取较新者即“最新一帧”的采集时刻。不能只在
@@ -2490,6 +2884,9 @@ def _perf_tick(runtime, p):
     if congested:
         _abr_degrade(runtime, p, stats, effective_send_ms, recent_drop)
     elif (stats["send_fps"] >= 5 and not recent_drop
+          # B9：没有订阅者时不回升——send_fps 已由 _send_loop 在"零投递"时归零，这里
+          # 再加一道订阅者计数，双保险（例如观看端全部切到了别的 peer 源）。
+          and stats.get("subscribers", 0) > 0
           and effective_send_ms < budget_ms * 0.5
           and (stats["fps_now"] < base_fps or stats["scale"] < base_scale
                or (stats["video_mode"] and stats["cur_bitrate"] < p.max_bitrate)

@@ -28,6 +28,13 @@ import tempfile
 import threading
 import time
 
+
+def _log_warning(fmt, *args):
+    """延迟导入 logger 记录告警：logger.py 反向依赖本模块（data_dir/exe_dir），
+    模块级 import 会成环（common→logger→半初始化的 common）。"""
+    import logger as logger_mod
+    logger_mod.get_logger().warning(fmt, *args)
+
 #: 客户端握手魔数（版本 2：kind 标记帧/控制消息；FS01 旧客户端握手将失败并给出明确告警）
 MAGIC_CLIENT = b"FS02"
 #: 服务端握手魔数
@@ -64,6 +71,14 @@ MAX_PAYLOAD = 32 * 1024 * 1024
 #: 配置结构版本：用于把 1.x 遗留配置一次性迁移到更安全的默认值（见 _upgrade_config）。
 #: 1 = 1.3.0 及更早（监听 0.0.0.0、准入默认关闭）；2 = 默认只监听本机 + 准入默认开启。
 CONFIG_VERSION = 2
+
+#: B10（2026-09-11）：认证窗口的默认值与**下界**（秒）。
+#: 观看端在发出凭据前的等待 = 等 Tk 就绪（最长 60s，viewer.C19）+ 登录框等待（120s）
+#: → 最坏 ≈180s，且该等待发生在**服务端 deadline 已经开始计时之后**。认证窗口若小于
+#: 这个值，用户还在输入 host 就已断开（第 31 条"输对了也登录失败"）。默认给 240s
+#: 留出余量；host 侧用 AUTH_TIMEOUT_MIN_S 做下界约束，迁移时也一并抬高。
+AUTH_TIMEOUT_DEFAULT_S = 240
+AUTH_TIMEOUT_MIN_S = 240
 
 #: 默认配置
 DEFAULT_CONFIG = {
@@ -136,9 +151,12 @@ DEFAULT_CONFIG = {
             #   "bootstrap" = 只有第一个账户可以自助注册，此后注册关闭
             #   "closed"    = 完全关闭自助注册，账户只能由共享端控制台添加
             "allow_register": "open",
-            # 认证阶段「总时限」（第 23 条防 slowloris）；须大于观看端登录框等待（120s），
-            # 否则用户还在输入 host 就先断开、明明输对却登录失败（第 31 条）。
-            "auth_timeout": 150
+            # 认证阶段「总时限」（第 23 条防 slowloris）；须大于观看端「等界面就绪（最长
+            # 60s）+ 登录框等待（120s）」的最坏合计 ≈180s（第 31 条：否则用户还在输入
+            # host 就先断开、明明输对却登录失败）。B10（2026-09-11）：默认值从 150 提到
+            # 240，并在 host 侧加下界约束 + 迁移时一并抬高——旧值只留 30s 余量，公网高
+            # 延迟/慢用户下同样会踩到。
+            "auth_timeout": AUTH_TIMEOUT_DEFAULT_S
         }
     },
     "viewer": {
@@ -230,17 +248,6 @@ def parse_video(payload):
         raise ValueError("视频帧 payload 不足 10 字节")
     (ts,) = struct.unpack(">Q", payload[:8])
     return ts, payload[8], payload[9], payload[10:]
-
-
-def unpack_frame(data):
-    """从帧 payload 中解包出 (时间戳微秒, JPEG 字节) 元组；数据不完整或损坏时抛出 ValueError。
-
-    注意：v2 使用包类型标记后不再需要手工解帧头，这里保留用于解析帧 payload（较 verify 脚本使用）。
-    """
-    if len(data) < 8:
-        raise ValueError("帧 payload 不足 8 字节，无法解析时间戳")
-    (ts,) = struct.unpack(">Q", data[:8])
-    return ts, data[8:]
 
 
 def pack_msg(obj):
@@ -398,6 +405,71 @@ def parse_addr(addr_str, default_port=5700):
             raise ValueError("端口超出范围 1~65535: %d" % port)
         return host, port
     return addr_str, default_port
+
+
+def safe_int(value, default, lo=None, hi=None, warn=True):
+    """把配置值安全转为 int：非法（字符串/None/布尔/超出范围）时回退 default。
+
+    第 100 条：`config.json` 手改成 `"fps": "60"` 时，`slot["fps"]` 是 str，采集线程
+    的 `fps_now > 0` 会抛 TypeError 并把线程直接打死（服务仍在 accept、观看端能收
+    pong，但一帧都没有）。所有来自配置的数值都经此转换。
+
+    warn=False 用于每秒/每帧执行的热路径（避免同一条告警刷满日志）。
+    """
+    if isinstance(value, bool):
+        value = int(value)
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        if warn:
+            _log_warning("配置值 %r 不是整数，回退默认值 %r", value, default)
+        out = int(default)
+    if lo is not None and out < lo:
+        out = int(lo)
+    if hi is not None and out > hi:
+        out = int(hi)
+    return out
+
+
+def safe_float(value, default, lo=None, hi=None, warn=True):
+    """把配置值安全转为 float：非法时回退 default，并按需夹到 [lo, hi]。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        if warn:
+            _log_warning("配置值 %r 不是数字，回退默认值 %r", value, default)
+        out = float(default)
+    if lo is not None and out < lo:
+        out = float(lo)
+    if hi is not None and out > hi:
+        out = float(hi)
+    return out
+
+
+def normalize_region(region):
+    """校验并规范化采集区域；非法（缺键/非数字/宽高非正）时返回 None（全屏）。
+
+    第 100 条：旧实现把配置里的 region 原样透传，缺键时 screen.CaptureManager.grab
+    每次 KeyError 被吞成 None（画面永久冻结、无任何提示），host_ui._region_text 也会
+    KeyError 让整个图形控制台起不来。
+    """
+    if region is None:
+        return None
+    if not isinstance(region, dict):
+        _log_warning("采集区域配置不是对象（%r），按全屏处理", region)
+        return None
+    try:
+        left = int(region["left"])
+        top = int(region["top"])
+        width = int(region["width"])
+        height = int(region["height"])
+    except (KeyError, TypeError, ValueError):
+        _log_warning("采集区域配置缺少 left/top/width/height 或非整数（%r），按全屏处理", region)
+        return None
+    if left < 0 or top < 0 or width <= 0 or height <= 0:
+        _log_warning("采集区域取值非法（%r），按全屏处理", region)
+        return None
+    return {"left": left, "top": top, "width": width, "height": height}
 
 
 def enable_dpi_awareness():
@@ -606,26 +678,56 @@ def _upgrade_config(raw):
     except (TypeError, ValueError):
         version = 1
     if version >= CONFIG_VERSION:
+        # C12（2026-09-11）：结构版本已是最新时没有迁移动作，但这里仍返回 []。
+        # 版本号缺失/落后的情况由上面的分支写回（见下方 raw["config_version"]）。
         return []
     changes = []
     host = raw.get("host")
     if isinstance(host, dict):
         if host.get("listen_host") in ("", "0.0.0.0", "::"):
             host["listen_host"] = DEFAULT_CONFIG["host"]["listen_host"]
-            changes.append("监听地址 0.0.0.0 → %s（只允许本机与 frp 隧道接入）"
+            changes.append("监听地址 0.0.0.0 → %s（只允许本机与 frp 隧道接入；"
+                           "同时监听 127.0.0.1 与 [::1]，frpc 以 localhost 回连亦可达）"
                            % DEFAULT_CONFIG["host"]["listen_host"])
+        elif isinstance(host.get("listen_host"), str) and \
+                host["listen_host"].strip().lower() in ("127.0.0.1", "localhost", "::1"):
+            # A0（2026-09-11）：已是回环地址的配置无需改动（host 侧会做回环双栈监听），
+            # 但若配了 frp 隧道则记一条说明，避免用户仍按旧文档以为"隧道必失效"。
+            frp = host.get("frp")
+            if isinstance(frp, dict) and (str(frp.get("token") or "").strip()
+                                          or str(frp.get("tunnel_ids") or "").strip()):
+                changes.append("监听地址为回环（%s），已启用 IPv4+IPv6 双栈回环监听以兼容 "
+                               "frpc 的 localhost 回连" % host["listen_host"])
         auth = host.get("auth")
         if isinstance(auth, dict) and not auth.get("enabled", False):
             auth["enabled"] = True
             changes.append("账户准入 关闭 → 开启（观看端需注册/登录）")
+            # B10（2026-09-11）：迁移的目标是"更安全"，不能顺手把可用性弄坏——准入一开，
+            # 认证窗口就必须覆盖观看端"等界面就绪 + 等用户输凭据"的最坏耗时，否则会重新
+            # 引入第 31 条「输对了也登录失败」（随包 config.json 一度写的就是 60 秒）。
+            try:
+                current = float(auth.get("auth_timeout", AUTH_TIMEOUT_DEFAULT_S))
+            except (TypeError, ValueError):
+                current = 0.0
+            if current < AUTH_TIMEOUT_MIN_S:
+                auth["auth_timeout"] = AUTH_TIMEOUT_DEFAULT_S
+                changes.append("认证窗口 %s → %d 秒（覆盖观看端最坏等待 ≈180 秒）"
+                               % (("%g" % current) if current else "非法值",
+                                  AUTH_TIMEOUT_DEFAULT_S))
     if not changes:
+        # C12：即便本次没有实际改动，也要补写结构版本号，避免每次启动都重跑升级判定
+        if version < CONFIG_VERSION:
+            raw["config_version"] = CONFIG_VERSION
         return []
     raw["config_version"] = CONFIG_VERSION
     return changes
 
 
-def _persist_upgrade(path, raw, changes):
-    """把升级后的配置写回磁盘并记录改动清单；写失败只告警（下次启动会再试一次）。"""
+def _persist_upgrade(path, raw, changes, silent=False):
+    """把升级后的配置写回磁盘并记录改动清单；写失败只告警（下次启动会再试一次）。
+
+    silent=True（C12：只补写缺失的结构版本号、无实际迁移动作）时不打印"配置已升级"。
+    """
     try:
         with _config_lock:
             tmp = path + ".tmp"
@@ -641,10 +743,11 @@ def _persist_upgrade(path, raw, changes):
         return
     try:
         import logger
-        logger.get_logger().warning(
-            "配置已升级到 v%d（更安全的默认值）：%s。需要局域网直连或匿名观看时，"
-            "请在共享端控制台的「传输参数」里改回并重新应用。",
-            CONFIG_VERSION, "；".join(changes))
+        if not silent:
+            logger.get_logger().warning(
+                "配置已升级到 v%d（更安全的默认值）：%s。需要局域网直连或匿名观看时，"
+                "请在共享端控制台的「传输参数」里改回并重新应用。",
+                CONFIG_VERSION, "；".join(changes))
     except Exception:
         pass
 
@@ -676,10 +779,16 @@ def load_config():
             cfg = json.load(f)
         if not isinstance(cfg, dict):
             raise ValueError("config.json 顶层不是对象（实际 %s）" % type(cfg).__name__)
+        before_version = cfg.get("config_version")
         changes = _upgrade_config(cfg)
         merged = _deep_merge(DEFAULT_CONFIG, cfg)
         if changes:
             _persist_upgrade(path, cfg, changes)
+        elif (cfg.get("config_version") == CONFIG_VERSION
+              and before_version != CONFIG_VERSION):
+            # C12：只是补写缺失的结构版本号（值本身已是安全默认），静默落盘，
+            # 避免每次启动都重跑升级判定。
+            _persist_upgrade(path, cfg, [], silent=True)
         return merged
     except Exception as e:
         _recover_corrupt_config(path, e)

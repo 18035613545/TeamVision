@@ -11,6 +11,7 @@
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import tempfile
 import time
@@ -35,6 +36,10 @@ _MAX_BYTES = 5 * 1024 * 1024
 _BACKUP_COUNT = 5
 #: 按日期保留的历史日志文件数（app_YYYYMMDD.log，超出部分在跨天时清理）
 _KEEP_DAYS = 5
+
+#: C3：日志文件名里的日期前缀（app_YYYYMMDD[_pidN][.N].log）。
+#: 用正则严格取日期，避免 app_debug.log 之类的非日期名被切片成假"日期键"而挤掉真日志。
+_LOG_DATE_RE = re.compile(r"^app_(\d{8})")
 
 #: 是否已完成 handler 初始化（幂等标志）
 _initialized = False
@@ -69,14 +74,22 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
 
         按日期分组（app_YYYYMMDD_pid*.log 及其备份属于同一日期组），只保留最新的
         KEEP_DAYS 天，其余整组删除——避免旧日期文件长期累积。兼容旧的无 PID 命名。
+
+        C3（2026-09-11）：日期键必须是**真正的 8 位日期**。原实现用 `name[4:12]` 直接
+        切片，目录里若存在 `app_debug.log` 这类非日期命名文件，其"日期"键 `"debug.lo"`
+        在字典序上大于任何 `"2026xxxx"`，于是被保留在 keep_keys 里，**某个真实日期组
+        反被挤出 5 日窗口删除**（日志丢失）。改用正则严格匹配，不匹配的文件不参与分组
+        （也就不会被删）。
         """
         try:
             files = [f for f in os.listdir(self._log_dir)
                      if f.startswith("app_") and ".log" in f]
             groups = {}  # YYYYMMDD -> [文件名列表]
             for name in files:
-                date = name[4:12]  # app_ 之后的 8 位日期
-                groups.setdefault(date, []).append(name)
+                m = _LOG_DATE_RE.match(name)
+                if not m:
+                    continue  # app_debug.log 之类的非日期文件：不分组、不清理
+                groups.setdefault(m.group(1), []).append(name)
             keep_keys = set(sorted(groups)[-_KEEP_DAYS:])
             for date, names in groups.items():
                 if date in keep_keys:

@@ -20,6 +20,8 @@ import threading
 import unittest
 from unittest import mock
 
+import numpy as np
+
 import viewer
 
 
@@ -103,8 +105,8 @@ class TestPanelRefreshPreviewGuard(unittest.TestCase):
         ch.name = "alice"
         ch.status = "receiving"
         ch.frame_serial = 5
-        ch.last_frame = mock.MagicMock()
-        ch.last_frame.copy.return_value = object()       # 任意「帧」对象，cvtColor 会被 patch 抛异常
+        # 真实小帧：阶段 A1 起先走 cv2.resize（真实实现），cvtColor 随后被 patch 抛异常。
+        ch.last_frame = np.zeros((4, 4, 3), np.uint8)
         app.channels = [ch]
         return app
 

@@ -137,19 +137,21 @@ class TestHandshakeTimeout(unittest.TestCase):
 # ------------------------------------------------- 3) 配置数值安全转换
 
 class TestSafeConfigValues(unittest.TestCase):
+    """C1（优化方案 2026-09-17）：三个工具已从 host 下沉 common，直接从 common 断言。"""
+
     def test_safe_int_rejects_garbage(self):
-        self.assertEqual(host._safe_int("60", 30), 60)      # 数字字符串可用
-        self.assertEqual(host._safe_int("abc", 30), 30)
-        self.assertEqual(host._safe_int(None, 30), 30)
-        self.assertEqual(host._safe_int([], 30), 30)
-        self.assertEqual(host._safe_int(-5, 30, lo=1), 1)
-        self.assertEqual(host._safe_int(9999, 30, hi=240), 240)
+        self.assertEqual(common.safe_int("60", 30), 60)      # 数字字符串可用
+        self.assertEqual(common.safe_int("abc", 30), 30)
+        self.assertEqual(common.safe_int(None, 30), 30)
+        self.assertEqual(common.safe_int([], 30), 30)
+        self.assertEqual(common.safe_int(-5, 30, lo=1), 1)
+        self.assertEqual(common.safe_int(9999, 30, hi=240), 240)
 
     def test_safe_float_rejects_garbage(self):
-        self.assertEqual(host._safe_float("0.5", 1.0), 0.5)
-        self.assertEqual(host._safe_float("abc", 1.0), 1.0)
-        self.assertEqual(host._safe_float(None, 1.0), 1.0)
-        self.assertEqual(host._safe_float(9.0, 1.0, hi=2.0), 2.0)
+        self.assertEqual(common.safe_float("0.5", 1.0), 0.5)
+        self.assertEqual(common.safe_float("abc", 1.0), 1.0)
+        self.assertEqual(common.safe_float(None, 1.0), 1.0)
+        self.assertEqual(common.safe_float(9.0, 1.0, hi=2.0), 2.0)
 
     def test_slot_survives_string_fps(self):
         """旧代码：slot["fps"] 是 str → 采集线程 `fps_now > 0` TypeError → 线程死亡。"""
@@ -177,13 +179,13 @@ class TestSafeConfigValues(unittest.TestCase):
         self.assertEqual(rt.slot["backend"], "mss")
 
     def test_normalize_region_keeps_valid(self):
-        self.assertEqual(host._normalize_region(
+        self.assertEqual(common.normalize_region(
             {"left": 1, "top": 2, "width": 3, "height": 4}),
             {"left": 1, "top": 2, "width": 3, "height": 4})
-        self.assertIsNone(host._normalize_region(
+        self.assertIsNone(common.normalize_region(
             {"left": 0, "top": 0, "width": 0, "height": 4}))
-        self.assertIsNone(host._normalize_region({"left": "x", "top": 0,
-                                                  "width": 1, "height": 1}))
+        self.assertIsNone(common.normalize_region({"left": "x", "top": 0,
+                                                   "width": 1, "height": 1}))
 
 
 # ----------------------------------------------------- 4) 频道线程启动时序

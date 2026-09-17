@@ -587,18 +587,12 @@ class TestAuthMessageVisible(unittest.TestCase):
 # ---------------------------------------------------------------- B4：控制消息写入失败
 
 class TestControlWriteFailureDropsClient(unittest.TestCase):
-    """B4：sendall 超时/短写后可能已写出半截消息，连接必须移除（否则字节流永久错位）。"""
+    """B4：sendall 超时/短写后可能已写出半截消息，连接必须移除（否则字节流永久错位）。
 
-    def test_send_ctrl_or_drop_removes_client_on_oserror(self):
-        rt = host.HostRuntime(copy.deepcopy(common.DEFAULT_CONFIG))
-        sock = _FakeSock()
-        info = host.ClientInfo(("1.2.3.4", 1))
-        info.send_ctrl = mock.MagicMock(side_effect=OSError("模拟写失败"))
-        rt.clients = {sock: info}
-
-        self.assertFalse(host._send_ctrl_or_drop(rt, sock, info, {"action": "pong"}))
-        self.assertEqual(rt.clients, {})            # 已从广播列表移除
-        self.assertTrue(info.send_stop.is_set())    # 发送线程已通知退出
+    C4（优化方案 2026-09-17）：原 _send_ctrl_or_drop 无生产调用者（生产路径是
+    _reply_ctrl + 调用方收尾），已随死代码清理删除；其"写失败即移除"语义由本类
+    的 roster 用例与 test_bugfix_20260911.test_handle_client_disconnects_when_reply_fails 覆盖。
+    """
 
     def test_broadcast_roster_drops_failing_client_without_deadlock(self):
         # 失败的客户端带 share_id：_drop_client → _unregister_sharer → broadcast_roster
@@ -683,11 +677,13 @@ class TestNoRedundantFrameCopy(unittest.TestCase):
 
         captured = []
 
-        def fake_cvt(src, code):
+        def fake_resize(src, size, interpolation=None):
             captured.append(src)
             raise RuntimeError("stop here")
 
-        with mock.patch.object(viewer.cv2, "cvtColor", fake_cvt):
+        # 阶段 A1 起全帧的第一个消费者是 cv2.resize（先缩放后转换），B5 的"只取引用"
+        # 语义随之下移：这里断言 resize 收到的是同一对象，而非任何 copy。
+        with mock.patch.object(viewer.cv2, "resize", fake_resize):
             app._panel_refresh_preview()
 
         self.assertTrue(captured)
@@ -891,8 +887,15 @@ class TestUpstreamRateLimitUnit(unittest.TestCase):
         self.assertTrue(info.allow_upstream(10000, 100, 30, now=100.0))
         self.assertFalse(info.allow_upstream(6000, 100, 30, now=100.0))
         self.assertEqual(info._up_dropped, 1)
-        # 1 秒后补 12500 字节额度
+        # 1 秒后补 **12500** 字节额度（名义速率 = 100Kbps×125 B/s；A1：原实现补 25000）
         self.assertTrue(info.allow_upstream(6000, 100, 30, now=101.0))
+        # A1 强断言：耗尽后再看补充速率是否恰好等于名义速率——把桶放干，1 秒后
+        # 恰好 12500 字节可用，第 12501 字节必须被拒（原实现补 25000 会错误放行）
+        drained = host.ClientInfo(("1.2.3.4", 2))
+        self.assertTrue(drained.allow_upstream(25000, 100, 30, now=200.0))
+        self.assertFalse(drained.allow_upstream(1, 100, 30, now=200.0))   # 桶已空
+        self.assertTrue(drained.allow_upstream(12500, 100, 30, now=201.0))
+        self.assertFalse(drained.allow_upstream(1, 100, 30, now=201.0))
 
     def test_frame_bucket_limits_frame_rate(self):
         info = host.ClientInfo(("1.2.3.4", 1))

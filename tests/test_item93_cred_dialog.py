@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """第 93 条回归：认证对话框不得嵌套，且结果不得跨请求串。
 
 旧路径两处隐患：
@@ -52,7 +52,7 @@ class TestCredBusyPreventsNesting(unittest.TestCase):
         box, done = {}, threading.Event()
         a._cred_requests.put((_FakeCh("chB"), done, box))
         opened = []
-        a._credentials_dialog = lambda name: opened.append(name) or ("login", "u", "p")
+        a._credentials_dialog = lambda name, error_text="", default_user="": opened.append(name) or ("login", "u", "p")
 
         a._process_cred_requests()
 
@@ -67,7 +67,7 @@ class TestCredBusyPreventsNesting(unittest.TestCase):
         a = _cred_app()
         box, done = {}, threading.Event()
         a._cred_requests.put((_FakeCh("chA"), done, box))
-        a._credentials_dialog = lambda name: ("login", "user", "pw")
+        a._credentials_dialog = lambda name, error_text="", default_user="": ("login", "user", "pw")
 
         a._process_cred_requests()
 
@@ -82,7 +82,7 @@ class TestCredBusyPreventsNesting(unittest.TestCase):
         box, done = {}, threading.Event()
         a._cred_requests.put((_FakeCh("chA"), done, box))
 
-        def boom(name):
+        def boom(name, error_text="", default_user=""):
             raise RuntimeError("dialog failed")
         a._credentials_dialog = boom
 
@@ -102,7 +102,7 @@ class TestPerRequestBoxNoCrossing(unittest.TestCase):
         a._cred_requests.put((_FakeCh("chA"), done1, box1))
         a._cred_requests.put((_FakeCh("chB"), done2, box2))
         seq = []
-        a._credentials_dialog = lambda name: (seq.append(name), ("login", name, "pw"))[1]
+        a._credentials_dialog = lambda name, error_text="", default_user="": (seq.append(name), ("login", name, "pw"))[1]
 
         a._process_cred_requests()                    # 第一次：只动 box1/done1
         self.assertEqual(box1["result"]["value"], ("login", "chA", "pw"))
@@ -126,14 +126,14 @@ class TestPerRequestBoxNoCrossing(unittest.TestCase):
         self.assertFalse(done1.is_set())
 
         # 主线程晚些处理请求1：用户提交 → 结果落进 box1（已放弃），done1.set()（无等待者）
-        a._credentials_dialog = lambda name: ("login", "OLD", "OLD")
+        a._credentials_dialog = lambda name, error_text="", default_user="": ("login", "OLD", "OLD")
         a._process_cred_requests()
         self.assertEqual(box1["result"]["value"], ("login", "OLD", "OLD"))
 
         # 新请求2 入队（全新 box2/done2）
         box2, done2 = {}, threading.Event()
         a._cred_requests.put((_FakeCh("chB"), done2, box2))
-        a._credentials_dialog = lambda name: ("login", "NEW", "NEW")
+        a._credentials_dialog = lambda name, error_text="", default_user="": ("login", "NEW", "NEW")
         a._process_cred_requests()
 
         # 请求2 只拿到 NEW；box1 的 OLD 不会串过来（共享槽时代 _cred_result 会被读走）

@@ -5,6 +5,8 @@
 既有 `import host; host.still_gate_update` 用法与单元测试不受影响。
 """
 
+import os
+import sys
 import time
 
 import cv2
@@ -14,6 +16,49 @@ import mss
 import logger
 
 log = logger.get_logger()
+
+
+#: B7：vendor 目录是否已接入 sys.path（只做一次）
+_VENDOR_ON_PATH = False
+
+
+def ensure_vendor_on_path():
+    """把项目自带的 `vendor/` 目录接入 `sys.path`（B7，2026-09-11）。
+
+    项目把 dxcam 0.3.0 与 comtypes 以 vendored 形式放在 `vendor/`，但全仓没有任何
+    把 `vendor/` 加进搜索路径的代码——`fps-host.spec` 只在**打包**时给
+    `Analysis(pathex=['vendor'])`。于是源码运行（README 的"从源码构建"、setup.bat、
+    `python host.py`）时 `import dxcam` 必然 ModuleNotFoundError，
+    `capture.backend`（默认 dxgi）走进 except → **静默降级成 mss(GDI)**：
+      - README/FAQ 里"独占全屏黑屏 → 把 capture.backend 设为 dxgi"这条官方排障建议
+        在源码运行时完全无效；
+      - GPU 采集、低延迟全部拿不到，"源码能跑、打包行为不同"难以解释。
+
+    这里在延迟 `import dxcam` 之前把 vendor 目录接到搜索路径（打包时 `_MEIPASS`
+    已含 dxcam，且该目录通常不存在，故无副作用）。
+    """
+    global _VENDOR_ON_PATH
+    if _VENDOR_ON_PATH:
+        return
+    _VENDOR_ON_PATH = True
+    candidates = []
+    try:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+    except Exception:
+        pass
+    try:
+        import common
+        candidates.append(os.path.join(common.exe_dir(), "vendor"))
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            if os.path.isdir(candidate) and candidate not in sys.path:
+                sys.path.insert(0, candidate)
+                log.info("已将 vendor 目录加入模块搜索路径: %s", candidate)
+                return
+        except Exception:
+            continue
 
 
 #: 静止检测抽稀步长（2K 下约 183x103 采样点，开销 <1ms）
@@ -117,21 +162,35 @@ class CaptureManager:
     def _open(self):
         if self.backend == "dxgi":
             try:
+                ensure_vendor_on_path()   # B7：源码运行时 vendor/ 需显式接入 sys.path
                 import dxcam  # 延迟导入：可选依赖，未安装时回退 mss
                 # 第 100 条：dxcam 的 output_color 默认是 "RGB"，其处理器做的是
                 # COLOR_BGRA2RGB，即 grab() 返回 RGB 数组；而本程序全链路（JPEG
                 # imencode、av.VideoFrame(format="bgr24")、观看端 BGR2RGB）都按 BGR
                 # 处理，用默认值会让整路画面红蓝互换。必须显式要 BGR。
+                used_bgr = True
                 try:
                     self._camera = dxcam.create(
                         output_idx=max(0, self.monitor - 1), output_color="BGR")
-                except TypeError:
-                    # 旧版 dxcam 无该参数：退回默认调用并告警（通道可能互换）
-                    log.warning("dxcam 不支持 output_color 参数，画面可能红蓝互换，"
-                                "请升级 dxcam")
+                except TypeError as e:
+                    # C16（2026-09-11）：只把"未知关键字参数 output_color"当成版本不支持。
+                    # dxcam.create 内部是一整条 DXGI/comtypes/winrt 第三方栈，任何位置抛出
+                    # 的 TypeError 原来都会被误判为"不支持 output_color"，然后去掉参数重试
+                    # 成功——可重试成功意味着拿到的是默认 RGB 帧，而全链路按 BGR 处理，
+                    # 结果是红蓝互换且只留一条容易被忽略的 WARNING。
+                    if "output_color" not in str(e):
+                        raise
+                    log.warning("dxcam 不支持 output_color 参数（%s）；已回退为 RGB 帧，"
+                                "画面红蓝可能互换，请升级 dxcam", e)
                     self._camera = dxcam.create(output_idx=max(0, self.monitor - 1))
+                    used_bgr = False
                 self._effective = "dxgi"
-                log.info("采集后端: dxgi（显示器 #%d，BGR）", self.monitor)
+                # C16：日志必须与实际拿到的颜色格式一致，不再无条件宣称 BGR
+                if used_bgr:
+                    log.info("采集后端: dxgi（显示器 #%d，BGR）", self.monitor)
+                else:
+                    log.info("采集后端: dxgi（显示器 #%d，RGB 未交换，红蓝可能互换）",
+                             self.monitor)
                 return
             except Exception as e:
                 log.warning("dxgi 后端不可用，回退 mss：%s", e)

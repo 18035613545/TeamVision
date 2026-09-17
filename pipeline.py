@@ -10,6 +10,7 @@ host.py（本地共享端）与 share.py（观看端上传）原先各维护一�
   后端已死重建、长期空帧告警）——两侧策略差异做成参数。
 - `StillGate`（第 111 条）：motion_changed + still_gate_update 状态机，可选边沿回调。
 - `FrameEncoder`（第 110 条）：编码器选型/重建/负缓存退避 + 编码 + 关键帧 + JPEG 回退。
+- `PipelineParams`（第 109 条，C1 归位）：host 四条流水线的派生参数对象（原在 host.py）。
 
 两侧只负责"帧去哪"：host 写共享槽（发送线程广播），share 经 _tx_lock 直接发送。
 
@@ -25,6 +26,7 @@ import cv2
 
 import logger
 import codec as codec_mod
+from common import safe_float, safe_int
 from screen import (CaptureManager, calc_output_size, downsample_frame, encode_bgr,
                     motion_changed, still_gate_update)
 
@@ -237,6 +239,8 @@ class CaptureSource:
         self._nones = 0         # 连续空帧次数（成功抓到一帧即清零）
         self._none_since = None  # 空帧起始时刻（monotonic）
         self._none_warned = False
+        # A2：句柄缺失类告警去重（10 秒一次，避免 2 条/秒刷满 5MB 滚动日志）
+        self._warn_at = 0.0
         self.cap = capture
         if self.cap is None:
             self._open()
@@ -245,6 +249,15 @@ class CaptureSource:
 
     def _tag(self):
         return ("频道[%s] 共享" % self._name) if self._name else ""
+
+    def _warn_throttled(self, msg, *args, interval=10.0):
+        """A2：同一类"采集不可用"告警最多每 interval 秒记一条（其余降级 debug）。"""
+        now = time.monotonic()
+        if self._warn_at <= 0.0 or (now - self._warn_at) >= interval:
+            self._warn_at = now
+            log.warning(msg, *args)
+        else:
+            log.debug(msg, *args)
 
     def working(self):
         """采集后端是否可用：句柄存在且未自报失效（无 working 属性视为可用）。"""
@@ -278,8 +291,27 @@ class CaptureSource:
             log.error("%s重建后的采集后端仍不可用，请检查采集源设置", self._tag())
 
     def set_params(self, backend, monitor, region):
-        """下发采集参数（host 允许在线切换采集源）；失败返回 False（调用方应退避重试）。"""
+        """下发采集参数（host 允许在线切换采集源）；失败返回 False（调用方应退避重试）。
+
+        A2（2026-09-11）：句柄缺失（两个后端初始化都失败 → `cap is None`）时必须走
+        `_rebuild` 而不是 `self.cap.set_params`：
+          - 旧实现抛 `AttributeError: 'NoneType' object has no attribute 'set_params'`，
+            被这里吞成"采集参数重建失败"每 0.5 秒刷一条 WARNING；
+          - 更致命的是 `host._capture_loop` 拿到 False 就 `continue`，**永远走不到
+            `grab()`**——而 grab() 里本来就有"句柄缺失 → 计数 → 达阈值重建"的自愈逻辑。
+            于是采集后端启动即失败时，采集线程永久无法自愈，只有重启进程才能恢复。
+        现在缺句柄时直接复用 grab() 同一套重建机制（返回重建是否成功），让调用方既能
+        看到失败、又能触发重建。
+        """
         self._backend, self._monitor, self._region = backend, monitor, region
+        if self.cap is None:
+            self._errors += 1
+            self._warn_throttled("%s采集句柄缺失（后端初始化失败），尝试重建采集器（连续 %d 次）",
+                                 self._tag(), self._errors)
+            self._rebuild("采集句柄缺失，尝试重建采集器", level="error")
+            self._errors = 0
+            time.sleep(self._sleep_on_error)
+            return self.working()
         try:
             self.cap.set_params(backend, monitor, region)
             return True
@@ -310,8 +342,8 @@ class CaptureSource:
             # 构造阶段就没拿到句柄（两个后端都不可用）：按错误路径计数，累计到阈值后
             # 再尝试重建。直接调 self.cap.grab() 只会抛 AttributeError 刷无意义日志。
             self._errors += 1
-            log.warning("%s采集句柄缺失（后端初始化失败），采集不可用（连续 %d 次）",
-                        self._tag(), self._errors)
+            self._warn_throttled("%s采集句柄缺失（后端初始化失败），采集不可用（连续 %d 次）",
+                                 self._tag(), self._errors)
             if self._errors >= self._rebuild_on_errors:
                 self._rebuild("采集句柄缺失，尝试重建采集器", level="error")
                 self._errors = 0
@@ -401,3 +433,51 @@ class StillGate:
         if self._on_edge is not None and self.in_still != was_still:
             self._on_edge(self.in_still)
         return changed
+
+
+class PipelineParams:
+    """采集/编码/发送/性能四条流水线的派生参数（第 109 条 · 阶段 2 重构）。
+
+    这些值原先散落在 run_server 开头的 60 余行局部变量里，被 4 个嵌套闭包共享。
+    抽成对象后四条流水线成为模块级函数（可单独构造参数测试），run_server 只做编排。
+    所有数值读取仍走 common.safe_int/safe_float（第 100 条，C1 下沉），手改配置不会打死线程。
+    """
+
+    __slots__ = ("base_fps", "base_quality", "base_scale", "quality_min", "scale_min",
+                 "fps_min", "still_enabled", "still_probe_interval", "still_quiet_s",
+                 "point_thr", "ratio_thr", "encoder_sel", "min_bitrate", "max_bitrate",
+                 "keyint", "codec_preset", "target_width")
+
+    def __init__(self, cfg):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        host_cfg = cfg.get("host") if isinstance(cfg.get("host"), dict) else {}
+        perf_cfg = host_cfg.get("perf") if isinstance(host_cfg.get("perf"), dict) else {}
+        codec_cfg = host_cfg.get("codec") if isinstance(host_cfg.get("codec"), dict) else {}
+        self.base_fps = safe_int(host_cfg.get("fps", 30), 30, 1, 240)
+        self.base_quality = safe_int(host_cfg.get("jpeg_quality", 80), 80, 1, 100)
+        self.base_scale = safe_float(host_cfg.get("scale", 1.0), 1.0, 0.05, 4.0)
+        self.quality_min = safe_int(perf_cfg.get("quality_min", 40), 40, 1, 100)
+        self.scale_min = safe_float(perf_cfg.get("scale_min", 0.25), 0.25, 0.05, 1.0)
+        self.fps_min = safe_int(perf_cfg.get("fps_min", 10), 10, 1, 240)
+        # 静止检测（perf.still，全部可配；默认关闭——开启后小的锐利局部变化
+        # 会被整屏面积比判据误判为静止，帧率被压到 probe_fps）
+        still_cfg = perf_cfg.get("still") if isinstance(perf_cfg.get("still"), dict) else {}
+        self.still_enabled = bool(still_cfg.get("enabled", False))
+        self.still_probe_interval = 1.0 / safe_int(
+            still_cfg.get("probe_fps", 5), 5, 1, 240)
+        still_frames = safe_int(still_cfg.get("still_frames", 3), 3, 1, 3600)
+        self.point_thr = safe_int(still_cfg.get("point_thr", 10), 10, 0, 255)
+        self.ratio_thr = safe_float(still_cfg.get("ratio_thr", 0.005), 0.005, 0.0, 1.0)
+        # 连续无变化满该时长才判定静止（默认 3 次探测 × 0.2s = 0.6s，仅连续累计，
+        # 间歇内容不会因零星停顿跨帧累计误入静止）；单位**秒**（第 87 条）
+        self.still_quiet_s = still_frames * self.still_probe_interval
+        self.encoder_sel = codec_cfg.get("encoder", "auto")
+        # 注：原 run_server 里的 base_bitrate 局部量自始未被使用（死代码），
+        # 目标码率由 HostRuntime.__init__ 写入 runtime.target_bitrate，故不再保留。
+        self.min_bitrate = safe_int(codec_cfg.get("min_bitrate_kbps", 400), 400, 64) * 1000
+        self.max_bitrate = safe_int(codec_cfg.get("max_bitrate_kbps", 6000), 6000, 64) * 1000
+        if self.max_bitrate < self.min_bitrate:
+            self.min_bitrate, self.max_bitrate = self.max_bitrate, self.min_bitrate
+        self.keyint = safe_int(codec_cfg.get("keyint", 60), 60, 1, 3600)
+        self.codec_preset = codec_cfg.get("preset", "") or ""
+        self.target_width = safe_int(codec_cfg.get("target_width", 854) or 0, 854, 0)

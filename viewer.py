@@ -54,6 +54,9 @@ from common import (
     VIDEO_FLAG_KEY,
     CODEC_H264,
     CODEC_HEVC,
+    # C1（优化方案 2026-09-17）：原 _cfg_int/_cfg_float 私有副本并入 common。
+    safe_float,
+    safe_int,
 )
 
 #: 模块级日志（logger.setup_logger(cfg) 幂等初始化后生效）
@@ -217,38 +220,23 @@ def _canonical_addr(addr):
     return h, port
 
 
-def _cfg_int(value, default, lo=None, hi=None):
-    """把配置值安全转为 int（第 100 条）：非法/超范围时回退 default 并夹紧。
+def _viewer_hotkeys_cfg(cfg):
+    """安全取 viewer.hotkeys 配置对象（B4，2026-09-11）。
 
-    手改 config.json（如 display_width: 0、rcvbuf_kb: "abc"）不应让 GUI 每帧抛异常
-    被静默吞掉或让接收线程起不来。
+    第 106 条（B16）已为 `viewer.channels` 做了同类规范化，`hotkeys` 漏了：手改成
+    `"hotkeys": false` 时 `self.cfg["viewer"].get("hotkeys", {}).get("direct", True)`
+    抛 AttributeError——在 `_build_panel` 里会让观看端**完全无法启动**（冒泡到 run()
+    → main() 弹错误框后 sys.exit(1)），在 `_hotkey_loop` 里会让热键线程直接死亡且
+    已注册的全局热键永不注销。这里统一兜底成 {} 并保留原默认语义。
     """
-    if isinstance(value, bool):
-        value = int(value)
-    try:
-        out = int(value)
-    except (TypeError, ValueError):
-        log.warning("viewer 配置值 %r 不是整数，回退默认值 %r", value, default)
-        out = int(default)
-    if lo is not None and out < lo:
-        out = int(lo)
-    if hi is not None and out > hi:
-        out = int(hi)
-    return out
-
-
-def _cfg_float(value, default, lo=None, hi=None):
-    """把配置值安全转为 float（第 100 条）：非法时回退 default，并按需夹到 [lo, hi]。"""
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        log.warning("viewer 配置值 %r 不是数字，回退默认值 %r", value, default)
-        out = float(default)
-    if lo is not None and out < lo:
-        out = float(lo)
-    if hi is not None and out > hi:
-        out = float(hi)
-    return out
+    viewer_cfg = cfg.get("viewer") if isinstance(cfg, dict) else None
+    viewer_cfg = viewer_cfg if isinstance(viewer_cfg, dict) else {}
+    hotkeys = viewer_cfg.get("hotkeys")
+    if not isinstance(hotkeys, dict):
+        if hotkeys is not None:
+            log.warning("viewer.hotkeys 不是对象（%r），按默认值处理", hotkeys)
+        return {}
+    return hotkeys
 
 
 def _normalize_channel_items(viewer_cfg):
@@ -290,6 +278,11 @@ class Channel:
         self.username = (auth or {}).get("username", "")
         self.auth_msg = ""
         self._prompt_blocked_until = 0.0  # 取消登录后的冷却时刻，避免频繁重连狂弹对话框
+        # 第 133 条（2026-09-11）：服务端最近一次拒绝原因与最近一次尝试的用户名——
+        # 回填进登录框（红字提示 + 预填用户名），并在日志里明确写出"已弹出登录框"。
+        # 原实现只有冷却和 auth_msg，用户看不到"为什么失败"，也看不到任何"弹过框"的痕迹。
+        self._auth_error_text = ""
+        self._last_auth_user = ""
         self._password = None  # 本次会话内的明文密码缓存，用于重连自动登录
         self._auth_probed = False  # 已用空凭据探测过服务端是否需要登录（避免准入关闭时仍弹框）
         self._anon_ok = False  # 已确认服务端准入关闭（匿名放行），重连时直接走 probe 不再弹框
@@ -297,12 +290,12 @@ class Channel:
         viewer_cfg = (owner.cfg if owner is not None else {}).get("viewer", {}) or {}
         net_cfg = viewer_cfg.get("net", {}) or {}
         rc_cfg = viewer_cfg.get("reconnect", {}) or {}
-        self._rcvbuf = _cfg_int(net_cfg.get("rcvbuf_kb", 4096), 4096, 0) * 1024
-        self._read_idle_s = _cfg_float(net_cfg.get("read_idle_s", 5.0), 5.0, 0.5, 600.0)
-        self._ping_interval = _cfg_float(viewer_cfg.get("ping_interval_s", 2.0), 2.0, 0.2, 600.0)
-        self._backoff_base = _cfg_float(rc_cfg.get("base_s", 1.0), 1.0, 0.1, 600.0)
-        self._backoff_max = _cfg_float(rc_cfg.get("max_s", 30.0), 30.0, 0.5, 3600.0)
-        self._backoff_factor = _cfg_float(rc_cfg.get("factor", 2.0), 2.0, 1.0, 10.0)
+        self._rcvbuf = safe_int(net_cfg.get("rcvbuf_kb", 4096), 4096, 0) * 1024
+        self._read_idle_s = safe_float(net_cfg.get("read_idle_s", 5.0), 5.0, 0.5, 600.0)
+        self._ping_interval = safe_float(viewer_cfg.get("ping_interval_s", 2.0), 2.0, 0.2, 600.0)
+        self._backoff_base = safe_float(rc_cfg.get("base_s", 1.0), 1.0, 0.1, 600.0)
+        self._backoff_max = safe_float(rc_cfg.get("max_s", 30.0), 30.0, 0.5, 3600.0)
+        self._backoff_factor = safe_float(rc_cfg.get("factor", 2.0), 2.0, 1.0, 10.0)
         self._retry_delay = 0.0  # 当前重连等待（指数退避）；成功收帧后归零
         # H.264/H.265(HEVC) 视频解码（host 视频编码路径）；JPEG 回退仍兼容
         self._decoder = codec_mod.VideoDecoder()
@@ -385,7 +378,19 @@ class Channel:
                 log.info("频道[%s] 正在连接 %s:%d …", self.name, host, port)
                 sock = socket.create_connection((host, port), timeout=10)
                 tune_socket(sock, rcvbuf=self._rcvbuf, keepalive=True, keepalive_idle=60)
-                client_handshake(sock)
+                # C15（2026-09-11）：把"隧道不可达"报成可归因的错误。`recv_exact` 在
+                # "TCP 已建立但对端不发数据即关闭"时抛「连接提前关闭，收到的数据不完整」，
+                # 而这句话在**隧道/端口映射没指向共享端、frpc 未运行、共享端崩溃**三种
+                # 完全不同的故障下都会出现，且共享端在这三种情况下都不留日志——用户只能
+                # 在两端之间盲猜（本次 A0 故障即因此拖延定位）。
+                try:
+                    client_handshake(sock)
+                except Exception as e:
+                    raise ConnectionError(
+                        "%s · TCP 已连通但未收到服务端握手：通常是内网穿透/端口映射没有"
+                        "指向共享端的监听端口（樱花 frpc 日志会写「连接映射目标 "
+                        "[tcp://localhost:PORT] 失败」），也可能共享端未启动、或只监听了"
+                        "另一地址族（如 IPv4 回环而 frpc 走 ::1）" % e)
                 if not self._authenticate(sock):
                     self.status = "auth"
                     self.auth_msg = "需要登录后观看"
@@ -638,6 +643,18 @@ class Channel:
                 self.video_mode = True
             with self._dec_lock():
                 frames = self._decoder.decode(nal)
+            if getattr(self._decoder, "needs_keyframe", False):
+                # B6（2026-09-11）：解码器内部已复位（缺参考帧/坏 NAL → flush_buffers），
+                # 参考链被清空，但 _got_key 仍为 True——此后某个 P 帧若被解出（PyAV 在
+                # 缺参考时并非总是失败）会跳过"仅关键帧后显示"门控，把脏帧直接贴到悬浮窗。
+                # 这里作废门控并请求关键帧，等待下一个 IDR 重新起解。
+                self._got_key = False
+                try:
+                    self._decoder.clear_needs_keyframe()
+                except Exception:
+                    pass
+                self._request_keyframe(sock)
+                frames = []
             if frames and self._got_key:
                 # 仅在收到关键帧后显示：重连/编码切换后首个关键帧前的 P 帧可能对旧参考
                 # 解码出脏画面，一律丢弃并请求关键帧。批次内逐帧喂解码器维持参考链，
@@ -734,6 +751,8 @@ class Channel:
             else:
                 action = "login"
             try:
+                if user:
+                    self._last_auth_user = user   # 第 133 条：失败后预填用
                 send_msg(sock, {"action": action, "user": user, "pass": password})
                 sock.settimeout(5.0)
                 reply = recv_msg(sock)
@@ -757,6 +776,7 @@ class Channel:
                     # 无用户名即匿名放行（准入关闭）：记住以便重连直接 probe
                     self._anon_ok = True
                 self.auth_msg = ""
+                self._auth_error_text = ""
                 log.info("频道[%s] 以用户 %s 登录成功", self.name, user or "匿名(准入关闭)")
                 return True
             msg = reply.get("msg", "")
@@ -770,24 +790,37 @@ class Channel:
             # 第 28 条：注册时用户名被占用并不代表已保存的登录凭据失效，绝不能据此清空
             # 凭据（原 bug：点“注册”输了个已占用的名字，该频道有效的登录凭据被抹掉）。
             if action == "register" and msg == "用户名已存在":
-                self._prompt_blocked_until = time.time() + 30
-                self.auth_msg = "注册失败：用户名已被占用，请换一个或直接登录"
-                log.warning("频道[%s] 注册用户名已被占用：%s", self.name, user)
+                # 第 133 条：带原因重新弹框（而不是静默 30 秒），让用户能立刻改名重试
+                self._auth_error_text = "注册失败：用户名已被占用，请换一个或改点「登录」"
+                self.auth_msg = self._auth_error_text
+                self._retry_delay = 0.0
+                log.warning("频道[%s] 注册用户名已被占用：%s（稍后重新弹出登录框）", self.name, user)
                 return False
             if action == "register" and msg:
                 # 第 131 条：服务端关闭了自助注册（bootstrap/closed 策略）或账户文件写不
                 # 进去时，必须把原因显示出来并停止本轮重试；否则用户看到的只是"输完又弹
                 # 框"，误以为是自己密码打错了。
-                self._prompt_blocked_until = time.time() + 30
-                self.auth_msg = "注册失败：%s" % msg
-                log.warning("频道[%s] 注册被拒绝：%s", self.name, msg)
+                # 第 133 条：原因同时写进登录框（红字），并在约 1 秒后重新弹出，用户可直接
+                # 改成「登录」用已有账户进去，不必等 30 秒冷却。
+                self._auth_error_text = "注册失败：%s" % msg
+                self.auth_msg = self._auth_error_text
+                self._retry_delay = 0.0
+                log.warning("频道[%s] 注册被拒绝：%s（稍后重新弹出登录框）", self.name, msg)
                 return False
             if msg in ("用户名或密码错误", "账号不存在"):
-                self._prompt_blocked_until = time.time() + 30
+                # 第 133 条（2026-09-11）：**不再**在这里设置 30 秒弹框冷却。
+                # 旧行为：凭据错误 → _prompt_blocked_until=+30 → 下一次重连
+                # _ask_credentials 立刻返回 None（被当成"用户取消"）→ 登录框消失，而
+                # 重连退避又逐次涨到 30 秒；用户输错一次后，长时间再也看不到登录页面，
+                # 只会以为"根本没有登录入口"（本次用户报障正是此现象）。
+                # 现在：清除失效凭据 → 把服务端原因带进登录框（红字）→ 复位重连退避，
+                # 约 1 秒后重新弹框并预填上次的用户名，用户可立即重输。
+                self._auth_error_text = "%s（用户名须与共享端账户完全一致，区分大小写）" % msg
                 self.auth_msg = "认证失败：%s" % msg
                 # 凭据失效（改密/账号删除等）：清除缓存，重连时重新询问，避免无限重试旧凭据
                 self._password = None
                 self.username = ""
+                self._retry_delay = 0.0
                 if self.auth:
                     self.auth = {}
                     try:
@@ -795,7 +828,8 @@ class Channel:
                             self.owner._save_channels()
                     except Exception:
                         pass
-                log.warning("频道[%s] %s", self.name, msg)
+                log.warning("频道[%s] %s（已清除本地凭据，约 1 秒后重新弹出登录框）",
+                            self.name, msg)
                 return False
             # 其余情况（如服务端异常响应）继续循环，下一轮会弹框询问注册或登录
         return False
@@ -808,6 +842,10 @@ class Channel:
         键盘输入无法到达的问题（焦点上下文与 Tk 内部状态不同步）。
         """
         if time.time() < self._prompt_blocked_until:
+            # 第 133 条：冷却必须留痕——原来这里静默 return None，用户与日志都无从知道
+            # "登录框被压住了"，只能看到"没有登录页面"。
+            log.info("频道[%s] 登录框处于冷却中（%.0f 秒后可再次弹出；上次为手动取消）",
+                     self.name, max(0.0, self._prompt_blocked_until - time.time()))
             return None
         owner = self.owner
         if owner is None:
@@ -815,13 +853,24 @@ class Channel:
         # 等待 Tk root 创建且 mainloop 真正启动后再入队：接收线程在 __init__ 期间即可能
         # 到达此处（root 尚为 None）或处于首启向导 wait_window 期间（mainloop 未启动）。
         # 轮询等待而不是直接返回 None，可避免误入 30 秒冷却后狂重试。
+        # C19（2026-09-11）：轮询改用 _stop_evt.wait(0.1)——原来 time.sleep(0.1) 不受
+        # stop()/request_stop() 影响，删除频道后接收线程仍会在这里空转最长 60 秒。
+        stop_evt = getattr(self, "_stop_evt", None)
         deadline = time.time() + 60
         while time.time() < deadline:
+            if not getattr(self, "_running", True):
+                return None
+            if stop_evt is not None and stop_evt.is_set():
+                return None
             root = owner.root
             ready = getattr(owner, "_mainloop_ready", None)
             if root is not None and (ready is None or ready.is_set()):
                 break
-            time.sleep(0.1)
+            if stop_evt is not None:
+                if stop_evt.wait(0.1):
+                    return None
+            else:
+                time.sleep(0.1)
         else:
             return None
         # 第 93 条：结果走"每请求独立 box"，不再用频道上的共享 _cred_result 槽——
@@ -830,16 +879,37 @@ class Channel:
         done = threading.Event()
         # 第 108 条（B15）：队列限长——接收线程 done.wait(120) 超时后会重连并再次入队，
         # 用户几小时后回来关掉第一个框，主线程会接着弹出积压的第二、第三个"幽灵登录框"。
-        # 超过 4 个就丢掉最旧的（其等待者已超时或即将超时，done 不会再被误置）。
+        # 超过 4 个就丢掉最旧的。
+        #
+        # A3（2026-09-11）：淘汰**必须唤醒被淘汰的等待者**。原实现只 get_nowait 丢掉最旧
+        # 请求，其 done 永远不会被置位（主线程也从队列里取不到它了），该频道的接收线程只能
+        # 空等满 120 秒——多频道（≥5）同时登录时必现"某个频道一直连不上，过两分钟自己好了"。
         try:
             while owner._cred_requests.qsize() >= 4:
-                owner._cred_requests.get_nowait()
+                old_ch, old_done, old_box = owner._cred_requests.get_nowait()
+                old_box["result"] = {"error": RuntimeError("登录请求被更新的请求替换")}
+                old_done.set()
         except queue.Empty:
             pass
         owner._cred_requests.put((self, done, box))
-        done.wait(timeout=120)
-        if not done.is_set():
-            return None
+        # 第 133 条：弹出动作必须留痕（用户报"没有登录页面"时，日志要能直接回答"弹没弹"）
+        _last_user = getattr(self, "_last_auth_user", "") or ""
+        log.info("频道[%s] 需要账户（服务端要求登录），已弹出登录框%s",
+                 self.name, ("；上次尝试：%s" % _last_user) if _last_user else "")
+        # A3：等待必须可被打断——done.wait(120) 不受 _running/_stop_evt 影响时，删除一个
+        # 正在等登录的频道会让 channel-recv 线程与其 socket 残留最长 120 秒（B13 已把退避
+        # 等待改成可中断 Event.wait，这条路径漏了）。这里改成 0.5 秒一轮的可中断等待。
+        waited = 0.0
+        while not done.is_set():
+            if done.wait(0.5):
+                break
+            if stop_evt is not None and stop_evt.is_set():
+                return None
+            if not getattr(self, "_running", True):
+                return None
+            waited += 0.5
+            if waited >= 120.0:
+                return None
         result = box.get("result")
         if result is None or "error" in result or "value" not in result:
             return None
@@ -1077,6 +1147,40 @@ class Channel:
             log.info("频道[%s] 对方不支持共享上传，已自动关闭共享", self.name)
         self._notify_share_error("对方不支持共享上传（旧版服务端），共享已自动关闭")
 
+    def check_share_alive(self):
+        """B8（2026-09-11）：共享会话自行终止时，本端 UI 与对端 host 都必须收到通知。
+
+        原来 `ScreenShareSession` 的线程可能因采集后端不可用 / 连环编码失败 / 未预期异常
+        而终止，**连接仍然健在**：
+          - 对端 host 不知道 → `share_id` 仍是 `peer:N`，该成员继续挂在所有观众端的
+            「画面源」列表里（"幽灵源"：选中后永远收不到帧，停在最后一帧或全黑）；
+          - 本端也不知道 → `Channel.share_enabled` 仍为 True，面板按钮仍显示「停止共享」，
+            用户以为自己在共享。
+        本方法由主线程 poll 周期调用（见 `ViewerApp._check_share_sessions`），发现会话已死
+        即：关开关 → 清理会话 → 若连接仍在补发一次 unshare → 状态栏提示原因。
+        """
+        with self._share_lock:
+            if not self.share_enabled or self._share is None:
+                return
+            session = self._share
+        try:
+            if session.alive:
+                return
+        except Exception:
+            return
+        reason = getattr(session, "exit_reason", None) or "上传会话已结束"
+        with self._share_lock:
+            self.share_enabled = False
+        self._stop_share()
+        sock = self._active_sock
+        if sock is not None:
+            try:
+                self._send_locked(sock, {"action": "unshare"})
+            except (OSError, ValueError):
+                pass
+        log.warning("频道[%s] 共享已停止：%s", self.name, reason)
+        self._notify_share_error("共享已停止：%s" % reason)
+
     def _notify_share_error(self, text):
         """把共享错误提示调度到主线程状态栏（Owner 在且存活时）。"""
         name = self.name
@@ -1138,6 +1242,9 @@ class Channel:
         stop_evt = getattr(self, "_stop_evt", None)
         if stop_evt is not None:
             stop_evt.set()   # 第 108 条（B13）：打断退避等待
+        # A3（2026-09-11）：唤醒仍在等登录框的接收线程——stop() 之前无法打断
+        # _ask_credentials 的等待，删除频道后线程与其 socket 会残留最长 120 秒。
+        self._wake_pending_credentials("频道已停止")
         # 第 61 条：cancel 能力确认兜底定时器并清 _active_sock，杜绝退出后定时器触发
         # _share_sync_after_connect → _start_share 在 teardown 期间新開上传会话。
         if self._share_sync_timer is not None:
@@ -1145,6 +1252,24 @@ class Channel:
             self._share_sync_timer = None
         self._active_sock = None
         self._stop_share()
+
+    def _wake_pending_credentials(self, reason):
+        """A3：把本频道在等登录框的请求就地置位，让接收线程立即可返回。
+
+        队列元素为 (channel, done, box)；只动属于本频道的项，其他频道的等待不受影响。
+        """
+        owner = getattr(self, "owner", None)
+        q = getattr(owner, "_cred_requests", None) if owner is not None else None
+        if q is None:
+            return
+        try:
+            with q.mutex:
+                for ch, done, box in list(q.queue):
+                    if ch is self:
+                        box["result"] = {"error": RuntimeError(reason)}
+                        done.set()
+        except Exception:
+            pass
 
 
 class ViewerApp:
@@ -1155,8 +1280,8 @@ class ViewerApp:
         viewer_cfg = cfg["viewer"]
         # 第 100 条：显示宽度/透明度来自配置，手改成 0/负数/字符串时不应让每帧
         # resize 抛异常被吞成"永久占位文字"。这里与 set_display_width 同口径夹紧。
-        self.display_width = _cfg_int(viewer_cfg.get("display_width", 480), 480, 1, 4096)
-        self.alpha = _cfg_float(viewer_cfg.get("alpha", 0.9), 0.9, 0.0, 1.0)
+        self.display_width = safe_int(viewer_cfg.get("display_width", 480), 480, 1, 4096)
+        self.alpha = safe_float(viewer_cfg.get("alpha", 0.9), 0.9, 0.0, 1.0)
         self.click_through = bool(viewer_cfg.get("click_through", True))
         self.panel_topmost = bool(viewer_cfg.get("panel_topmost", True))
 
@@ -1195,6 +1320,7 @@ class ViewerApp:
         self.panel = None
         self._share_toggle_busy = False  # 第 60 条：共享开关异步执行期间的重入护栏
         self._save_after_id = None  # 第 64 条：viewer 配置去抖落盘的 root.after 句柄
+        self._share_alive_check_at = 0.0  # B8：共享会话存活巡检的节流时刻
         # 全局热键状态（注册结果供面板提示/失败上屏；tid 供退出时 PostThreadMessage 唤醒）
         self._hotkey_tid = None
         self._hotkey_registered = set()
@@ -1606,7 +1732,7 @@ class ViewerApp:
         header = ttk.Frame(panel, style="Panel.TFrame")
         header.pack(fill="x", padx=14, pady=(12, 4))
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(anchor="w")
-        if bool(self.cfg["viewer"].get("hotkeys", {}).get("direct", True)):
+        if bool(_viewer_hotkeys_cfg(self.cfg).get("direct", True)):
             hint = ("Ctrl+Alt+←/→ 换频道   Ctrl+Alt+↑/↓ 换画面源   "
                     "Alt+1..9 直达   Ctrl+Alt+X 穿透")
         else:
@@ -1934,16 +2060,17 @@ class ViewerApp:
                             frame = ch.last_frame   # 第 105 条（B5）：只取引用
             if frame is not None:
                 if changed:
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    img = Image.fromarray(rgb)
-                    w, h = img.size
-                    if w > 0 and h > 0:
+                    fh, fw = frame.shape[:2]
+                    if fw > 0 and fh > 0:
                         # 等比缩放到宽度 320；过高时按高度上限 165 收缩，防止面板被撑开
-                        new_w, new_h = 320, max(1, int(round(h * 320.0 / w)))
+                        new_w, new_h = 320, max(1, int(round(fh * 320.0 / fw)))
                         if new_h > 165:
-                            new_w, new_h = max(1, int(round(w * 165.0 / h))), 165
-                        img = img.resize((new_w, new_h), Image.BILINEAR)
-                        photo = ImageTk.PhotoImage(img)
+                            new_w, new_h = max(1, int(round(fw * 165.0 / fh))), 165
+                        # 阶段 A1（优化方案 2026-09-17）：与 _show_frame 同款"先缩放后转换"
+                        small = cv2.resize(frame, (new_w, new_h),
+                                           interpolation=cv2.INTER_AREA)
+                        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
                         # 先让 label 指向新图再释放旧引用：否则旧 Tk 图像在 label 仍显示时
                         # 被删除，随后的 configure 可能报 "image ... doesn't exist"
                         self._preview_label.configure(image=photo, text="")
@@ -2110,8 +2237,13 @@ class ViewerApp:
             # 队友行
             for p in peers:
                 sid = p.get("id")
+                # B8：共享者侧会话已停但仍未注销的"幽灵源"标出无信号，避免观众选中后
+                # 停在最后一帧却毫无提示
+                pname = "队友 · %s" % (p.get("name") or sid)
+                if p.get("stale"):
+                    pname += "（无信号）"
                 rows.append(("▶ 观看中" if (active and watching == sid) else "",
-                             "队友 · %s" % (p.get("name") or sid),
+                             pname,
                              p.get("addr") or "", sid))
         # 结构（sid 序列）未变：只更新值变化的行，避免每 500ms 全删全建
         if (self._src_rows
@@ -2293,8 +2425,13 @@ class ViewerApp:
 
     # ---------- 账户认证 ----------
 
-    def _credentials_dialog(self, channel_name):
-        """弹出登录/注册模态对话框（主线程执行）；返回 ("login"|"register", user, password) 或 None。"""
+    def _credentials_dialog(self, channel_name, error_text="", default_user=""):
+        """弹出登录/注册模态对话框（主线程执行）；返回 ("login"|"register", user, password) 或 None。
+
+        第 133 条（2026-09-11）：新增 error_text / default_user 两个可选参数——
+        服务端上一次的拒绝原因以红字直接写在框里，用户名预填上次尝试值。
+        旧实现每次都是空白框且不显示任何原因，用户只能靠面板状态栏去猜。
+        """
         parent = self.panel if self.panel is not None else self.root
         win = tk.Toplevel(parent)
         win.title("账户认证")
@@ -2312,7 +2449,7 @@ class ViewerApp:
                  fg=COL_FG, font=("Microsoft YaHei", 11, "bold")).pack(anchor="w", pady=(4, 10))
         tk.Label(body, text="用户名", bg=COL_CARD, fg=COL_DIM,
                  font=("Microsoft YaHei", 9)).pack(anchor="w")
-        user_var = tk.StringVar()
+        user_var = tk.StringVar(value=default_user)
         pass_var = tk.StringVar()
         user_entry = tk.Entry(body, textvariable=user_var, bg=COL_CTRL, fg=COL_FG,
                               insertbackground=COL_FG, relief="flat", highlightthickness=1,
@@ -2324,8 +2461,8 @@ class ViewerApp:
                               insertbackground=COL_FG, relief="flat", highlightthickness=1,
                               highlightbackground="#3a3a52")
         pass_entry.pack(fill="x", pady=(2, 10))
-        err = tk.Label(body, text="", bg=COL_CARD, fg=COL_OFFLINE,
-                       font=("Microsoft YaHei", 9))
+        err = tk.Label(body, text=error_text, bg=COL_CARD, fg=COL_OFFLINE,
+                       font=("Microsoft YaHei", 9), wraplength=340, justify="left")
         err.pack(anchor="w", pady=(0, 8))
 
         def _submit(action):
@@ -2362,9 +2499,15 @@ class ViewerApp:
             win.grab_set()
         except Exception:
             pass
-        # 强制聚焦用户名输入框，确保用户可直接输入（也便于自动化驱动）
+        # 强制聚焦输入框，确保用户可直接输入（也便于自动化驱动）
+        # 第 133 条：预填了用户名时把焦点放到密码框、用户名全选——用户只需补密码，
+        # 想改名时直接输入即覆盖。
         try:
-            user_entry.focus_force()
+            if default_user:
+                user_entry.selection_range(0, "end")
+                pass_entry.focus_force()
+            else:
+                user_entry.focus_force()
         except Exception:
             pass
         self.root.wait_window(win)
@@ -2623,7 +2766,8 @@ class ViewerApp:
         """将窗口定位到屏幕右上角（留 10 像素边距）。"""
         self.root.update_idletasks()
         w = self.root.winfo_width() or self.label.winfo_reqwidth()
-        h = self.root.winfo_height() or self.label.winfo_reqheight()
+        # C9（2026-09-11）：原实现还算了 `h = winfo_height()...` 但从未使用（只用 w），
+        # 属于死代码，删掉以免误导。
         x = self.root.winfo_screenwidth() - w - 10
         y = 10
         self.root.geometry("+%d+%d" % (x, y))
@@ -2652,8 +2796,20 @@ class ViewerApp:
             return
         self._cred_busy = True
         result = {}
+        # 第 133 条：把服务端上一次的拒绝原因与上次尝试的用户名带进登录框（红字+预填）。
+        # 读后即清：同一条原因只提示一次，避免用户改用新账号时还看到旧报错。
+        error_text = getattr(ch, "_auth_error_text", "") or ""
+        default_user = getattr(ch, "_last_auth_user", "") or ""
+        if not isinstance(error_text, str):      # 测试替身（MagicMock）容错
+            error_text = ""
+        if not isinstance(default_user, str):
+            default_user = ""
         try:
-            result["value"] = self._credentials_dialog(ch.name)
+            ch._auth_error_text = ""
+        except Exception:
+            pass
+        try:
+            result["value"] = self._credentials_dialog(ch.name, error_text, default_user)
         except Exception as e:
             result["error"] = e
         finally:
@@ -2675,6 +2831,23 @@ class ViewerApp:
         except Exception:
             pass
 
+    def _check_share_sessions(self):
+        """B8：周期性检查各频道的共享会话是否已自行终止（主线程，最长 0.5 秒一次）。
+
+        原实现只在收到 cap/peers 或重连时才有机会发现会话已死（`_maybe_resume_share`）；
+        连接保持期间不再检查，于是"共享者以为还在共享、对端挂着死源"可以持续到用户手动
+        点一下。这里把"会话已死"从"等下一次 cap/peers"变成"最长一个刷新周期内自愈"。
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_share_alive_check_at", 0.0) < 0.5:
+            return
+        self._share_alive_check_at = now
+        for ch in list(self.channels):
+            try:
+                ch.check_share_alive()
+            except Exception:
+                pass
+
     def poll(self):
         """主循环轮询：每 15ms 检查活动频道是否有新帧。"""
         if not self.running:
@@ -2688,6 +2861,7 @@ class ViewerApp:
         self._drain_ui_queue()          # 第 108 条（B14）：执行工作线程投递的 UI 回调
         self._sync_hotkey_notice_once()  # 热键注册结果若在 ready 前被丢弃，这里补上屏
         self._process_cred_requests()
+        self._check_share_sessions()    # B8：共享会话自行终止时自愈（最长 0.5 秒一次）
         if not self.channels:
             self._show_text("无频道")
             return
@@ -2774,14 +2948,17 @@ class ViewerApp:
             return
         self._update_status_overlay()
         try:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(rgb)
-            w, h = img.size
-            if w <= 0 or h <= 0:
+            frame_h, frame_w = frame_bgr.shape[:2]
+            if frame_w <= 0 or frame_h <= 0:
                 return
-            new_h = max(1, int(round(h * self.display_width / float(w))))
-            img = img.resize((self.display_width, new_h), Image.BILINEAR)
-            photo = ImageTk.PhotoImage(img)
+            new_h = max(1, int(round(frame_h * self.display_width / float(frame_w))))
+            # 阶段 A1（优化方案 2026-09-17）：先缩放后转换。旧链对全分辨率帧做
+            # cvtColor 再交给 PIL resize，转换输出的 99.9% 随即被丢弃——实测 1080p→854px
+            # 每帧 10.9ms → 1.5ms。INTER_AREA 自带下采样抗锯齿，画质不低于原 PIL.BILINEAR。
+            small = cv2.resize(frame_bgr, (self.display_width, new_h),
+                               interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            photo = ImageTk.PhotoImage(Image.fromarray(rgb))
             self.label.configure(image=photo, text="")
             self._photo = photo  # 保持引用，防止被垃圾回收
             self.has_frame = True
@@ -2931,12 +3108,20 @@ class ViewerApp:
         Ctrl+Alt+X / Alt+1..9。用 PostThreadMessageW(WM_QUIT) 打断消息等待。
         """
         tid = getattr(self, "_hotkey_tid", None)
-        if not tid:
-            return
-        try:
-            ctypes.windll.user32.PostThreadMessageW(int(tid), WM_QUIT, 0, 0)
-        except Exception:
-            log.debug("PostThreadMessageW(WM_QUIT) 失败", exc_info=True)
+        if tid:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(int(tid), WM_QUIT, 0, 0)
+            except Exception:
+                log.debug("PostThreadMessageW(WM_QUIT) 失败", exc_info=True)
+        else:
+            # C6（2026-09-11）：_hotkey_tid 在线程注册阶段结束才回填，启动期退出时它是
+            # None，原实现直接 return → 已注册成功的 Ctrl+Alt+X / Alt+1..9 不再注销。
+            # 这里对"已注册集合"做一次尽力注销（注册线程自己仍会在 finally 里注销）。
+            for hid in list(getattr(self, "_hotkey_registered", ()) or ()):
+                try:
+                    ctypes.windll.user32.UnregisterHotKey(None, int(hid))
+                except Exception:
+                    pass
 
     def _notify_hotkey_result(self, registered, failed):
         """主线程：把热键注册结果反映到面板提示与状态栏。
@@ -2988,42 +3173,45 @@ class ViewerApp:
 
     def _hotkey_loop(self):
         user32 = ctypes.windll.user32
-        try:
-            self._hotkey_tid = int(threading.get_native_id())
-        except Exception:
-            self._hotkey_tid = None
         registered = []
-        failed = []
-        mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT
-        for hid, vk in HOTKEY_DEFS:
-            if user32.RegisterHotKey(None, hid, mods, vk):
-                registered.append(hid)
-            else:
-                failed.append(HOTKEY_NAMES.get(hid, "热键ID %d" % hid))
-        direct_enabled = bool(self.cfg["viewer"].get("hotkeys", {}).get("direct", True))
-        if direct_enabled:
-            for i in range(9):
-                hid = HOTKEY_ID_DIRECT_BASE + i
-                if user32.RegisterHotKey(None, hid, MOD_ALT | MOD_NOREPEAT, VK_1 + i):
+        # B4：注册与配置读取整体纳入 try/finally——原实现中 `cfg["viewer"].get("hotkeys",{})`
+        # 的 AttributeError 发生在 try/finally 之前，热键线程直接死亡，刚注册成功的
+        # Ctrl+Alt+X / Ctrl+Alt+←→ 永不注销（全局热键泄漏到进程退出）。
+        try:
+            try:
+                self._hotkey_tid = int(threading.get_native_id())
+            except Exception:
+                self._hotkey_tid = None
+            failed = []
+            mods = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT
+            for hid, vk in HOTKEY_DEFS:
+                if user32.RegisterHotKey(None, hid, mods, vk):
                     registered.append(hid)
                 else:
-                    failed.append("Alt+%d 直达频道" % (i + 1))
-        self._hotkey_registered = set(registered)
-        self._hotkey_failed = list(failed)
-        if not registered:
-            log.warning("全局热键全部注册失败（可能已被其他程序占用）：%s",
-                        "、".join(failed) if failed else "未知")
-            self._post_ui(lambda: self._notify_hotkey_result([], list(failed)))
-            return
-        if failed:
-            log.warning("部分全局热键注册失败（可能已被其他程序占用）：%s", "、".join(failed))
-        else:
-            log.info("全局热键注册成功 %d 个", len(registered))
-        # 结果上屏：若此刻 mainloop 尚未 ready，回调会被 _post_ui 丢弃——
-        # poll 启动后由 _sync_hotkey_notice 补发（见 poll）。
-        self._post_ui(lambda: self._notify_hotkey_result(
-            list(registered), list(failed)))
-        try:
+                    failed.append(HOTKEY_NAMES.get(hid, "热键ID %d" % hid))
+            direct_enabled = bool(_viewer_hotkeys_cfg(self.cfg).get("direct", True))
+            if direct_enabled:
+                for i in range(9):
+                    hid = HOTKEY_ID_DIRECT_BASE + i
+                    if user32.RegisterHotKey(None, hid, MOD_ALT | MOD_NOREPEAT, VK_1 + i):
+                        registered.append(hid)
+                    else:
+                        failed.append("Alt+%d 直达频道" % (i + 1))
+            self._hotkey_registered = set(registered)
+            self._hotkey_failed = list(failed)
+            if not registered:
+                log.warning("全局热键全部注册失败（可能已被其他程序占用）：%s",
+                            "、".join(failed) if failed else "未知")
+                self._post_ui(lambda: self._notify_hotkey_result([], list(failed)))
+                return
+            if failed:
+                log.warning("部分全局热键注册失败（可能已被其他程序占用）：%s", "、".join(failed))
+            else:
+                log.info("全局热键注册成功 %d 个", len(registered))
+            # 结果上屏：若此刻 mainloop 尚未 ready，回调会被 _post_ui 丢弃——
+            # poll 启动后由 _sync_hotkey_notice 补发（见 poll）。
+            self._post_ui(lambda: self._notify_hotkey_result(
+                list(registered), list(failed)))
             msg = ctypes.wintypes.MSG()
             while True:
                 ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
@@ -3049,12 +3237,15 @@ class ViewerApp:
                                       self.switch_channel(idx))
                 except Exception:
                     log.debug("热键回调入队失败", exc_info=True)
+        except Exception:
+            log.warning("热键线程异常（已注册热键将全部注销）", exc_info=True)
         finally:
             for hid in registered:
                 try:
                     user32.UnregisterHotKey(None, hid)
                 except Exception:
                     pass
+            self._hotkey_registered = set()
             self._hotkey_tid = None
             log.debug("热键已注销 %d 个", len(registered))
 

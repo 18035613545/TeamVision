@@ -16,7 +16,10 @@ import time
 
 import logger
 import pipeline
-from common import pack_frame, pack_video
+# B5：配置数值转换与区域归一复用公共实现，避免观看端上传路径继续用裸 int()/float()。
+# C1（优化方案 2026-09-17）：这三个工具已从 host 下沉到 common——原先反向 import host
+# 会把整个共享端巨模块拖进观看端进程，且 host/viewer/share 三套 clamp 互为副本。
+from common import normalize_region, pack_frame, pack_video, safe_float, safe_int
 
 log = logger.get_logger()
 
@@ -31,26 +34,39 @@ class ScreenShareSession:
         self._stop = threading.Event()
         self._key_evt = threading.Event()
         host_cfg = ((cfg or {}).get("host", {})) if isinstance(cfg, dict) else {}
-        capture_cfg = host_cfg.get("capture", {}) or {}
-        codec_cfg = host_cfg.get("codec", {}) or {}
-        still_cfg = ((host_cfg.get("perf", {}) or {}).get("still", {})) or {}
+        host_cfg = host_cfg if isinstance(host_cfg, dict) else {}
+        capture_cfg = host_cfg.get("capture")
+        capture_cfg = capture_cfg if isinstance(capture_cfg, dict) else {}
+        codec_cfg = host_cfg.get("codec")
+        codec_cfg = codec_cfg if isinstance(codec_cfg, dict) else {}
+        perf_cfg = host_cfg.get("perf")
+        perf_cfg = perf_cfg if isinstance(perf_cfg, dict) else {}
+        still_cfg = perf_cfg.get("still")
+        still_cfg = still_cfg if isinstance(still_cfg, dict) else {}
+        # 第 100 条 / B5（2026-09-11）：配置数值一律走安全转换。原实现用裸 int()/float()，
+        # 配置里出现字符串数字（"fps": "30"、"monitor": "1"）就在 __init__ 抛
+        # ValueError/TypeError，用户看到的是"共享启动失败: invalid literal for int()"这种
+        # 与真实问题无关的提示。三端（host/viewer/share）现统一走 common.safe_int/
+        # safe_float（C1 下沉），唯独观看端上传路径此前漏了。
         self._backend = capture_cfg.get("backend", "mss")
-        self._monitor = int(capture_cfg.get("monitor", 1))
-        self._region = capture_cfg.get("region")
-        self._fps = max(1, int(host_cfg.get("fps", 30)))
-        self._quality = int(host_cfg.get("jpeg_quality", 80))
-        self._target_width = int(codec_cfg.get("target_width", 854) or 0)
+        self._monitor = safe_int(capture_cfg.get("monitor", 1), 1, 1)
+        # region 必须归一（缺键/负值区域会直达 CaptureManager.grab，每帧 KeyError 被吞成
+        # None → "共享开着但对方永远看不到画面"，且无任何提示）
+        self._region = normalize_region(capture_cfg.get("region"))
+        self._fps = safe_int(host_cfg.get("fps", 30), 30, 1, 240)
+        self._quality = safe_int(host_cfg.get("jpeg_quality", 80), 80, 1, 100)
+        self._target_width = safe_int(codec_cfg.get("target_width", 854) or 0, 854, 0)
         self._encoder_sel = codec_cfg.get("encoder", "auto")
-        self._bitrate = int(codec_cfg.get("bitrate_kbps", 2500)) * 1000
-        self._keyint = max(1, int(codec_cfg.get("keyint", 60)))
+        self._bitrate = safe_int(codec_cfg.get("bitrate_kbps", 2500), 2500, 64) * 1000
+        self._keyint = safe_int(codec_cfg.get("keyint", 60), 60, 1, 3600)
         self._preset = codec_cfg.get("preset", "") or ""
         self._still_enabled = bool(still_cfg.get("enabled", False))
-        probe_fps = max(1, int(still_cfg.get("probe_fps", 5)))
+        probe_fps = safe_int(still_cfg.get("probe_fps", 5), 5, 1, 240)
         self._probe_interval = 1.0 / probe_fps
-        still_frames = max(1, int(still_cfg.get("still_frames", 3)))
+        still_frames = safe_int(still_cfg.get("still_frames", 3), 3, 1, 600)
         self._quiet_s = still_frames * self._probe_interval  # 单位秒（第 87 条：旧名 _ms 名不副实）
-        self._point_thr = int(still_cfg.get("point_thr", 10))
-        self._ratio_thr = float(still_cfg.get("ratio_thr", 0.005))
+        self._point_thr = safe_int(still_cfg.get("point_thr", 10), 10, 0, 255)
+        self._ratio_thr = safe_float(still_cfg.get("ratio_thr", 0.005), 0.005, 0.0, 1.0)
         self._cap = capture
         self._cap_owned = capture is None
         # 第 110 条（阶段 2）：编码器生命周期与 JPEG 回退改由 pipeline.FrameEncoder
@@ -61,6 +77,9 @@ class ScreenShareSession:
             target_width=self._target_width, quality=self._quality, name=name,
             on_build=self._on_encoder_built)
         self._thread = None
+        # B8：会话自行终止的原因。Channel 检测到 not alive 时据此在状态栏说明原因，
+        # 而不是让用户以为"还在共享"（原实现既不通知对端也不通知本端 UI）。
+        self.exit_reason = None
 
     # ---------- 生命周期 ----------
 
@@ -69,6 +88,7 @@ class ScreenShareSession:
         if self._thread is not None and self._thread.is_alive():
             return self
         self._stop.clear()
+        self.exit_reason = None
         self._thread = threading.Thread(
             target=self._run, name="share-upload", daemon=True)
         self._thread.start()
@@ -125,6 +145,7 @@ class ScreenShareSession:
         # 直接报错停止，由 Channel 层提示用户，而不是静默假活。
         if not src.working():
             log.error("频道[%s] 共享采集器无可用后端（dxgi/mss 均失败），已停止", self._name)
+            self.exit_reason = "采集后端不可用（dxgi/mss 均失败）"
             self._close_resources()
             return
         interval = 1.0 / self._fps
@@ -167,6 +188,9 @@ class ScreenShareSession:
                 if wait - elapsed > 0:
                     time.sleep(wait - elapsed)
         finally:
+            # B8：非主动停止（异常/采集链路失效）时留下原因，供 Channel 上报 UI 与对端
+            if self.exit_reason is None and not self._stop.is_set():
+                self.exit_reason = "上传线程意外结束（采集或编码链路失效）"
             self._close_resources()
 
     def _close_resources(self):
@@ -256,5 +280,6 @@ class ScreenShareSession:
             return True
         except OSError as e:
             log.warning("频道[%s] 共享发送失败，已停止: %s", self._name, e)
+            self.exit_reason = "发送失败（连接已断）: %s" % e
             self._stop.set()
             return False

@@ -7,6 +7,7 @@
 
 import logging
 import queue
+import threading
 import tkinter as tk
 from tkinter import ttk
 
@@ -77,11 +78,6 @@ def _monitor_labels(rects):
     return ["%d: %s (%dx%d)" % (i, "全部屏幕" if i == 0 else "显示器 %d" % i,
                                m["width"], m["height"])
             for i, m in enumerate(rects)]
-
-
-def list_monitors():
-    """枚举本机显示器（mss 语义），返回 ["0: 全部屏幕 (WxH)", "1: 显示器 1 (WxH)", ...]。"""
-    return _monitor_labels(list_monitor_rects())
 
 
 class HostConsole:
@@ -166,7 +162,7 @@ class HostConsole:
         tk.Label(addr_row, text="公网地址", bg=COL_BG, fg=COL_DIM,
                  font=("Microsoft YaHei", 9)).pack(side="left")
         self._addr_var = tk.StringVar(
-            value=self.runtime.cfg["host"].get("frp", {}).get("public_addr", ""))
+            value=self._frp_cfg().get("public_addr", ""))
         self._addr_entry = tk.Entry(addr_row, textvariable=self._addr_var, bg=COL_CTRL,
                                     fg=COL_FG, insertbackground=COL_FG, relief="flat",
                                     font=("Consolas", 10))
@@ -178,7 +174,7 @@ class HostConsole:
         self._frp_status = tk.Label(frp_card, text="已停止", bg=COL_CARD, fg=COL_DIM,
                                     font=("Microsoft YaHei", 9))
         self._frp_status.pack(anchor="w", padx=10)
-        frp = self.runtime.cfg["host"].get("frp", {})
+        frp = self._frp_cfg()
         self._frp_auto_var = tk.BooleanVar(value=bool(frp.get("auto_start", False)))
         self._frp_token_var = tk.StringVar(value=frp.get("token", ""))
         self._frp_tunnel_var = tk.StringVar(value=frp.get("tunnel_ids", ""))
@@ -199,7 +195,7 @@ class HostConsole:
 
         # ---------- 传输参数区 ----------
         trans_card = self._card(self.root, "传输参数")
-        host_cfg = self.runtime.cfg["host"]
+        host_cfg = self._host_cfg()
         self._fps_var = tk.StringVar(value=str(host_cfg.get("fps", 60)))
         self._quality_var = tk.StringVar(value=str(host_cfg.get("jpeg_quality", 80)))
         self._scale_var = tk.StringVar(value=str(host_cfg.get("scale", 1.0)))
@@ -267,7 +263,8 @@ class HostConsole:
 
         # ---------- 采集源区 ----------
         cap_card = self._card(self.root, "采集源")
-        cap = self.runtime.cfg["host"].get("capture", {})
+        cap = self._host_cfg().get("capture")
+        cap = cap if isinstance(cap, dict) else {}
         row = tk.Frame(cap_card, bg=COL_CARD)
         row.pack(fill="x", padx=10, pady=2)
         tk.Label(row, text="显示器", width=14, bg=COL_CARD, fg=COL_DIM,
@@ -310,6 +307,39 @@ class HostConsole:
         self._button(footer, "退出", self._on_quit, accent=True).pack(side="right")
 
     # ---------- 工具 ----------
+
+    def _host_cfg(self):
+        """安全取 host 配置对象（C10，2026-09-11）。
+
+        `self.runtime.cfg["host"].get(...)` 在 host 被手改成非对象时抛 AttributeError，
+        `HostConsole.__init__` 失败 → `host.main()` 捕获后**静默回退命令行模式**，
+        用户看到的是"双击 exe 没有界面/没有反应"，真实原因却是配置格式。
+        """
+        cfg = getattr(self.runtime, "cfg", None)
+        host = cfg.get("host") if isinstance(cfg, dict) else None
+        return host if isinstance(host, dict) else {}
+
+    def _frp_cfg(self):
+        """安全取 host.frp 配置对象，必要时就地补一个空对象（C10）。"""
+        host = self._host_cfg()
+        frp = host.get("frp")
+        if not isinstance(frp, dict):
+            frp = {}
+            try:
+                host["frp"] = frp
+            except Exception:
+                pass
+        return frp
+
+    def _post_ui(self, fn):
+        """把回调调度回 Tk 主线程（C17：隧道启停不得在主线程内同步阻塞）。"""
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            try:
+                fn()
+            except Exception:
+                pass
 
     def _monitor_label(self, idx):
         for s in self.monitors:
@@ -359,7 +389,7 @@ class HostConsole:
             self._set_status("暂无公网地址，请先在 frpc 区填写", error=True)
             return
         # 顶部地址编辑后也同步到配置与 frpc 区，避免只复制不保存
-        frp = self.runtime.cfg["host"].setdefault("frp", {})
+        frp = self._frp_cfg()
         frp["public_addr"] = addr
         save_config(self.runtime.cfg, "host")
         self._frp_addr_var.set(addr)
@@ -368,18 +398,44 @@ class HostConsole:
         self._set_status("公网地址已复制到剪贴板并保存")
 
     def _frp_start(self):
-        frp = self.runtime.cfg["host"].setdefault("frp", {})
+        """保存隧道配置并启动 frpc。
+
+        C17（2026-09-11）：`FrpManager.start()` 会阻塞到"轮询 1 秒确认 frpc 没有秒退"，
+        在 Tk 回调里同步执行会让控制台冻结约 1 秒（日志区/客户端列表/性能区全部停更），
+        与项目自己在共享端/观看端反复强调并已修复的"不在主线程做阻塞操作"约定不一致。
+        这里放进工作线程，结果经 `_post_ui` 回主线程更新状态栏。
+        """
+        frp = self._frp_cfg()
         frp["auto_start"] = bool(self._frp_auto_var.get())
         frp["token"] = self._frp_token_var.get().strip()
         frp["tunnel_ids"] = self._frp_tunnel_var.get().strip()
         frp["public_addr"] = self._frp_addr_var.get().strip()
         save_config(self.runtime.cfg, "host")
-        ok, msg = self.runtime.frp.start()
-        self._set_status(msg, error=not ok)
+        self._set_status("正在启动隧道…")
+        frp_mgr = self.runtime.frp
+
+        def _work():
+            try:
+                ok, msg = frp_mgr.start()
+            except Exception as e:          # 兜底：工作线程异常也不得静默丢失原因
+                ok, msg = False, "启动 frpc 失败: %s" % e
+            self._post_ui(lambda: self._set_status(msg, error=not ok))
+
+        threading.Thread(target=_work, name="frp-start", daemon=True).start()
 
     def _frp_stop(self):
-        msg = self.runtime.frp.stop()
-        self._set_status(msg or "frpc 已停止")
+        """停止 frpc（C17：`stop()` 最长阻塞 5 秒，同样移出主线程）。"""
+        self._set_status("正在停止隧道…")
+        frp_mgr = self.runtime.frp
+
+        def _work():
+            try:
+                msg = frp_mgr.stop()
+            except Exception as e:
+                msg = "停止 frpc 失败: %s" % e
+            self._post_ui(lambda: self._set_status(msg or "frpc 已停止"))
+
+        threading.Thread(target=_work, name="frp-stop", daemon=True).start()
 
     def _capture_save(self):
         monitor = 1
@@ -430,7 +486,7 @@ class HostConsole:
         监听地址只落盘，需重启共享端才生效（监听 socket 在启动时绑定一次）；重启前
         在状态栏明确说明，避免用户以为「改了没用」。
         """
-        host = self.runtime.cfg["host"]
+        host = self._host_cfg()
         try:
             fps = int(self._fps_var.get().strip())
             quality = int(self._quality_var.get().strip())
@@ -464,8 +520,11 @@ class HostConsole:
             self.runtime.slot["quality"] = quality
             self.runtime.slot["scale"] = scale
         bound = getattr(self.runtime, "bound_addr", None) or "0.0.0.0"
+        # A0：回环双栈时 bound_addr 会带 "（+[::1]）" 后缀（如实反映两个监听地址），
+        # 比较监听地址是否变化时必须取基础地址，否则每次保存都会误报"需重启生效"。
+        bound_base = str(bound).split("（")[0].strip()
         restart_hint = ""
-        if listen != bound:
+        if listen != bound_base:
             restart_hint = "；监听地址改动需重启共享端生效"
         self._set_status(
             "传输设置已应用：监听=%s，注册=%s，fps=%d，质量=%d，缩放=%.2f，自适应=%s，准入=%s%s" % (
@@ -548,17 +607,43 @@ class HostConsole:
             self._frp_status.configure(text="运行中", fg=COL_ONLINE)
         else:
             self._frp_status.configure(text="已停止", fg=COL_OFFLINE)
-        # 客户端列表
+        # 客户端列表（C18，2026-09-11：增量刷新）
+        # 原实现每 500ms `tree.delete(*tree.get_children())` 后整表重插——行选中丢失、
+        # 滚动位置被拽回顶部、客户端多时长期可见闪烁。第 115 条/C4 已把**观看端**的两棵树
+        # 改成增量刷新，这张共享端客户端表当时没同步。现在行数与各行值都没变时完全不动，
+        # 只有值变化的行走 tree.item 更新。
         tree = self._client_tree
-        tree.delete(*tree.get_children())
-        for i, c in enumerate(snap["clients"]):
-            tree.insert("", "end", iid=str(i), values=(
+        rows = []
+        for c in snap["clients"]:
+            rows.append((
                 c.get("username") or "—",
                 c["addr"],
                 self._fmt_uptime(c["uptime_s"]),
                 "%.0f KB/s" % c["rate_kbps"],
                 "%.1f MB" % c["total_mb"],
             ))
+        cached = getattr(self, "_client_rows_cache", None)
+        if cached is None or len(cached) != len(rows):
+            try:
+                y_top = tree.yview()[0]
+            except Exception:
+                y_top = 0.0
+            tree.delete(*tree.get_children())
+            for i, values in enumerate(rows):
+                tree.insert("", "end", iid=str(i), values=values)
+            try:
+                if y_top:
+                    tree.yview_moveto(y_top)
+            except Exception:
+                pass
+        else:
+            for i, values in enumerate(rows):
+                if values != cached[i]:
+                    try:
+                        tree.item(str(i), values=values)
+                    except Exception:
+                        pass
+        self._client_rows_cache = rows
         # 性能
         p = snap["perf"]
         codec_txt = ""

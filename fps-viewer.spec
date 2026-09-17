@@ -18,10 +18,24 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 阶段 B1（优化方案 2026-09-17）：同 fps-host.spec——排除用不到的重模块做防御；
+    # viewer.py 的 UI 同样依赖 tkinter，不得排除。
+    excludes=[
+        'unittest', 'doctest', 'pydoc', 'test', 'lib2to3',
+        'distutils', 'setuptools', 'pkg_resources', 'pip', 'wheel',
+        'IPython', 'jupyter', 'pytest',
+        'matplotlib', 'scipy', 'pandas', 'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'wx',
+    ],
     noarchive=False,
     optimize=0,
 )
+
+# 阶段 B1（优化方案 2026-09-17）：剔除明确用不到的大二进制，理由见 fps-host.spec——
+# cv2 的 FFMPEG videoio 后端（~31MB）与 Pillow 的 AVIF/WebP 插件（~8MB）。
+_B1_PRUNE = ('cv2\\opencv_videoio_ffmpeg', 'pil\\_avif', 'pil\\_webp')
+a.binaries = [b for b in a.binaries
+              if not any(p in b[0].lower().replace('/', '\\') for p in _B1_PRUNE)]
+
 pyz = PYZ(a.pure)
 
 # 第 131 条：由 onefile 改为 onedir（COLLECT），理由见 fps-host.spec——

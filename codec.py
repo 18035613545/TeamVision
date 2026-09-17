@@ -27,8 +27,7 @@ import time
 
 from fractions import Fraction
 
-import numpy as np
-
+# 注（C9）：不再 import numpy——本模块只处理字节/帧对象，无任何 np.* 调用。
 try:
     import av
     from av.video.frame import PictureType
@@ -371,6 +370,11 @@ class VideoDecoder:
         self._codec = codec
         self._ctx = None
         self.decoded_frames = 0
+        # B6（2026-09-11）：内部复位标志。decode() 因缺参考帧/坏 NAL 抛异常时会
+        # flush_buffers()，此时参考帧链已被清空，但调用方（viewer 的 _got_key）无从得知，
+        # 后续某个 P 帧若被解出就会跳过"仅关键帧后显示"门控被直接贴到悬浮窗（随机花屏）。
+        # 这里把"解码器已复位、需要等下一个关键帧"显式告诉调用方。
+        self.needs_keyframe = False
         self._init_ctx()
 
     def _decoder_name(self):
@@ -413,11 +417,17 @@ class VideoDecoder:
         if self._ctx is not None:
             try:
                 self._ctx.flush_buffers()
+                self.needs_keyframe = False
                 return
             except Exception:
                 pass
         self.close()
         self._init_ctx()
+        self.needs_keyframe = False
+
+    def clear_needs_keyframe(self):
+        """B6：调用方（viewer）在按标志作废显示门控后清除标志。"""
+        self.needs_keyframe = False
 
     def decode(self, annexb):
         """解码一段 Annex-B NAL，返回 list[BGR ndarray]；失败/缺参考帧返回 []。"""
@@ -427,6 +437,9 @@ class VideoDecoder:
             frames = self._ctx.decode(av.Packet(annexb))
         except Exception:
             # 缺参考帧 / 非法 NAL：重置解码器，等待下一关键帧
+            # B6：显式置位 needs_keyframe——调用方据此把"已有关键帧起点"的门控作废，
+            # 否则后续解出的 P 帧会以脏参考被直接显示（随机花屏/拖影）。
+            self.needs_keyframe = True
             try:
                 self._ctx.flush_buffers()
             except Exception:

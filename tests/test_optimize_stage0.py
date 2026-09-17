@@ -22,6 +22,8 @@ import time
 import unittest
 from unittest import mock
 
+import numpy as np
+
 import common
 import host
 import viewer
@@ -325,7 +327,8 @@ class TestTkImageLifetime(unittest.TestCase):
         ch.name = "alice"
         ch.status = "receiving"
         ch.frame_serial = 1
-        ch.last_frame = mock.MagicMock()
+        # 真实小帧：阶段 A1 起先走 cv2.resize（真实实现），cvtColor 随后被 patch 抛异常。
+        ch.last_frame = np.zeros((4, 4, 3), np.uint8)
         app.channels = [ch]
 
         with mock.patch.object(viewer.cv2, "cvtColor",

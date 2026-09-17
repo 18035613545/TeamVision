@@ -11,10 +11,14 @@ OSError 接住。「有限超时能中断被阻塞的 sendall」是 SO_SNDTIMEO 
 仓库帧发送路径已在生产依赖；Windows 回环会立即吸入任意大 sendall（实测 24MB
 0.002s 返回、对端可完整 drain），无法用缓冲耗尽造真实阻塞。
 
+C1（2026-09-11）：收紧的超时必须**在 finally 里还原**——接收循环的"阻塞基线"是
+viewer._send_locked / share._send_msg 都遵守的不变量（第 96 条）。旧实现在
+send_ctrl / _client_sender_loop 里把 socket timeout 永久改成 2.0 且从不还原。
+
 这里用**纯内存 FakeSocket**（不碰真实 socket/FD）确定性地验证代码改动本身：
-send_ctrl 把 timeout 从 None 切成有限值并仍完成发送，且两个真实调用方在
-send_ctrl 抛 socket.timeout 时不崩、不误拆健康连接。避免真实 socketpair 的
-TIME_WAIT 残留扰动同套件里的多连接集成测试。
+send_ctrl 在 sendall 期间把 timeout 从 None 切成有限值、发送完成后还原为原基线，
+且两个真实调用方在 send_ctrl 抛 socket.timeout 时不崩、不误拆健康连接。避免真实
+socketpair 的 TIME_WAIT 残留扰动同套件里的多连接集成测试。
 """
 import socket
 import threading
@@ -29,6 +33,7 @@ class FakeSocket:
     def __init__(self):
         self._timeout = None
         self.sent = []
+        self.timeouts_during_send = []   # C1：记录 sendall 期间生效的超时
 
     def settimeout(self, t):
         self._timeout = t
@@ -37,6 +42,7 @@ class FakeSocket:
         return self._timeout
 
     def sendall(self, data):
+        self.timeouts_during_send.append(self._timeout)
         self.sent.append(data)
 
 
@@ -46,6 +52,8 @@ class RuntimeStub:
     def __init__(self, clients=None):
         self.clients_lock = threading.Lock()
         self._roster_lock = threading.Lock()  # 第 55 条：broadcast_roster 串行化锁
+        self._roster_sending = False          # 阶段 A2：单发送者 + 脏标记
+        self._roster_dirty = False
         self.clients = clients or {}
 
 
@@ -57,15 +65,56 @@ class TestSendCtrlTimeout(unittest.TestCase):
         self.assertIsNone(s.gettimeout())
         info = host.ClientInfo(("127.0.0.1", 1), "tester")
         info.send_ctrl(s, {"action": "pong", "t": 1})
-        self.assertEqual(s.gettimeout(), 2.0)  # 不再是无限阻塞
+        # C1：sendall 期间收紧到有限值（不再是无限阻塞）……
+        self.assertEqual(s.timeouts_during_send, [2.0])
+        # ……发送完成后还原接收循环的阻塞基线（第 96 条不变量）
+        self.assertIsNone(s.gettimeout())
         self.assertEqual(len(s.sent), 1)       # 消息仍被实际发出
 
     def test_custom_timeout_is_passed_through(self):
         s = FakeSocket()
         info = host.ClientInfo(("127.0.0.1", 2), "tester")
         info.send_ctrl(s, {"action": "cap", "multiview": True}, send_timeout=0.5)
-        self.assertEqual(s.gettimeout(), 0.5)
+        self.assertEqual(s.timeouts_during_send, [0.5])   # sendall 期间用的是 0.5
+        self.assertIsNone(s.gettimeout())                # 基线 None 被还原
         self.assertEqual(len(s.sent), 1)
+
+    def test_non_none_baseline_is_restored(self):
+        # 基线不是 None 时也必须还原成原值（C1 的核心不变量）
+        s = FakeSocket()
+        s.settimeout(7.5)
+        info = host.ClientInfo(("127.0.0.1", 3), "tester")
+        info.send_ctrl(s, {"action": "pong", "t": 1}, send_timeout=1.0)
+        self.assertEqual(s.timeouts_during_send, [1.0])
+        self.assertEqual(s.gettimeout(), 7.5)
+
+    def test_sender_loop_restores_baseline(self):
+        # 帧发送线程同样不得把 2.0 永久留在共享 socket 上（C1）
+        s = FakeSocket()
+        s.settimeout(None)
+        info = host.ClientInfo(("127.0.0.1", 4), "tester")
+        info.send_queue.put(b"frame")
+        info._sender_active = True
+
+        class _RT:
+            stop_event = threading.Event()
+
+        done = threading.Event()
+
+        def _stop_after_send():
+            for _ in range(200):
+                if s.sent:
+                    break
+                threading.Event().wait(0.01)
+            done.set()
+            # 让发送线程退出循环
+            info.stop_sender()
+
+        threading.Thread(target=_stop_after_send, daemon=True).start()
+        host._client_sender_loop(s, info, _RT())
+        self.assertTrue(done.wait(3.0))
+        self.assertEqual(s.timeouts_during_send, [2.0])
+        self.assertIsNone(s.gettimeout())
 
     def test_socket_timeout_is_oserror_subclass(self):
         # 调用方靠 except OSError 接住超时，这是整条容错链的前提

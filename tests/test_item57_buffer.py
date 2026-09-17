@@ -4,15 +4,19 @@
 这些测试是 hermetic 的（无真实 socket、无线程），直接复刻 host.py/viewer.py recv 循环
 的解析模式，锁定三条不变量：
   1. parse_message 无论缓冲区是 bytes 还是 bytearray，都返回 bytes payload；
-  2. 该 bytes payload 喂回 parse_video/unpack_frame → pack_video/pack_frame 的中继再打包
+  2. 该 bytes payload 喂回 parse_video → pack_video/pack_frame 的中继再打包
      路径不会触发 `bytes + bytearray` TypeError；
   3. bytearray + `del rx_buf[:consumed]` 的 recv 循环模式能正确切分跨 chunk 边界的多消息流。
+
+C4（优化方案 2026-09-17）：原 common.unpack_frame（零生产调用者）已删除，JPEG 帧
+payload 的拆解直接按格式（[8 字节时间戳][JPEG]）展开。
 """
+import struct
 import unittest
 
 from common import (
     MAX_PAYLOAD, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
-    parse_message, parse_video, pack_video, pack_frame, unpack_frame, pack_msg,
+    parse_message, parse_video, pack_video, pack_frame, pack_msg,
 )
 
 
@@ -53,7 +57,7 @@ class TestPayloadIsAlwaysBytes(unittest.TestCase):
         self.assertIs(type(payload), bytes)
 
     def test_relay_repack_does_not_raise_typeerror(self):
-        # host 中继上行帧：parse_message → parse_video/unpack_frame → pack_video/pack_frame。
+        # host 中继上行帧：parse_message → parse_video（视频）/手工拆帧头（JPEG）→ 再打包。
         # 若 payload 是 bytearray，pack_video 内 `bytes((MSG_VIDEO,)) + ... + video_bytes`
         # 会抛 TypeError。用 bytearray 缓冲取出的 payload 走完整再打包，断言往返一致。
         vid_raw = pack_video(b"\x00\x00\x00\x01KEY", ts=42, keyframe=True)
@@ -64,7 +68,8 @@ class TestPayloadIsAlwaysBytes(unittest.TestCase):
 
         frm_raw = pack_frame(b"\xff\xd8BODY\xff\xd9", ts=7)
         _, _, frm_payload = parse_message(bytearray(frm_raw))
-        fts, jpeg = unpack_frame(frm_payload)
+        fts = struct.unpack(">Q", frm_payload[:8])[0]   # JPEG payload = [8 字节时间戳][JPEG]
+        jpeg = frm_payload[8:]
         self.assertEqual(pack_frame(jpeg, ts=fts), frm_raw)
 
 

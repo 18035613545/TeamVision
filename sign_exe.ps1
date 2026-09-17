@@ -124,13 +124,32 @@ function Invoke-SignOne([string]$path, $cert) {
     if ($result.Status -in @('Valid', 'UnknownError')) {
         # UnknownError 常见于自签未加入信任链；签名本身已写入
         Write-Host "    Status=$($result.Status)  $($result.StatusMessage)"
+    } elseif ($result.Status -eq 'NotSigned') {
+        throw "签名失败（仍为 NotSigned）: $($result.StatusMessage)"
+    } else {
+        Write-Host "    Status=$($result.Status)  $($result.StatusMessage)" -ForegroundColor Yellow
+    }
+
+    # 第 132 条（2026-09-11）：签名后必须**复核文件本身**，不能只看 Set-AuthenticodeSignature
+    # 的返回值。实测在 140MB 的安装包上带时间戳签名会得到 HashMismatch——签名块已写入，
+    # 但文件哈希与签名不符，而调用方按返回状态判为成功、静默收尾；用户拿到的是验签失败、
+    # 甚至会被 SmartScreen/杀软拦下的安装包。这里复核一次，失败则去掉时间戳重试。
+    $verify = Get-AuthenticodeSignature -FilePath $path
+    if ($verify.Status -ne 'Valid' -and $splat.ContainsKey('TimestampServer')) {
+        Write-Host "    复核结果为 $($verify.Status)，改为不带时间戳重签…" -ForegroundColor Yellow
+        $splat.Remove('TimestampServer')
+        Set-AuthenticodeSignature @splat | Out-Null
+        $verify = Get-AuthenticodeSignature -FilePath $path
+    }
+    if ($verify.Status -eq 'NotSigned') {
+        throw "签名复核失败（仍为 NotSigned）: $($verify.StatusMessage)"
+    }
+    if ($verify.Status -in @('Valid', 'UnknownError')) {
+        Write-Host "    复核 Status=$($verify.Status)  $($verify.StatusMessage)"
         return $true
     }
-    if ($result.Status -eq 'NotSigned') {
-        throw "签名失败（仍为 NotSigned）: $($result.StatusMessage)"
-    }
-    Write-Host "    Status=$($result.Status)  $($result.StatusMessage)" -ForegroundColor Yellow
-    return $true
+    Write-Host "    复核 Status=$($verify.Status)  $($verify.StatusMessage)" -ForegroundColor Red
+    return $false
 }
 
 # ---------- main ----------
