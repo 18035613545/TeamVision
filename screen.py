@@ -10,8 +10,8 @@ import sys
 import time
 
 import cv2
-import numpy as np
 import mss
+import numpy as np
 
 import logger
 
@@ -222,9 +222,11 @@ class CaptureManager:
         try:
             if self._effective == "dxgi" and self._camera is not None:
                 if self.region:
-                    l = int(self.region["left"]); t = int(self.region["top"])
-                    r = l + int(self.region["width"]); b = t + int(self.region["height"])
-                    frame = self._camera.grab(region=(l, t, r, b))
+                    x0 = int(self.region["left"])
+                    y0 = int(self.region["top"])
+                    frame = self._camera.grab(
+                        region=(x0, y0, x0 + int(self.region["width"]),
+                                y0 + int(self.region["height"])))
                 else:
                     frame = self._camera.grab()
                 return frame  # dxcam 返回 BGR ndarray（已显式 output_color="BGR"）或 None（无新帧）

@@ -1,0 +1,28 @@
+# E1（实现方案 §11.1）：默认回归进 CI。约定维持 run_tests.bat 的只匹配 test*.py
+# （e2e_*/soak_*/stress_* 不进 CI）。依赖显示环境的用例（Tk 根窗口）自带 SkipTest
+# 兜底，headless 上跳过、本机全量仍会跑。
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Lint (E2 阶段范围：核心三文件)
+        run: |
+          pip install ruff
+          ruff check common.py codec.py screen.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p "test*.py" -v

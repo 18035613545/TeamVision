@@ -509,7 +509,7 @@ def recv_exact(sock, n, deadline=None):
         if deadline is not None:
             left = deadline - time.monotonic()
             if left <= 0:
-                raise socket.timeout("接收总时限已耗尽")
+                raise TimeoutError("接收总时限已耗尽")
             sock.settimeout(left)
         chunk = sock.recv(remaining)
         if not chunk:
@@ -552,7 +552,7 @@ def parse_addr(addr_str, default_port=5700):
         try:
             port = int(port_str)
         except ValueError:
-            raise ValueError("端口无效: %s" % port_str)
+            raise ValueError("端口无效: %s" % port_str) from None
         if not (1 <= port <= 65535):
             raise ValueError("端口超出范围 1~65535: %d" % port)
         return host, port
@@ -927,7 +927,7 @@ def load_config():
                 pass
         return copy.deepcopy(DEFAULT_CONFIG)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
         if not isinstance(cfg, dict):
             raise ValueError("config.json 顶层不是对象（实际 %s）" % type(cfg).__name__)
@@ -989,7 +989,7 @@ def save_config(cfg, section=None):
             base = {}
             if os.path.exists(path):
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
+                    with open(path, encoding="utf-8") as f:
                         base = json.load(f)
                     if not isinstance(base, dict):
                         base = {}

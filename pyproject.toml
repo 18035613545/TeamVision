@@ -1,0 +1,23 @@
+# E2（实现方案 §11.2）：工程化基线。ruff 先只严格卡协议/采集/编解码三个核心文件
+# （09-17 裁决：存量文件不一次全卡）——强制范围由 CI 的调用清单决定
+# （`ruff check common.py codec.py screen.py`），不在配置里用 per-file-ignores
+# 反向豁免（ruff 对多条匹配的 per-file-ignores 取并集，兜底 "*.py" 会把核心文件
+# 一起豁免掉）。mypy 从 common.py 起步。
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# E/W 风格、F 未定义名、I import 排序、UP py310 惯用法、B 潜在缺陷
+select = ["E", "F", "W", "I", "UP", "B"]
+# 本仓库中文注释/文档串普遍较长，行长交给 review 而非工具
+ignore = [
+    "E501",   # 行宽：中文注释/文档串普遍较长
+    "UP031",  # % 格式 → f-string：全仓统一 % 风格（日志/异常消息同款），不做批量改写
+    "UP009",  # utf-8 声明：每个源文件首行 `# -*- coding: utf-8 -*-` 是本仓库既有约定
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["common.py"]
+ignore_missing_imports = true
