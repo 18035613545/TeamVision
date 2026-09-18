@@ -59,14 +59,14 @@ echo.
 
 rem ===== [4/4] 对安装包做 Authenticode 签名 =====
 echo [4/4] 签名安装包 ...
-if exist "dist\TeamVision-Setup-1.3.0.exe" (
+if exist "dist\TeamVision-Setup-1.4.0.exe" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1" ^
-        -Files "dist\TeamVision-Setup-1.3.0.exe"
+        -Files "dist\TeamVision-Setup-1.4.0.exe"
     if errorlevel 1 (
         echo [警告] 安装包签名失败，产物仍可用。
     )
 ) else (
-    echo [警告] 未找到 dist\TeamVision-Setup-1.3.0.exe，跳过签名。
+    echo [警告] 未找到 dist\TeamVision-Setup-1.4.0.exe，跳过签名。
 )
 echo.
 echo ============================================

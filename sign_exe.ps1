@@ -18,7 +18,7 @@ param(
     [string[]]$Files = @(
         'dist\fps-host\fps-host.exe',
         'dist\fps-viewer\fps-viewer.exe',
-        'dist\TeamVision-Setup-1.3.0.exe'
+        'dist\TeamVision-Setup-1.4.0.exe'
     ),
     [string]$PfxPath = $env:TEAMVIEW_PFX,
     [string]$PfxPassword = $env:TEAMVIEW_PWD,
