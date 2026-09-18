@@ -17,7 +17,10 @@ kind 标记让接收端无需猜测即可区分帧与控制消息（ping/pong �
 上行帧视为共享声明，下行帧按 watch 源订阅路由；全部向后兼容（未知 action 忽略）。
 """
 
+import base64
 import copy
+import hashlib
+import hmac
 import json
 import os
 import select
@@ -41,10 +44,11 @@ MAGIC_CLIENT = b"FS02"
 #: 服务端握手魔数
 MAGIC_SERVER = b"OK02"
 
-#: C2（实现方案 §7）：协议版本单一载体。当前线上语义 = FS02 握手（v2.1）；
-#: D1（挑战-应答认证）落地时升 (2, 2)。握手 JSON 已随带 proto 字段，
-#: 服务端主判仍用 MAGIC（旧客户端拒绝行为不变）。
-PROTOCOL_VERSION = (2, 1)
+#: C2（实现方案 §7）：协议版本单一载体。v2.2 = D1 挑战-应答认证（chal/auth_proof/
+#: reg_proof）上线；握手主判仍是 MAGIC（旧客户端拒绝行为不变），proto 字段随认证
+#: 期 CTRL 消息携带，服务端据此判断对端能力（观看端以 auth_result.proto ≥ 2.2
+#: 作为"可走挑战流"的探测结果）。次版本向后兼容：2.1 客户端仍可走 legacy 通道。
+PROTOCOL_VERSION = (2, 2)
 
 #: C2 §7 第 3 步：proto 强校验开关——"先只加不启用"。当前唯一版本载体仍是
 #: FS02 MAGIC；置 True 后服务端会拒绝 proto 不兼容的客户端（D1 的翻转点）。
@@ -86,6 +90,37 @@ class Act:
     PEERS = "peers"
     CAP = "cap"
     CAP_PROBE = "cap_probe"
+    # D1（实现方案 §10）：挑战-应答认证。chal=服务端下发 nonce（+salt/iter），
+    # auth_proof/reg_proof=观看端以 HMAC(dk, nonce) 应答，口令永不上网。
+    CHAL = "chal"
+    AUTH_PROOF = "auth_proof"
+    REG_PROOF = "reg_proof"
+
+
+#: D1：PBKDF2 参数单一真源（host.AccountManager 与 viewer 挑战流共用，
+#: 保证既有账户（10 万次迭代派生）无需迁移即可继续登录）。
+PBKDF2_ITERATIONS = 100_000
+
+
+def derive_dk(password, salt_hex, iterations=PBKDF2_ITERATIONS):
+    """由口令与盐派生密钥 dk（bytes）。salt 为十六进制字符串。"""
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                               bytes.fromhex(salt_hex), iterations)
+
+
+def challenge_mac(dk, nonce):
+    """挑战-应答核心：proof = HMAC-SHA256(key=dk, msg=nonce)。"""
+    return hmac.new(dk, nonce, hashlib.sha256).digest()
+
+
+def b64e(data):
+    """bytes → base64 字符串（JSON 消息里传 nonce/proof 用）。"""
+    return base64.b64encode(data).decode("ascii")
+
+
+def b64d(text):
+    """base64 字符串 → bytes；非法输入抛 binascii.Error（调用方按协议错误处理）。"""
+    return base64.b64decode(text.encode("ascii"), validate=True)
 
 
 #: 消息 kind：JPEG 帧 / 控制消息 / H.264 视频帧
@@ -199,6 +234,12 @@ DEFAULT_CONFIG = {
             #   "bootstrap" = 只有第一个账户可以自助注册，此后注册关闭
             #   "closed"    = 完全关闭自助注册，账户只能由共享端控制台添加
             "allow_register": "open",
+            # D1（实现方案 §10.2）：挑战-应答认证模式。
+            #   "require"       = 默认。口令不再过网，观看端必须走 chal/auth_proof；
+            #                     旧版观看端的明文凭据被拒并提示「观看端版本过旧」。
+            #   "allow_legacy"  = 兼容窗口：旧观看端可继续直发凭据（host 记 WARNING，
+            #                     含用户名与来源地址）。一个发布周期后删除该分支。
+            "chal_response": "require",
             # 认证阶段「总时限」（第 23 条防 slowloris）；须大于观看端「等界面就绪（最长
             # 60s）+ 登录框等待（120s）」的最坏合计 ≈180s（第 31 条：否则用户还在输入
             # host 就先断开、明明输对却登录失败）。B10（2026-09-11）：默认值从 150 提到

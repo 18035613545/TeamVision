@@ -15,6 +15,7 @@ import json
 import math
 import os
 import queue
+import secrets
 import socket
 import struct
 import sys
@@ -80,6 +81,8 @@ from common import (
     Act,
     # C2 §7 第 3 步：认证期 CTRL 随带协议版本
     PROTOCOL_VERSION,
+    # D1（实现方案 §10）：挑战-应答认证公共件（口令不再过网）
+    PBKDF2_ITERATIONS, derive_dk, challenge_mac, b64e, b64d,
 )
 
 #: 模块级日志（logger.setup_logger(cfg) 幂等初始化后生效）
@@ -265,6 +268,9 @@ class Channel:
         self._password = None  # 本次会话内的明文密码缓存，用于重连自动登录
         self._auth_probed = False  # 已用空凭据探测过服务端是否需要登录（避免准入关闭时仍弹框）
         self._anon_ok = False  # 已确认服务端准入关闭（匿名放行），重连时直接走 probe 不再弹框
+        # D1（实现方案 §10）：服务端是否支持挑战-应答（None=未知，首次登录前用 probe
+        # 回包里的 proto 字段判定；老服务端无该字段 → False → 走旧版直发口令路径）。
+        self._chal_capable = None
         # 网络/稳定性参数（从 viewer 配置读取，缺省用安全默认值）
         viewer_cfg = (owner.cfg if owner is not None else {}).get("viewer", {}) or {}
         net_cfg = viewer_cfg.get("net", {}) or {}
@@ -750,10 +756,32 @@ class Channel:
             try:
                 if user:
                     self._last_auth_user = user   # 第 133 条：失败后预填用
-                send_msg(sock, {"action": action, "user": user, "pass": password,
-                                "proto": list(PROTOCOL_VERSION)})
                 sock.settimeout(5.0)
-                reply = recv_msg(sock)
+                if action in (Act.LOGIN, Act.REGISTER) and self._chal_capable is None:
+                    # D1 能力探测：先发一次 probe 读取服务端回包中的 proto（新版必带；
+                    # 旧版无该字段 → False，保留旧版直发口令路径）。probe 若命中准入
+                    # 关闭会直接 ok=True，本轮即出结果。
+                    send_msg(sock, {"action": Act.PROBE, "user": "", "pass": "",
+                                    "proto": list(PROTOCOL_VERSION)})
+                    probe = recv_msg(sock)
+                    proto = probe.get("proto")
+                    self._chal_capable = bool(
+                        isinstance(proto, (list, tuple)) and len(proto) >= 2
+                        and proto[0] == PROTOCOL_VERSION[0] and proto[1] >= 2)
+                    if probe.get("ok"):
+                        reply = probe
+                    elif self._chal_capable:
+                        reply = self._auth_via_challenge(sock, action, user, password)
+                    else:
+                        send_msg(sock, {"action": action, "user": user, "pass": password,
+                                        "proto": list(PROTOCOL_VERSION)})
+                        reply = recv_msg(sock)
+                elif action in (Act.LOGIN, Act.REGISTER) and self._chal_capable:
+                    reply = self._auth_via_challenge(sock, action, user, password)
+                else:
+                    send_msg(sock, {"action": action, "user": user, "pass": password,
+                                    "proto": list(PROTOCOL_VERSION)})
+                    reply = recv_msg(sock)
             except Exception as exc:
                 self.auth_msg = "认证通信失败: %s" % exc
                 log.warning("频道[%s] 认证通信失败: %s", self.name, exc)
@@ -805,6 +833,15 @@ class Channel:
                 self._retry_delay = 0.0
                 log.warning("频道[%s] 注册被拒绝：%s（稍后重新弹出登录框）", self.name, msg)
                 return False
+            if msg == "观看端版本过旧，请更新后重试":
+                # D1：服务端只接受挑战-应答，本轮却走了旧直发路径（能力缓存失效的
+                # 窄窗口，如服务端运行中改了配置）。复位缓存，重连后重新探测。
+                self._chal_capable = None
+                self._auth_error_text = msg
+                self.auth_msg = msg
+                self._retry_delay = 0.0
+                log.warning("频道[%s] 服务端仅接受挑战-应答认证，已复位能力缓存", self.name)
+                return False
             if msg in ("用户名或密码错误", "账号不存在"):
                 # 第 133 条（2026-09-11）：**不再**在这里设置 30 秒弹框冷却。
                 # 旧行为：凭据错误 → _prompt_blocked_until=+30 → 下一次重连
@@ -831,6 +868,53 @@ class Channel:
                 return False
             # 其余情况（如服务端异常响应）继续循环，下一轮会弹框询问注册或登录
         return False
+
+    def _auth_via_challenge(self, sock, action, user, password):
+        """D1（实现方案 §10.1）：挑战-应答一轮往返，口令不过网。
+
+        登录:   {login,user} → {chal,nonce,salt,iter} → {auth_proof,user,proof=HMAC(dk,nonce)}
+        注册:   {register,user} → {chal,nonce,iter}（salt 由本端生成）
+                → {reg_proof,user,salt,dk,proof}
+        dk = pbkdf2_hmac-sha256(口令, salt, iter)，与服务端账户表存的是同一把密钥。
+        返回服务端 auth_result 字典（失败时含 msg），交回 _authenticate 的既有分支处理。
+        """
+        send_msg(sock, {"action": action, "user": user, "pass": "",
+                        "proto": list(PROTOCOL_VERSION)})
+        sock.settimeout(10.0)  # 含本端 PBKDF2 十万次迭代（慢机可达数百毫秒）
+        chal = recv_msg(sock)
+        if not isinstance(chal, dict):
+            return {"ok": False, "msg": "服务端响应异常"}
+        if chal.get("action") != Act.CHAL:
+            # 服务端直接拒绝（如账号不存在/版本过旧）：chal 本身就是 auth_result
+            return chal
+        try:
+            nonce = b64d(chal.get("nonce") or "")
+            iter_ = int(chal.get("iter") or PBKDF2_ITERATIONS)
+        except (ValueError, TypeError):
+            return {"ok": False, "msg": "挑战消息格式非法"}
+        if action == Act.REGISTER:
+            salt = secrets.token_hex(16)  # 注册路径：服务端还没有该账户记录，salt 本端生成
+        else:
+            salt = chal.get("salt") or ""
+        if not salt:
+            return {"ok": False, "msg": "挑战消息缺少 salt"}
+        try:
+            dk = derive_dk(password, salt, iter_)
+        except ValueError:
+            return {"ok": False, "msg": "挑战消息格式非法（salt 非十六进制）"}
+        proof = b64e(challenge_mac(dk, nonce))
+        if action == Act.REGISTER:
+            reply_msg = {"action": Act.REG_PROOF, "user": user, "salt": salt,
+                         "dk": dk.hex(), "proof": proof,
+                         "proto": list(PROTOCOL_VERSION)}
+        else:
+            reply_msg = {"action": Act.AUTH_PROOF, "user": user, "proof": proof,
+                         "proto": list(PROTOCOL_VERSION)}
+        send_msg(sock, reply_msg)
+        result = recv_msg(sock)
+        if not isinstance(result, dict):
+            return {"ok": False, "msg": "服务端响应异常"}
+        return result
 
     def _ask_credentials(self):
         """请求主线程弹出登录/注册对话框；返回 ("login"|"register", user, password) 或 None。

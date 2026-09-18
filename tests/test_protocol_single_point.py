@@ -84,11 +84,15 @@ class TestActionSinglePoint(unittest.TestCase):
         self.assertEqual(Act.PEERS, "peers")
         self.assertEqual(Act.CAP, "cap")
         self.assertEqual(Act.CAP_PROBE, "cap_probe")
+        # D1（实现方案 §10）：挑战-应答认证
+        self.assertEqual(Act.CHAL, "chal")
+        self.assertEqual(Act.AUTH_PROOF, "auth_proof")
+        self.assertEqual(Act.REG_PROOF, "reg_proof")
 
     def test_protocol_version_is_single_carrier(self):
-        # C2：PROTOCOL_VERSION 是唯一的版本载体（FS02 语义 = 2.1，D1 时升 2.2）
+        # C2：PROTOCOL_VERSION 是唯一的版本载体；D1（挑战-应答）落地时按预案升 2.2
         self.assertEqual(Act.__dict__.get("AUTH_RESULT"), "auth_result")
-        self.assertEqual(common.PROTOCOL_VERSION, (2, 1))
+        self.assertEqual(common.PROTOCOL_VERSION, (2, 2))
         self.assertEqual(common.MAGIC_CLIENT, b"FS02")
 
 

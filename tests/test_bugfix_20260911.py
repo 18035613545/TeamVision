@@ -893,6 +893,7 @@ class TestB13CredentialRetryUX(unittest.TestCase):
         ch.auth = {}
         ch._anon_ok = False
         ch._auth_probed = True          # 已探测过：下一轮直接弹框
+        ch._chal_capable = False        # D1：本文件锁定的是旧直发口令路径的回包映射
         ch._prompt_blocked_until = 0.0
         ch._retry_delay = 12.5          # 假装退避已涨到 12.5 秒
         ch._auth_error_text = ""

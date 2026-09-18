@@ -17,7 +17,6 @@ av/PyAV（host.codec.encoder!="jpeg" 时用于 H.264 编码）。
 """
 
 import argparse
-import hashlib
 import hmac
 import json
 import os
@@ -73,6 +72,8 @@ from common import (  # noqa: F401
     Act,
     # C2 §7 第 3 步：握手版本字段（先只加不启用）
     PROTOCOL_VERSION, PROTO_ENFORCE, proto_compatible,
+    # D1（实现方案 §10）：挑战-应答认证公共件（PBKDF2/HMAC/base64 单一真源）
+    PBKDF2_ITERATIONS, derive_dk, challenge_mac, b64e, b64d,
     # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
     # 各有一套 clamp），share.py 不再反向 import host。
     normalize_region, safe_float, safe_int,
@@ -131,9 +132,7 @@ def _sanitize(text, token):
 
 def _hash_password(password, salt_hex):
     """pbkdf2_hmac(sha256) 加盐哈希，迭代 10 万次，返回十六进制摘要。"""
-    salt = bytes.fromhex(salt_hex)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
-    return dk.hex()
+    return derive_dk(password, salt_hex, PBKDF2_ITERATIONS).hex()
 
 
 class AccountManager:
@@ -253,6 +252,82 @@ class AccountManager:
                 self._save()
         log.info("账户登录成功: %s", user)
         return True, "登录成功"
+
+    def challenge_for(self, user):
+        """D1（实现方案 §10.1）：登录挑战用，返回 (salt_hex, iter) 或 None（账号不存在/记录损坏）。
+
+        旧记录无 iter 字段时回填当前全局迭代数——存储的 hash 本身就是 pbkdf2 派生的
+        dk，观看端用 salt+iter 重算即可得到同一把 HMAC 密钥。
+        """
+        user = (user or "").strip()
+        with self._lock:
+            record = self._users.get(user)
+            if not isinstance(record, dict):
+                return None
+            salt = record.get("salt")
+            pw_hash = record.get("hash")
+            if not isinstance(salt, str) or not isinstance(pw_hash, str):
+                return None
+            iter_ = record.get("iter", PBKDF2_ITERATIONS)
+        if not isinstance(iter_, int) or iter_ <= 0:
+            iter_ = PBKDF2_ITERATIONS
+        return salt, iter_
+
+    def verify_login_proof(self, user, nonce, proof):
+        """D1：校验 auth_proof。key=存储的 dk（hash 字段即 pbkdf2 派生字节），
+        期望 proof = HMAC-SHA256(dk, nonce)。返回 (ok, 提示语)。"""
+        user = (user or "").strip()
+        with self._lock:
+            record = self._users.get(user)
+            if not isinstance(record, dict):
+                return False, "账号不存在"
+            pw_hash = record.get("hash")
+        if not isinstance(pw_hash, str):
+            log.warning("账户 %s 记录损坏（缺 hash），拒绝登录", user)
+            return False, "账号不存在"
+        try:
+            dk = bytes.fromhex(pw_hash)
+            expected = challenge_mac(dk, nonce)
+        except (ValueError, TypeError) as e:
+            log.warning("账户 %s 口令校验失败（记录损坏）：%s", user, e)
+            return False, "账号不存在"
+        if not hmac.compare_digest(expected, proof):
+            return False, "用户名或密码错误"
+        with self._lock:
+            record = self._users.get(user)
+            if isinstance(record, dict):
+                record["last_login"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                self._save()
+        log.info("账户登录成功: %s（挑战-应答）", user)
+        return True, "登录成功"
+
+    def register_derived(self, user, salt_hex, dk_hex):
+        """D1：注册自助派生账户，salt/dk 由观看端计算上送，host 侧口令零接触。
+        返回 (ok, 提示语)。"""
+        user = (user or "").strip()
+        if not user or not isinstance(salt_hex, str) or not isinstance(dk_hex, str):
+            return False, "用户名与凭据不能为空"
+        try:
+            salt_bytes = bytes.fromhex(salt_hex)
+            dk_bytes = bytes.fromhex(dk_hex)
+        except ValueError:
+            return False, "凭据格式无效"
+        if len(salt_bytes) < 8 or len(dk_bytes) < 16:
+            return False, "凭据长度无效"
+        with self._lock:
+            if user in self._users:
+                return False, "用户名已存在"
+            self._users[user] = {
+                "salt": salt_hex,
+                "hash": dk_hex,
+                "iter": PBKDF2_ITERATIONS,
+                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            if not self._save():
+                self._users.pop(user, None)
+                return False, "无法写入账户文件（磁盘或权限问题），注册未生效"
+        log.info("账户注册成功: %s（挑战-应答）", user)
+        return True, "注册成功"
 
 
 class ClientInfo:
@@ -1341,83 +1416,181 @@ def _str_field(msg, key, default=""):
     return default, False
 
 
+CHALLENGE_TTL_S = 60.0  # D1（实现方案 §10.1）：挑战 nonce 有效期，超时须重新发起登录
+
+
 def _auth_required_phase(sock, addr, runtime, auth_cfg):
-    """准入开启：循环处理 login/register/probe；返回 (放行?, 用户名)。
+    """准入开启：D1 挑战-应答认证状态机 + 旧版明文凭据兼容分支；返回 (放行?, 用户名)。
 
     第 23 条：认证阶段强制「总时限」而非「每次 recv 超时」，防 slowloris 无限占用线程。
     第 31 条：总时限须大于观看端登录框等待（120s），否则用户还在输入 host 就先断开。
-    第 104 条（B11）：user/pass 必须是字符串——旧写法 `(msg.get("user") or "").strip()`
-    在 {"user":123} 上抛 AttributeError，被外层 except 记成"认证异常"并断开，用户看到
-    的是"认证通信失败"，而不是"用户名或密码错误"。
+    第 104 条（B11）：user/pass 必须是字符串——旧写法在 {"user":123} 上抛
+    AttributeError 被记成"认证异常"，用户看到的是"认证通信失败"而非"用户名或密码错误"。
+    B10（2026-09-11）：认证窗口下界抬到 AUTH_TIMEOUT_MIN_S，见 safe_float 约束。
 
-    B10（2026-09-11）：认证窗口下界不再是 1 秒。旧写法
-    `safe_float(..., 150, 1, 3600)` 会接受任何比客户端等待更小的值（随包 config.json
-    一度就是 60 秒），而观众端最坏要等 ≈180 秒（等界面就绪 60s + 登录框 120s）——
-    准入一开，"用户还在输入、服务端已断开"，正是第 31 条当年修掉的故障模式。
+    D1（实现方案 §10.1–10.2）：口令不再过网。
+      登录:   C→S {login, user}  → S→C {chal, nonce, salt, iter}
+              C→S {auth_proof, user, proof=HMAC-SHA256(dk, nonce)}
+      注册:   C→S {register, user} → S→C {chal, nonce, iter}（salt 由观看端生成）
+              C→S {reg_proof, user, salt, dk, proof}
+    nonce 一次性（校验前先摘除）、绑定本连接、CHALLENGE_TTL_S 过期。
+    host.auth.chal_response="require"（默认）拒绝旧版直发口令；"allow_legacy" 临时
+    放行并记 WARNING（含用户名与来源地址），一个发布周期后删除该分支。
     """
     auth_timeout = safe_float(auth_cfg.get("auth_timeout", AUTH_TIMEOUT_DEFAULT_S),
                                AUTH_TIMEOUT_DEFAULT_S, AUTH_TIMEOUT_MIN_S, 3600)
+    mode = auth_cfg.get("chal_response", "require")
+    if mode != "allow_legacy":
+        if mode != "require":
+            log.warning("auth.chal_response=%r 非预期值，按 require 处理", mode)
+        mode = "require"
     deadline = time.monotonic() + auth_timeout
     sock.settimeout(auth_timeout)
+    pending = None  # 本连接当前挑战：{kind, user, nonce, salt, iter, exp}
+
+    def _issue_challenge(kind, user, salt=None, iter_=PBKDF2_ITERATIONS):
+        nonlocal pending
+        nonce = secrets.token_bytes(16)
+        pending = {"kind": kind, "user": user, "nonce": nonce,
+                   "salt": salt, "iter": iter_,
+                   "exp": time.monotonic() + CHALLENGE_TTL_S}
+        reply = {"action": Act.CHAL, "nonce": b64e(nonce), "iter": iter_,
+                 "proto": list(PROTOCOL_VERSION)}
+        if salt is not None:
+            reply["salt"] = salt
+        send_msg(sock, reply)
+
+    def _reject_and_close(text, why_log=None):
+        send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False, "msg": text})
+        if why_log:
+            log.warning("客户端 %s %s", addr, why_log)
+        sock.close()
+        return False, None
+
     try:
         while True:
             msg = recv_msg(sock, deadline)
             action = msg.get("action")
-            # C2 §7 第 3 步：认证期 CTRL 随带 proto=[2,1]。主判仍是 MAGIC，
-            # 这里只留痕；PROTO_ENFORCE（当前 False）翻转后不兼容客户端被拒——
-            # 这条拒绝通道为 D1 的协议版本协商铺路。
+            # C2 §7 第 3 步：认证期 CTRL 随带 proto=[2,2]。主判仍是 MAGIC，
+            # 这里只留痕；PROTO_ENFORCE（当前 False）翻转后不兼容客户端被拒。
             present, compatible = proto_compatible(msg)
             if present and not compatible:
                 log.warning("客户端 %s 协议版本不兼容（proto=%r，服务端=%s）",
                             addr, msg.get("proto"), PROTOCOL_VERSION)
                 if PROTO_ENFORCE:
-                    send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
-                                    "msg": "协议版本不匹配，请更新观看端"})
-                    sock.close()
-                    return False, None
+                    return _reject_and_close("协议版本不匹配，请更新观看端")
             raw_user, ok_user = _str_field(msg, "user")
             raw_pass, ok_pass = _str_field(msg, "pass")
             if not ok_user:
-                send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
-                                "msg": "认证消息格式非法（user 必须是字符串）"})
-                log.warning("客户端 %s 认证消息 user 类型非法（%s），已拒绝",
-                            addr, type(msg.get("user")).__name__)
-                sock.close()
-                return False, None
+                return _reject_and_close("认证消息格式非法（user 必须是字符串）",
+                                         "认证消息 user 类型非法（%s），已拒绝"
+                                         % type(msg.get("user")).__name__)
             if not ok_pass:
-                send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
-                                "msg": "认证消息格式非法（pass 必须是字符串）"})
-                log.warning("客户端 %s 认证消息 pass 类型非法（%s），已拒绝",
-                            addr, type(msg.get("pass")).__name__)
-                sock.close()
-                return False, None
+                return _reject_and_close("认证消息格式非法（pass 必须是字符串）",
+                                         "认证消息 pass 类型非法（%s），已拒绝"
+                                         % type(msg.get("pass")).__name__)
             user = (raw_user or "").strip()
             password = raw_pass or ""
-            if action == Act.LOGIN:
-                ok, text = runtime.accounts.authenticate(user, password)
-            elif action == Act.REGISTER:
-                allowed, why = _register_allowed(runtime, auth_cfg, addr)
-                if allowed:
-                    ok, text = runtime.accounts.register(user, password)
+
+            # ---------- 应答阶段：auth_proof / reg_proof ----------
+            if action in (Act.AUTH_PROOF, Act.REG_PROOF):
+                kind = "login" if action == Act.AUTH_PROOF else "register"
+                if pending is None or pending["kind"] != kind or user != pending["user"]:
+                    return _reject_and_close("没有进行中的挑战，请重新登录",
+                                             "无进行中挑战即提交 %s，已断开" % action)
+                p, pending = pending, None  # nonce 一次性：校验前先摘除，防重放
+                if time.monotonic() > p["exp"]:
+                    return _reject_and_close("挑战已过期，请重新登录",
+                                             "挑战过期（>%d 秒）后仍提交应答" % int(CHALLENGE_TTL_S))
+                raw_proof, ok_proof = _str_field(msg, "proof")
+                proof = None
+                if ok_proof and raw_proof:
+                    try:
+                        proof = b64d(raw_proof)
+                    except ValueError:
+                        proof = None
+                if proof is None:
+                    return _reject_and_close("挑战应答格式非法",
+                                             "auth proof 格式非法（%r），已断开" % raw_proof)
+                if kind == "login":
+                    ok, text = runtime.accounts.verify_login_proof(user, p["nonce"], proof)
                 else:
-                    ok, text = False, why
-            elif action == Act.PROBE:
-                # 观看端无凭据时的探测：告知需要登录，但不作为认证失败告警记录
-                ok, text = False, "需要登录"
-            else:
-                ok, text = False, "不支持的认证请求"
-            send_msg(sock, {"action": Act.AUTH_RESULT, "ok": ok, "msg": text})
-            if ok:
-                return True, user
-            if action == Act.PROBE:
-                # 第 30 条：probe 后保持连接，等观看端在同一 socket 提交真实凭据。
-                # 旧实现 probe→立刻 close，观看端第二次弹框把凭据发进死连接 →
-                # 报「认证通信失败」，重连后再弹一次才成功（首连必失败、弹两次框）。
+                    raw_salt, ok_s = _str_field(msg, "salt")
+                    raw_dk, ok_d = _str_field(msg, "dk")
+                    dk_bytes = None
+                    if ok_s and ok_d and raw_salt and raw_dk:
+                        try:
+                            dk_bytes = bytes.fromhex(raw_dk)
+                        except ValueError:
+                            dk_bytes = None
+                    if dk_bytes is None:
+                        return _reject_and_close("注册凭据格式非法",
+                                                 "reg_proof salt/dk 格式非法，已断开")
+                    if not hmac.compare_digest(challenge_mac(dk_bytes, p["nonce"]), proof):
+                        ok, text = False, "挑战校验失败"
+                    else:
+                        ok, text = runtime.accounts.register_derived(user, raw_salt, raw_dk)
+                send_msg(sock, {"action": Act.AUTH_RESULT, "ok": ok, "msg": text})
+                if ok:
+                    return True, user
+                log.warning("客户端 %s 认证失败: %s（%s）", addr, text, user or "-")
+                sock.close()
+                return False, None
+
+            # ---------- 发起阶段：login / register ----------
+            if action == Act.LOGIN:
+                if password:
+                    if mode == "require":
+                        return _reject_and_close("观看端版本过旧，请更新后重试",
+                                                 "以旧版直发口令登录，require 模式下已拒绝（%s）"
+                                                 % (user or "-"))
+                    log.warning("客户端 %s（%s）走旧版认证，口令明文过网（allow_legacy），"
+                                "请更新观看端后将 auth.chal_response 改回 require",
+                                addr, user or "-")
+                    ok, text = runtime.accounts.authenticate(user, password)
+                    send_msg(sock, {"action": Act.AUTH_RESULT, "ok": ok, "msg": text})
+                    if ok:
+                        return True, user
+                    log.warning("客户端 %s 认证失败: %s（%s）", addr, text, user or "-")
+                    sock.close()
+                    return False, None
+                got = runtime.accounts.challenge_for(user)
+                if got is None:
+                    return _reject_and_close("账号不存在",
+                                             "登录失败: 账号不存在（%s）"
+                                             % (user or "-"))
+                _issue_challenge("login", user, salt=got[0], iter_=got[1])
                 continue
-            # 真实凭据校验失败：记录并断开（不在单连接内循环，避免放开暴力尝试）
-            log.warning("客户端 %s 认证失败: %s（%s）", addr, text, user or "-")
-            sock.close()
-            return False, None
+            if action == Act.REGISTER:
+                allowed, why = _register_allowed(runtime, auth_cfg, addr)
+                if not allowed:
+                    return _reject_and_close(why)
+                if password:
+                    if mode == "require":
+                        return _reject_and_close("观看端版本过旧，请更新后重试",
+                                                 "以旧版直发口令注册，require 模式下已拒绝（%s）"
+                                                 % (user or "-"))
+                    log.warning("客户端 %s（%s）走旧版注册，口令明文过网（allow_legacy），"
+                                "请更新观看端后将 auth.chal_response 改回 require",
+                                addr, user or "-")
+                    ok, text = runtime.accounts.register(user, password)
+                    send_msg(sock, {"action": Act.AUTH_RESULT, "ok": ok, "msg": text})
+                    if ok:
+                        return True, user
+                    log.warning("客户端 %s 注册失败: %s（%s）", addr, text, user or "-")
+                    sock.close()
+                    return False, None
+                _issue_challenge("register", user)
+                continue
+            if action == Act.PROBE:
+                # 观看端无凭据时的探测：告知需要登录，但不作为认证失败告警记录。
+                # D1：随带 proto，供新版观看端判定服务端是否支持挑战-应答
+                # （旧服务端的回复没有该字段 → 走 allow_legacy 直发路径）。
+                send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
+                                "msg": "需要登录", "proto": list(PROTOCOL_VERSION)})
+                # 第 30 条：probe 后保持连接，等观看端在同一 socket 提交真实凭据。
+                continue
+            return _reject_and_close("不支持的认证请求")
     except socket.timeout:
         log.warning("客户端 %s 未在 %.0f 秒内完成登录，已断开", addr, auth_timeout)
         sock.close()
@@ -1471,7 +1644,8 @@ def _auth_optional_phase(sock, addr):
             user = ""
         user = (user or "").strip()
         send_msg(sock, {"action": Act.AUTH_RESULT, "ok": True,
-                        "msg": "账户准入已关闭，无需登录"})
+                        "msg": "账户准入已关闭，无需登录",
+                        "proto": list(PROTOCOL_VERSION)})
         if user:
             log.info("客户端 %s 在准入关闭状态发送登录：%s（已直接放行）", addr, user)
             return True, user

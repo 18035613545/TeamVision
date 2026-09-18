@@ -246,6 +246,7 @@ class TestViewerRegisterRejected(unittest.TestCase):
         ch.owner = None
         ch._anon_ok = False
         ch._auth_probed = True       # 跳过首轮 probe，让下一轮直接询问凭据
+        ch._chal_capable = False     # D1：本文件锁定的是旧直发口令路径（serve 端直接回 auth_result）
         ch._prompt_blocked_until = 0.0
         ch.auth_msg = ""
         return ch

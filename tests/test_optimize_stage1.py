@@ -44,12 +44,16 @@ class _Hub:
     """以线程方式启动真实 HostRuntime（真实 TCP），供 B1 集成测试使用。"""
 
     def __init__(self, max_clients=None, msg_timeout_s=None, auth_enabled=False,
-                 accounts_file=None, upstream_max_kbps=None, upstream_max_fps=None):
+                 accounts_file=None, upstream_max_kbps=None, upstream_max_fps=None,
+                 chal_mode=None):
         cfg = copy.deepcopy(common.DEFAULT_CONFIG)
         cfg["host"]["port"] = _free_port()
         cfg["host"]["fps"] = 2
         cfg["host"]["codec"]["encoder"] = "jpeg"   # 测试不解码，省掉编码器依赖
         cfg["host"]["auth"]["enabled"] = bool(auth_enabled)
+        if chal_mode is not None:
+            # D1（实现方案 §10.2）：None=跟随默认（require）；旧凭据流程的用例显式传 allow_legacy
+            cfg["host"]["auth"]["chal_response"] = chal_mode
         if max_clients is not None:
             cfg["host"]["net"]["max_clients"] = max_clients
         if msg_timeout_s is not None:
@@ -506,7 +510,7 @@ class TestAuthFieldValidation(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="tv_auth_")
         self.addCleanup(shutil.rmtree, self._tmp, True)
-        self.hub = _Hub(auth_enabled=True,
+        self.hub = _Hub(auth_enabled=True, chal_mode="allow_legacy",
                         accounts_file=os.path.join(self._tmp, "accounts.json"))
         self.addCleanup(self.hub.close)
 

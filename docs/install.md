@@ -70,6 +70,8 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 > ⚠️ **明文传输警示**：画面与控制数据走明文 TCP，本软件不做端到端加密。公网暴露等于
 > 链路上任何一跳都能看到画面内容——请经由隧道/VPN 接入，保持账户准入开启，
 > 并把「账户注册」设为 `仅首个账户` 或 `关闭`；不要直接把 5700 端口映射到公网裸奔。
+> 1.4.0 起认证改为挑战-应答（`auth.chal_response=require`），**登录口令不再过网**，
+> 但这不改变上述结论：口令安全 ≠ 画面加密，公网接入仍须信任链路或走隧道/VPN。
 
 ---
 
@@ -119,6 +121,7 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 | `auth.enabled` | `true` | 账户准入：观看端必须注册/登录后才能取流 |
 | `auth.allow_register` | `open` | 自助注册策略：`open` / `bootstrap`（仅首个账户可注册）/ `closed`。公网暴露时建议 `bootstrap` 或 `closed` |
 | `auth.auth_timeout` | `240` | 认证阶段总时限（秒），代码有 240 秒下界，改小会被自动抬高 |
+| `auth.chal_response` | `require` | 认证方式：`require`=挑战-应答（口令不过网，1.4.0 起默认）/ `allow_legacy`=临时允许旧版观看端直发口令（每条都记 WARNING）。仅建议作为升级过渡，一个版本周期后移除 |
 | `frp.*` | — | 外部 frpc 拉起参数（`auto_start`/`frpc_path`/`token`/`tunnel_ids`/`public_addr`），示例性质、维持现状；token 写日志时自动打码，勿外发 `config.json` |
 | `config_version` | `2` | 配置结构版本（程序维护，请勿手改） |
 
@@ -131,6 +134,11 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 `127.0.0.1` + 准入开启，并在日志里逐条列出改动。迁移只做一次（写回 `config_version: 2`），
 只动这两个安全相关字段；`fps`、`capture.*`、`codec.*`、频道列表等原样保留；
 自定义监听地址（如 `192.168.1.5`）不会被改写。想恢复旧行为：「传输参数」里改回并重新应用。
+
+**1.4.0 新增（D1 挑战-应答）**：共享端升级后默认 `require`，**1.3.x 及更早的观看端会被拒
+（提示「观看端版本过旧，请更新后重试」）**。请让观看端一并升级到 1.4.0；暂时做不到时，可在
+`config.json` 的 `host.auth` 加 `"chal_response": "allow_legacy"` 并重启共享端过渡
+（旧版直发口令会记 WARNING，升级完成后请改回 `require`）。已有账户无需重建。
 
 ### 5.3 观看端 `viewer`
 
