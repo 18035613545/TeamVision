@@ -18,6 +18,7 @@ import mss
 import logger as logger_mod
 import diag
 import ui_common
+import update_check
 from common import (
     APP_NAME, APP_VERSION, data_dir, save_config, register_policy, REGISTER_POLICIES,
 )
@@ -103,6 +104,15 @@ class HostConsole:
         # 第 37 条：_poll() 自身会 after(500) 重排，这里不再额外排一次，避免双刷新链
         # （旧实现客户端表格每 500ms 被全删全建两次 → 可见闪烁 + 与推流线程抢锁翻倍）。
         self._poll()
+        # B4（实现方案 §6）：启动后台查一次更新，仅写状态栏，失败静默
+        update_check.start_background_check(
+            getattr(self.runtime, "cfg", None), self._show_update_hint)
+
+    def _show_update_hint(self, msg):
+        try:
+            self.root.after(0, lambda: self._set_status(msg))
+        except Exception:
+            pass
 
     # ---------- 界面搭建 ----------
 

@@ -123,10 +123,13 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 | `auth.auth_timeout` | `240` | 认证阶段总时限（秒），代码有 240 秒下界，改小会被自动抬高 |
 | `auth.chal_response` | `require` | 认证方式：`require`=挑战-应答（口令不过网，1.4.0 起默认）/ `allow_legacy`=临时允许旧版观看端直发口令（每条都记 WARNING）。仅建议作为升级过渡，一个版本周期后移除 |
 | `frp.*` | — | 外部 frpc 拉起参数（`auto_start`/`frpc_path`/`token`/`tunnel_ids`/`public_addr`），示例性质、维持现状；token 写日志时自动打码，勿外发 `config.json` |
+| `update_check.enabled` | `true` | 更新提示（共享端与观看端共用）：启动后查一次 GitHub Releases 最新 tag，比当前版本新时在状态栏提示，结果缓存 24h、失败静默；**不做自动更新**，不想外连可置 `false` |
 | `config_version` | `2` | 配置结构版本（程序维护，请勿手改） |
 
 > GUI「传输参数」区可直接改 `listen_host`、`auth.enabled`、`auth.allow_register`、`fps`、
 > `jpeg_quality`、`scale` 与 `perf.adaptive`，点「应用传输设置」写入 `config.json`。
+> 「账户管理」按钮（1.4.0 起）可列出/添加/删除账户与重置口令——纯本地写 `accounts.json`，
+> 与自助注册策略无关，`closed` 下也能给队友开号；删除最后一个账户会要求二次确认（防自锁）。
 
 ### 5.2 从 1.3.0 及更早版本升级
 

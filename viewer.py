@@ -51,6 +51,7 @@ import splash
 import codec as codec_mod
 import diag
 import ui_common
+import update_check
 from common import (
     APP_NAME,
     APP_VERSION,
@@ -1431,6 +1432,8 @@ class ViewerApp:
         self.menu = None
         self.hwnd = None
         self.panel = None
+        # B4（实现方案 §6）：更新提示后缀，拼在面板底部状态标签的默认文本后
+        self._update_hint = ""
         self._share_toggle_busy = False  # 第 60 条：共享开关异步执行期间的重入护栏
         self._save_after_id = None  # 第 64 条：viewer 配置去抖落盘的 root.after 句柄
         self._share_alive_check_at = 0.0  # B8：共享会话存活巡检的节流时刻
@@ -1497,6 +1500,9 @@ class ViewerApp:
         # 置位后接收线程才能安全调用 root.after 弹认证对话框（避免 mainloop 未启动时
         # 从子线程调用 Tk 触发 RuntimeError，导致对话框永远不弹出）
         self._mainloop_ready.set()
+        # B4（实现方案 §6）：启动后台查一次更新，命中时只改面板状态栏默认文本，失败静默
+        update_check.start_background_check(
+            self.cfg, lambda msg: self._post_ui(lambda m=msg: self._set_update_hint(m)))
         try:
             self.root.mainloop()
         finally:
@@ -2469,7 +2475,21 @@ class ViewerApp:
 
     def _panel_reset_status(self):
         self._status_after_id = None
-        self._status_label.configure(text="就绪", fg=COL_DIM)
+        self._status_label.configure(text=self._panel_default_status_text(),
+                                     fg=COL_DIM)
+
+    def _panel_default_status_text(self):
+        base = "就绪"
+        return base + (" · " + self._update_hint if self._update_hint else "")
+
+    def _set_update_hint(self, msg):
+        """B4（实现方案 §6）：状态栏追加一行更新提示（不弹窗、不打断其他临时消息）。"""
+        self._update_hint = msg
+        if self._status_after_id is None:
+            try:
+                self._status_label.configure(text=self._panel_default_status_text())
+            except Exception:
+                pass
 
     # ---------- 关于窗口 ----------
 

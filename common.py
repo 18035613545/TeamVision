@@ -169,6 +169,11 @@ DEFAULT_CONFIG = {
     "logs": {
         "level": "info"
     },
+    # B4（实现方案 §6）：启动后查一次 GitHub Releases 最新 tag，仅状态栏提示，
+    # 不做自动更新；结果缓存 24h，网络失败静默。关掉它只需置 false。
+    "update_check": {
+        "enabled": True
+    },
     "host": {
         # 默认只监听本机：默认形态下不存在对外监听的端口（局域网内其他人连不上，
         # 杀软/审计也不会把「屏幕采集 + 对外监听 + 无鉴权」判成高危组合）。
