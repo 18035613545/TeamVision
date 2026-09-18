@@ -16,5 +16,5 @@ av>=12.0.0,<18              # 实测 17.1.0
 # 可选 DXGI 硬件采集后端（host.capture.backend="dxgi"）：dxcam **不从 PyPI 装**。
 # PyPI 上的 dxcam 只有滞后的 0.0.5，与项目实测/已 vendor 的 0.3.0（GitHub ra1nty/DXcam）
 # 不是同一个东西；`pip install dxcam` 会把错的 0.0.5 装进 conda。dxcam 与其依赖 comtypes
-# 一律按 docs/部署操作文档.md §7.3/§7.4 的 vendoring 步骤离线装入 .\vendor（--no-deps）。
+# 一律按 docs/install.md §6.2/§6.3 的 vendoring 步骤离线装入 .\vendor（--no-deps）。
 # 因此这里不列 dxcam/comtypes——实测 conda 环境本就不含二者（dxgi 由 vendor 提供）。
