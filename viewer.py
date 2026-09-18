@@ -47,6 +47,7 @@ def _load_heavy():
 import logger
 import splash
 import codec as codec_mod
+import diag
 from common import (
     APP_NAME,
     APP_VERSION,
@@ -59,6 +60,7 @@ from common import (
     parse_addr,
     exe_dir,
     app_dirs,
+    data_dir,
     enable_dpi_awareness,
     tune_socket,
     parse_message,
@@ -2759,9 +2761,36 @@ class ViewerApp:
         tk.Button(btns, text="复制报告", bg=COL_CTRL, fg=COL_FG, relief="flat",
                   activebackground="#3a3a52", activeforeground=COL_FG,
                   padx=14, pady=4, command=_copy).pack(side="right")
+        tk.Button(btns, text="导出 zip", bg=COL_CTRL, fg=COL_FG, relief="flat",
+                  activebackground="#3a3a52", activeforeground=COL_FG,
+                  padx=14, pady=4,
+                  command=lambda: self._export_diag_zip(report)).pack(side="right", padx=(0, 8))
         tk.Button(btns, text="关闭", bg=COL_CTRL, fg=COL_FG, relief="flat",
                   activebackground="#3a3a52", activeforeground=COL_FG,
                   padx=14, pady=4, command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def _export_diag_zip(self, report_text):
+        """B2（第 134 条）：把脱敏配置 + 近两日日志 + 本报告打成 zip。"""
+        try:
+            logs_dir = os.path.join(data_dir(), "logs")
+            # 计划 §4.2.2：zip 统一落到 logs 目录，便于与支持者沟通固定路径
+            path = diag.build_report_zip(logs_dir, config=self.cfg,
+                                         logs_dir=logs_dir,
+                                         extra_text=report_text)
+            try:
+                self.panel.clipboard_clear()
+                self.panel.clipboard_append(report_text)
+            except Exception:
+                pass
+            messagebox.showinfo(
+                "导出成功",
+                "诊断包已保存到：\n%s\n\n配置中的 token/密码已自动脱敏；"
+                "日志仍可能包含 IP、地址等信息，请只发给信任的支持者。" % path,
+                parent=self.panel)
+        except Exception as e:
+            log.warning("诊断包导出失败: %s", e)
+            messagebox.showerror("导出失败", "诊断包导出失败：%s" % e,
+                                 parent=self.panel)
 
     # ---------- 面板：设置项回调 ----------
 

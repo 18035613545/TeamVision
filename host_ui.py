@@ -6,16 +6,19 @@
 """
 
 import logging
+import os
 import queue
 import threading
+import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 import mss
 
 import logger as logger_mod
+import diag
 from common import (
-    APP_NAME, APP_VERSION, save_config, register_policy, REGISTER_POLICIES,
+    APP_NAME, APP_VERSION, data_dir, save_config, register_policy, REGISTER_POLICIES,
 )
 
 log = logger_mod.get_logger()
@@ -157,6 +160,10 @@ class HostConsole:
         self._srv_status = tk.Label(header, text="服务未启动", bg=COL_BG, fg=COL_DIM,
                                     font=("Microsoft YaHei", 9))
         self._srv_status.pack(anchor="w", pady=(2, 0))
+        # B2（第 134 条）：公网自检结论上面板（只展示，不改 frpc 行为）
+        self._net_status_label = tk.Label(header, text="", bg=COL_BG, fg=COL_DIM,
+                                          font=("Microsoft YaHei", 9))
+        self._net_status_label.pack(anchor="w")
         addr_row = tk.Frame(header, bg=COL_BG)
         addr_row.pack(fill="x", pady=(6, 0))
         tk.Label(addr_row, text="公网地址", bg=COL_BG, fg=COL_DIM,
@@ -305,6 +312,7 @@ class HostConsole:
                                       fg=COL_DIM, font=("Microsoft YaHei", 9))
         self._status_label.pack(side="left")
         self._button(footer, "退出", self._on_quit, accent=True).pack(side="right")
+        self._button(footer, "导出诊断包", self._on_export_diag).pack(side="right", padx=(0, 8))
 
     # ---------- 工具 ----------
 
@@ -532,6 +540,49 @@ class HostConsole:
                 "开" if self._adaptive_var.get() else "关",
                 "开" if self._auth_var.get() else "关", restart_hint))
 
+    def _on_export_diag(self):
+        """B2（第 134 条）：一键导出诊断包（脱敏 config + 近两日日志 + 运行时概况）。"""
+        try:
+            extra = []
+            try:
+                snap = self.runtime.get_snapshot()
+            except Exception:
+                snap = {}
+            clients = snap.get("clients")
+            if clients is not None:
+                extra.append("在线观众数: %d" % len(clients))
+            ns = snap.get("net_status") or {}
+            state = ns.get("state", "unknown")
+            if state == "ok":
+                extra.append("最近公网自检: 通过（%s）" % ns.get("detail", ""))
+            elif state == "fail":
+                extra.append("最近公网自检: 失败（%s）" % ns.get("detail", ""))
+            else:
+                extra.append("最近公网自检: 未运行")
+            logs_dir = os.path.join(data_dir(), "logs")
+            # 计划 §4.2.2：zip 落到 %LOCALAPPDATA%\TeamVision\logs\，
+            # 并把 report 文本复制到剪贴板（messagebox 只能展示不能复制）。
+            path = diag.build_report_zip(logs_dir, config=self.runtime.cfg,
+                                         logs_dir=logs_dir,
+                                         extra_text="\n".join(extra))
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(
+                    diag.build_report_text(self.runtime.cfg,
+                                           extra_text="\n".join(extra)))
+                copied = "\n\n报告文本已同时复制到剪贴板。"
+            except Exception:
+                copied = ""
+            messagebox.showinfo(
+                "导出成功",
+                "诊断包已保存到：\n%s%s\n\n配置中的 token/密码已自动脱敏；"
+                "日志仍可能包含 IP、地址等信息，请只发给信任的支持者。"
+                % (path, copied), parent=self.root)
+        except Exception as e:
+            log.warning("诊断包导出失败: %s", e)
+            messagebox.showerror("导出失败", "诊断包导出失败：%s" % e,
+                                 parent=self.root)
+
     def _on_quit(self):
         self._set_status("正在退出…")
         try:
@@ -607,6 +658,22 @@ class HostConsole:
             self._frp_status.configure(text="运行中", fg=COL_ONLINE)
         else:
             self._frp_status.configure(text="已停止", fg=COL_OFFLINE)
+        # B2（第 134 条）：公网自检结论行。ts==0 表示尚未跑过
+        # （未配置 public_addr 或 frpc 未启动时 _start_tunnel_selfcheck 直接跳过）。
+        ns = snap.get("net_status") or {}
+        ts = ns.get("ts") or 0.0
+        if ts and ns.get("state") == "ok":
+            self._net_status_label.configure(
+                text="公网自检：通过 ✅ %s" % time.strftime(
+                    "%H:%M", time.localtime(ts)), fg=COL_ONLINE)
+        elif ts:
+            self._net_status_label.configure(
+                text="公网自检：失败 — %s（详见运行日志）" % ns.get("detail", ""),
+                fg=COL_OFFLINE)
+        else:
+            self._net_status_label.configure(
+                text="公网自检：未运行（配置 public_addr 并启动 frpc 后自动执行）",
+                fg=COL_DIM)
         # 客户端列表（C18，2026-09-11：增量刷新）
         # 原实现每 500ms `tree.delete(*tree.get_children())` 后整表重插——行选中丢失、
         # 滚动位置被拽回顶部、客户端多时长期可见闪烁。第 115 条/C4 已把**观看端**的两棵树
