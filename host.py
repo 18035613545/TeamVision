@@ -38,7 +38,7 @@ import pipeline
 from common import (  # noqa: F401
     load_config, save_config, server_handshake, pack_frame, pack_video, exe_dir, app_dirs,
     APP_NAME, enable_dpi_awareness, accounts_path, register_policy,
-    recv_msg, send_msg, tune_socket, parse_message, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
+    recv_msg, send_msg, tune_socket, parse_message, parse_message_raw, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
     VIDEO_FLAG_KEY, CODEC_H264, parse_video, _MSG_HDR, MAGIC_CLIENT, MAGIC_SERVER,
     AUTH_TIMEOUT_DEFAULT_S, AUTH_TIMEOUT_MIN_S,
     # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
@@ -1162,8 +1162,8 @@ def _reply_ctrl(sock, info, obj, addr):
 def _allow_upstream(runtime, info, payload, addr):
     """上行帧限速（第 107 条 / B8）：超限丢帧并计数，10 秒最多告警一次。
 
-    限速发生在**转发之前**，所以超额流量既不会复制给订阅者，也不会触发
-    _fwd_member_frame 的整帧重打包（那是每帧 2 次完整拷贝）。
+    限速发生在**转发之前**，所以超额流量既不会复制给订阅者，也不会进入
+    _fwd_member_frame 的中继入队（A4 §3.1 后中继为原始 bytes 零重打包）。
     """
     if info.allow_upstream(len(payload), runtime.up_max_kbps, runtime.up_max_fps):
         return True
@@ -1176,12 +1176,18 @@ def _allow_upstream(runtime, info, payload, addr):
     return False
 
 
-def _forward_upstream_frame(runtime, sock, info, kind, payload, addr):
+def _forward_upstream_frame(runtime, sock, info, kind, payload, addr, raw=None):
     """处理客户端上行帧（MSG_VIDEO/MSG_FRAME）：登记共享者 → 校验 → 限速 → 路由。
 
     第 26 条：中继前校验负载——视频帧走 parse_video 校验结构，JPEG 帧至少含
     SOI(FFD8) 标记；0 字节/损坏负载不得直达订阅端。
+
+    A4 §3.1：调用方（_client_recv_loop）用 parse_message_raw 一次物化整条消息
+    并以 `raw` 传入时，转发直接复用该 bytes（payload 只是它的只读视图），
+    不再重打包；`raw=None`（如测试直接调用）则回退为按 kind/payload 重建。
     """
+    if raw is None:
+        raw = _MSG_HDR.pack(kind, len(payload)) + payload
     if kind == MSG_VIDEO:
         try:
             _ts, _codec, flags, _nal = parse_video(payload)
@@ -1196,7 +1202,7 @@ def _forward_upstream_frame(runtime, sock, info, kind, payload, addr):
         if not _allow_upstream(runtime, info, payload, addr):   # 第 107 条（B8）
             return
         _fwd_member_frame(runtime, info, kind, payload,
-                          is_key=bool(flags & VIDEO_FLAG_KEY))
+                          is_key=bool(flags & VIDEO_FLAG_KEY), raw=raw)
         return
     # MSG_FRAME：payload = [8B ts][JPEG]
     if len(payload) < 10 or payload[8:10] != b"\xff\xd8":
@@ -1206,7 +1212,7 @@ def _forward_upstream_frame(runtime, sock, info, kind, payload, addr):
         runtime._register_sharer(sock, info)
     if not _allow_upstream(runtime, info, payload, addr):       # 第 107 条（B8）
         return
-    _fwd_member_frame(runtime, info, kind, payload, is_jpeg=True)
+    _fwd_member_frame(runtime, info, kind, payload, is_jpeg=True, raw=raw)
 
 
 def _client_net_cfg(runtime):
@@ -1571,13 +1577,21 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
             # 视为共享声明：首帧登记为共享成员并路由给 peer 源订阅者
             protocol_error = False
             while True:
+                if rx_buf and rx_buf[0] in (MSG_VIDEO, MSG_FRAME):
+                    # A4 §3.1：上行帧走 parse_message_raw——整条消息（含 5 字节头）
+                    # 一次物化，中继直接入队该 bytes，省掉原先 payload 切片 +
+                    # _fwd_member_frame 重打包的第 2 次整帧拷贝。
+                    consumed, kind, raw = parse_message_raw(rx_buf)
+                    if consumed == 0:
+                        break
+                    del rx_buf[:consumed]
+                    _forward_upstream_frame(runtime, sock, info, kind,
+                                            memoryview(raw)[5:], addr, raw=raw)
+                    continue
                 consumed, kind, payload = parse_message(rx_buf)
                 if consumed == 0:
                     break
                 del rx_buf[:consumed]
-                if kind in (MSG_VIDEO, MSG_FRAME):
-                    _forward_upstream_frame(runtime, sock, info, kind, payload, addr)
-                    continue
                 # MSG_CTRL
                 try:
                     msg = json.loads(payload.decode("utf-8"))
@@ -1791,18 +1805,22 @@ def _send_ctrl_safe(runtime, sock, obj):
         pass
 
 
-def _fwd_member_frame(runtime, sharer, kind, payload, is_key=False, is_jpeg=False):
+def _fwd_member_frame(runtime, sharer, kind, payload, is_key=False, is_jpeg=False,
+                      raw=None):
     """把成员上行帧原样重打包后路由给该 peer 源的订阅者。
 
     帧 payload 格式与下行完全一致，重打包字节序列等价原消息（kind+len+payload）。
     第 114 条（C3）：header 用 common._MSG_HDR 一次 pack，避免多段临时 bytes。
+    A4 §3.1：recv 循环已用 parse_message_raw 物化整条消息时直接复用 `raw`，
+    跳过重打包（整帧物化次数 2→1）；转发路径不得修改 payload 任何字节。
     B8：顺带记录该成员最近一次产帧时刻（roster 的"无信号"标注依据）。
     """
     try:
         sharer.last_up_at = time.monotonic()
     except Exception:
         pass
-    raw = _MSG_HDR.pack(kind, len(payload)) + payload
+    if raw is None:
+        raw = _MSG_HDR.pack(kind, len(payload)) + payload
     route_frame(runtime, sharer.share_id, raw, is_key=is_key, is_jpeg=is_jpeg)
 
 

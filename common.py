@@ -261,6 +261,24 @@ def send_msg(sock, obj):
     sock.sendall(pack_msg(obj))
 
 
+def _scan_message(buf):
+    """校验消息头并判断是否已收完整；返回 (kind, length)，数据不足时返回 None。
+
+    非法 kind/长度抛 ValueError（协议错误，调用方应断开连接）。
+    """
+    if len(buf) < 5:
+        return None
+    kind = buf[0]
+    (length,) = _LEN_U32.unpack(buf[1:5])
+    if kind not in (MSG_FRAME, MSG_CTRL, MSG_VIDEO):
+        raise ValueError("非法的消息类型: %d" % kind)
+    if length <= 0 or length > MAX_PAYLOAD:
+        raise ValueError("非法消息长度: %d" % length)
+    if len(buf) < 5 + length:
+        return None
+    return kind, length
+
+
 def parse_message(buf):
     """从接收缓冲区解析出最早的一条完整协议消息。
 
@@ -269,20 +287,28 @@ def parse_message(buf):
       - 不足一条（等待更多数据）时返回 (0, None, None)；
       - 校验失败（非法 kind/长度）时抛出 ValueError。
     """
-    if len(buf) < 5:
+    scanned = _scan_message(buf)
+    if scanned is None:
         return 0, None, None
-    kind = buf[0]
-    (length,) = _LEN_U32.unpack(buf[1:5])
-    if kind not in (MSG_FRAME, MSG_CTRL, MSG_VIDEO):
-        raise ValueError("非法的消息类型: %d" % kind)
-    if length <= 0 or length > MAX_PAYLOAD:
-        raise ValueError("非法消息长度: %d" % length)
-    if len(buf) < 5 + length:
-        return 0, None, None
+    kind, length = scanned
     # 第 57 条：rx_buf 改用 bytearray 后切片会是 bytearray，而 pack_video/pack_frame
     # 做 bytes(...) + payload，bytes + bytearray 抛 TypeError。统一转 bytes，保证
     # 中继路径（host 转发上行帧）与缓冲区类型无关。
     return 5 + length, kind, bytes(buf[5:5 + length])
+
+
+def parse_message_raw(buf):
+    """同 parse_message，但返回**整条原始消息**（含 5 字节头）的一份 bytes。
+
+    中继转发（A4 §3.1）需要的正是完整消息而非 payload：原先 payload 切片 +
+    _fwd_member_frame 重打包共 2 次整帧拷贝，这里一次物化即可直接入队。
+    返回值与线上字节逐字节相同，转发路径不得再修改任何字节。
+    """
+    scanned = _scan_message(buf)
+    if scanned is None:
+        return 0, None, None
+    kind, length = scanned
+    return 5 + length, kind, bytes(memoryview(buf)[:5 + length])
 
 
 def recv_msg(sock, deadline=None):

@@ -1297,6 +1297,9 @@ class ViewerApp:
         self._photo = None
         self._last_frame_serial = -1
         self._last_channel_idx = -1
+        # A4 §3.2：poll 空闲退避的当前间隔（毫秒）。收到新帧或任何"需要灵敏响应"
+        # 的状态即重置 15；仅在已连上（receiving）且画面静止时沿 15→33→50 退避。
+        self._poll_idle_ms = 15
         # 第 98 条：绘制路径缓存——位置只取决于窗口尺寸（=照片尺寸），尺寸未变时跳过
         # 每帧的 update_idletasks + winfo 查询 + geometry 下发；状态文本未变时跳过 reconfigure。
         self._last_pos_size = None    # 上次定位所用的 (display_width, new_h)
@@ -2848,8 +2851,10 @@ class ViewerApp:
             except Exception:
                 pass
 
+    _POLL_BACKOFF_MS = (15, 33, 50)  # A4 §3.2：空闲退避序列，50ms 封顶
+
     def poll(self):
-        """主循环轮询：每 15ms 检查活动频道是否有新帧。"""
+        """主循环轮询：检查活动频道是否有新帧（A4 §3.2 后退避到 15/33/50ms）。"""
         if not self.running:
             return
         # item 46：先重排下一次 poll，再处理可能阻塞的认证对话框。
@@ -2857,13 +2862,14 @@ class ViewerApp:
         # 定时器，嵌套期间悬浮窗就停止绘制（画面/fps/延迟定格最长 120s），而面板刷新链
         # 仍在跑，造成面板与悬浮窗互相矛盾。提前重排可让悬浮窗在对话框期间继续刷新
         # （嵌套循环照常触发 after 定时器），且每次只排一个后继，不会形成定时器风暴。
-        self.root.after(15, self.poll)
+        self.root.after(self._poll_idle_ms, self.poll)
         self._drain_ui_queue()          # 第 108 条（B14）：执行工作线程投递的 UI 回调
         self._sync_hotkey_notice_once()  # 热键注册结果若在 ready 前被丢弃，这里补上屏
         self._process_cred_requests()
         self._check_share_sessions()    # B8：共享会话自行终止时自愈（最长 0.5 秒一次）
         if not self.channels:
             self._show_text("无频道")
+            self._poll_idle_ms = 15     # 无频道时需保持灵敏（可能随时添加/连接）
             return
         channel = self.channels[self.active_idx]
         with channel.lock:
@@ -2871,7 +2877,19 @@ class ViewerApp:
         if self._last_channel_idx == self.active_idx and self._last_frame_serial == serial:
             # 没有新帧：只更新叠加状态，避免反复复制/缩放/绘制同一画面
             self._update_status_overlay()
+            # A4 §3.2：仅"已连上且画面静止"才退避；连接中/重连/认证等状态下一拍
+            # 可能出现文本或画面变化，保持 15ms 不放大。
+            if channel.status == "receiving":
+                try:
+                    i = self._POLL_BACKOFF_MS.index(self._poll_idle_ms)
+                except ValueError:
+                    i = 0
+                self._poll_idle_ms = self._POLL_BACKOFF_MS[
+                    min(i + 1, len(self._POLL_BACKOFF_MS) - 1)]
+            else:
+                self._poll_idle_ms = 15
             return
+        self._poll_idle_ms = 15         # 收到新帧（或切源）即重置，保证收帧灵敏
         frame = None
         with channel.lock:
             if channel.last_frame is not None:
@@ -2900,6 +2918,7 @@ class ViewerApp:
         # 切换后强制重绘一次，避免沿用上一频道的帧缓存判断
         self._last_channel_idx = -1
         self._last_frame_serial = -1
+        self._poll_idle_ms = 15  # A4 §3.2：切源后恢复灵敏轮询
         channel = self.channels[self.active_idx]
         frame = None
         serial = 0
