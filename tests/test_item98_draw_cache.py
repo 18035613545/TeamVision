@@ -64,6 +64,10 @@ class _FakeCh:
     def effective_latency_ms(self):
         return self._lat
 
+    def latency_percentiles(self):
+        # E4：状态行 P95 后缀的取数入口；默认"样本不足"→ 不追加后缀，既有文案断言不变
+        return 0.0, 0.0, 0
+
 
 def _draw_app():
     """构造只含绘制路径状态的 ViewerApp（不碰真实 Tk/线程/网络）。"""

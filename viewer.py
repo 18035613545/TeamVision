@@ -12,6 +12,7 @@ import base64
 import ctypes
 import ctypes.wintypes
 import json
+import math
 import os
 import queue
 import socket
@@ -19,6 +20,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 
 import win32con
 import win32gui
@@ -312,6 +314,11 @@ class Channel:
         self._share_sync_timer = None  # 第 61 条：连接后能力确认兜底定时器（stop 时 cancel）
         self._fps_times = []  # 1 秒滑动窗口内各帧的时间戳
         self._latency_samples = []  # 最近 5 帧延迟样本（微秒），用于滑动平均平滑
+        # E4（实现方案 §11.4）：30 秒 P50/P95 样本环（≈900 帧@30fps 封顶，防内存漂移），
+        # 元素 (monotonic 到达时刻, latency_us)；_p_stats_cache = (算得时刻, p50, p95, n)，
+        # 最长 5 秒重算一次（悬浮窗 15ms 轮询直接读缓存）。
+        self._latency_ring = deque(maxlen=900)
+        self._p_stats_cache = None
         threading.Thread(
             target=self._receiver_loop, name="channel-recv", daemon=True
         ).start()
@@ -920,7 +927,8 @@ class Channel:
         # 时钟不同步时会出现异常值：负数与超过 10 秒的值一律丢弃（不进入统计），
         # 避免跨机器时钟偏差导致面板/悬浮窗显示巨大的虚假延迟
         latency_us = time.time_ns() // 1000 - ts_us
-        if 0 <= latency_us <= 10_000_000:
+        fresh = 0 <= latency_us <= 10_000_000
+        if fresh:
             self._latency_samples.append(latency_us)
             if len(self._latency_samples) > 5:
                 self._latency_samples.pop(0)
@@ -934,6 +942,33 @@ class Channel:
                 )
             else:
                 self.latency_ms = 0.0
+            if fresh:
+                self._latency_ring.append((now, latency_us))
+
+    def latency_percentiles(self):
+        """E4（§11.4）：30 秒窗口的 (p50_ms, p95_ms, 样本数)；最长 5 秒重算一次。
+
+        样本为墙钟 ts 差，跨机时钟偏差会整体平移绝对值——消费侧（面板/悬浮窗/
+        诊断报告）以相对趋势为主，另给 RTT/2 参考（effective_latency_ms）。
+        样本不足 10 个时 p50/p95 记 0（视作"暂无"），避免个别抖动霸榜。
+        """
+        with self.lock:
+            cache = self._p_stats_cache
+            now = time.monotonic()
+            if cache is not None and now - cache[0] < 5.0:
+                return cache[1], cache[2], cache[3]
+            vals = sorted(v for t, v in self._latency_ring if now - t <= 30.0)
+            n = len(vals)
+            if n < 10:
+                p50 = p95 = 0.0
+            else:
+                def _pct(p):
+                    idx = min(n - 1, max(0, int(math.ceil(p * n / 100.0)) - 1))
+                    return vals[idx] / 1000.0
+                p50 = _pct(50)
+                p95 = _pct(95)
+            self._p_stats_cache = (now, p50, p95, n)
+            return p50, p95, n
 
     def _note_no_media(self):
         """超过 1 秒未收到画面帧：按当前时刻衰减 fps 显示（第 12 条）。
@@ -1494,6 +1529,7 @@ class ViewerApp:
                 "auth_msg": ch.auth_msg,  # 第 104 条（B10）：认证失败具体原因，面板据此显示
                 "fps": fps,
                 "latency": latency,  # 端到端延迟（RTT/2，0 表示暂无数据）
+                "latency_p95": ch.latency_percentiles()[1],  # E4：30s 窗口 P95（ms，0=暂无）
                 "video": ch.video_mode,  # 是否视频编码流（展示用）
                 "codec": ch.cur_codec,   # 当前视频流编码类型（H.264/HEVC，展示用）
             })
@@ -2626,6 +2662,14 @@ class ViewerApp:
             lines.append("频道「%s」端到端延迟：%s（RTT 实测 %s）" % (
                 ch.name, lat_txt,
                 ("%.0f ms" % ch.round_trip_ms) if ch.round_trip_ms > 0 else "暂无"))
+            p50, p95, pn = ch.latency_percentiles()
+            if pn >= 10:
+                lines.append("频道「%s」延迟 P50/P95（近 30s，%d 样本）：%.0f / %.0f ms"
+                             "（墙钟差含时钟偏差，看相对趋势）" % (
+                                 ch.name, pn, p50, p95))
+            else:
+                lines.append("频道「%s」延迟 P95：样本不足（近 30s 仅 %d 帧）" % (
+                    ch.name, pn))
         # frpc 程序：同时搜索 exe 目录与 SakuraFrpLauncher 默认安装目录
         try:
             frpc_path = self.cfg["host"]["frp"].get("frpc_path", "") or "frpc.exe"
@@ -2936,6 +2980,9 @@ class ViewerApp:
             fps_txt = "%dfps" % round(ch.fps) if ch.fps > 0 else "-"
             lat = ch.effective_latency_ms()
             lat_txt = "%dms" % round(lat) if lat > 0 else "-"
+            p95 = ch.latency_percentiles()[1]
+            if p95 > 0:
+                lat_txt = "%s·P95 %dms" % (lat_txt, round(p95))
             text = "%s · %s" % (fps_txt, lat_txt)
             with ch.lock:
                 src = ch.watch_source

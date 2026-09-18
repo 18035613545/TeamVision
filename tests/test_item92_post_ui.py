@@ -170,6 +170,10 @@ class _FakeChannel:
             self._on_visit()
         return 0
 
+    def latency_percentiles(self):
+        # E4：诊断遍历会读 P50/P95；假频道一律"样本不足"（n<10）
+        return 0.0, 0.0, 0
+
 
 def _diag_app(channels):
     a = viewer.ViewerApp.__new__(viewer.ViewerApp)

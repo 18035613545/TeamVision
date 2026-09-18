@@ -58,8 +58,8 @@ def recent_log_files(logs_dir, days=2, now=None):
 def build_report_text(config, extra_text=""):
     """report.txt 内容：版本/Python/监听形态/准入与注册策略等静态项。
 
-    在线观众数、最近自检结论、延迟 P95 属运行时信息，由调用方经
-    extra_text 追加（§11.4 落地后诊断报告回填 P95）。
+    在线观众数、最近自检结论属运行时信息，由调用方经 extra_text 追加；
+    延迟 P95 自 E4（§11.4）起由观看端统计，随观众各自诊断包的频道行走。
     """
     host_cfg = (config or {}).get("host") if isinstance(config, dict) else None
     if not isinstance(host_cfg, dict):
@@ -81,7 +81,7 @@ def build_report_text(config, extra_text=""):
         "注册策略: %s" % auth.get("allow_register", "open"),
         "公网地址: %s" % (host_cfg.get("frp", {}).get("public_addr", "")
                           if isinstance(host_cfg.get("frp"), dict) else ""),
-        "延迟 P95: 尚未统计（待实现方案 §11.4）",
+        "延迟 P95: 由观看端统计（E4 已落地：见观众诊断包内「延迟 P50/P95」频道行）",
     ]
     if extra_text:
         lines.append("")
