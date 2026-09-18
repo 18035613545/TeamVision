@@ -21,18 +21,32 @@ import sys
 import threading
 import time
 
-import cv2
-import numpy as np
 import win32con
 import win32gui
 import tkinter as tk
 from tkinter import ttk, messagebox
-from PIL import Image, ImageTk
+
+# A3（第 133 条）：重依赖改为 main() 里极简 splash 上屏后由 _load_heavy() 加载。
+# onedir 冷启动时 cv2.pyd（~86MB）是导入大头；win32*/tkinter 是 Tk 系最轻的
+# 依赖，保留顶层。cv2/np/Image/ImageTk/share_mod 的全部使用点都在函数体内
+# （模块导入期零引用），哨兵初值不会被触及。
+cv2 = np = Image = ImageTk = share_mod = None
+
+
+def _load_heavy():
+    """惰性加载重依赖（幂等）：cv2 / numpy / PIL / share→pipeline 链。"""
+    global cv2, np, Image, ImageTk, share_mod
+    if cv2 is not None:
+        return
+    import cv2 as _cv2
+    import numpy as _np
+    from PIL import Image as _Image, ImageTk as _ImageTk
+    import share as _share
+    cv2, np, Image, ImageTk, share_mod = _cv2, _np, _Image, _ImageTk, _share
 
 import logger
 import splash
 import codec as codec_mod
-import share as share_mod
 from common import (
     APP_NAME,
     APP_VERSION,
@@ -1356,12 +1370,24 @@ class ViewerApp:
 
     # ---------- 生命周期 ----------
 
-    def run(self):
-        """启动 Tk 窗口、控制台面板、热键监听并进入主循环。"""
+    def run(self, root=None):
+        """启动 Tk 窗口、控制台面板、热键监听并进入主循环。
+
+        A3（第 133 条）：main() 在重依赖加载前已建好带极简 splash 的 root 并传入——
+        这里的"关闭 splash"时机点即清空 splash 内容并把同一个 root 交给
+        _build_ui 改造成悬浮窗（不新建 Tk，避免双解释器实例）。root 为 None
+        （测试/e2e 直接构造）时维持旧行为自行创建。
+        """
         global _TK_ROOT
-        self.root = tk.Tk()
+        self.root = root if root is not None else tk.Tk()
         _TK_ROOT = self.root
-        splash.show_splash(self.root)
+        if root is not None:
+            try:
+                root.overrideredirect(False)
+                for w in list(root.winfo_children()):
+                    w.destroy()
+            except tk.TclError:
+                pass  # splash root 已被外部销毁：照常继续（_build_ui 重设一切）
         self._build_ui()
         self._maybe_run_wizard()
         self._build_panel()
@@ -3345,9 +3371,26 @@ def main():
 
     enable_dpi_awareness()
 
+    # A3（第 133 条）：先上屏纯 tkinter 极简 splash，再加载 cv2/numpy/PIL/share——
+    # 双击到 splash 可见的间隔只剩 Python/Tk 启动本身。splash 失败时静默降级为
+    # 旧行为（root 由 run() 自建）。
+    splash_root = None
+    try:
+        splash_root = tk.Tk()
+        splash.show_fast_splash(splash_root)
+    except Exception:
+        log.debug("极简 splash 创建失败，降级为常规启动", exc_info=True)
+        if splash_root is not None:
+            try:
+                splash_root.destroy()
+            except Exception:
+                pass
+        splash_root = None
+    _load_heavy()
+
     app = ViewerApp(cfg, addr_override=addr_override)
     try:
-        app.run()
+        app.run(root=splash_root)
     except Exception:
         log.exception("程序异常退出")
         try:

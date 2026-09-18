@@ -15,7 +15,9 @@ import sys
 import tkinter as tk
 
 import common
-from PIL import Image, ImageTk
+# A3（第 133 条）：PIL 不再顶层导入——viewer/host 在极简 splash 之后才惰性加载
+# 重依赖，import splash 本身必须保持"纯 tkinter"。_build 内函数级导入，
+# 失败按原有"静默降级"路径显示文字版启动画面。
 
 #: 启动画面尺寸
 SPLASH_SIZE = (480, 300)
@@ -51,10 +53,10 @@ def _author_text():
     return getattr(common, "APP_AUTHOR", "by 西琳")
 
 
-def _center(win):
-    """将窗口居中显示（指定尺寸）。"""
+def _center(win, size=None):
+    """将窗口居中显示（尺寸可指定，默认 SPLASH_SIZE）。"""
     win.update_idletasks()
-    w, h = SPLASH_SIZE
+    w, h = size or SPLASH_SIZE
     x = max(0, (win.winfo_screenwidth() - w) // 2)
     y = max(0, (win.winfo_screenheight() - h) // 2)
     win.geometry("%dx%d+%d+%d" % (w, h, x, y))
@@ -66,6 +68,7 @@ def _build(win):
     path = _splash_path()
     if os.path.exists(path):
         try:
+            from PIL import Image, ImageTk
             img = Image.open(path)
             img.thumbnail(SPLASH_SIZE, Image.BILINEAR)
             photo = ImageTk.PhotoImage(img)
@@ -128,3 +131,28 @@ def show_splash(root=None):
                 win.destroy()
             except Exception:
                 pass
+
+
+#: 极简快启 splash 尺寸（文字版，无需图片/PIL）
+_FAST_SIZE = (380, 120)
+
+
+def show_fast_splash(root):
+    """A3（第 133 条）：在重依赖加载前于调用方新建的 root 上绘制极简 splash。
+
+    纯 tkinter（不触碰 cv2/numpy/PIL），调用后 root.update() 已执行、窗口
+    即刻上屏；后续 UI 就绪时由调用方清空/接管该 root。异常原样抛出交由
+    调用方降级。
+    """
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.configure(bg=_BG)
+    tk.Label(root, text=_brand_text(), bg=_BG, fg=_FG,
+             font=("Microsoft YaHei", 16, "bold")).pack(expand=True,
+                                                        pady=(14, 2))
+    tk.Label(root, text="正在启动…", bg=_BG, fg=_DIM,
+             font=("Microsoft YaHei", 10)).pack(expand=True, pady=(0, 4))
+    tk.Label(root, text=_author_text(), bg=_BG, fg=_DIM,
+             font=("Microsoft YaHei", 9)).pack(expand=True, pady=(0, 12))
+    _center(root, _FAST_SIZE)
+    root.update()

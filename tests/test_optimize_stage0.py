@@ -28,6 +28,8 @@ import common
 import host
 import viewer
 
+viewer._load_heavy()  # A3（第 133 条）：本文件 patch 真实 cv2 的属性，先触发惰性加载
+
 
 # ---------------------------------------------------------------- A1：accept 循环
 

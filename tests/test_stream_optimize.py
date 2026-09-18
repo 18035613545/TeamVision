@@ -4,6 +4,8 @@ import unittest
 
 import numpy as np
 
+import host  # A3（第 133 条）：host 重依赖惰性化，先触发加载再取转发名
+host._load_heavy()
 from host import calc_output_size, downsample_frame, motion_changed
 
 

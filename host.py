@@ -31,7 +31,34 @@ import threading
 import time
 
 import logger
-import pipeline
+
+# A3（第 133 条）：pipeline（→screen→cv2/numpy/mss）是 host 的导入大头，改为
+# main() 极简 splash 上屏后由 _load_heavy() 惰性加载（HostRuntime.__init__ 也
+# 会兜底触发，库用/测试路径 `import host; HostRuntime(cfg)` 行为不变）。
+# screen 公共件按 test_multiview.TestScreenExtraction 锁定的"host 转发 screen
+# 公共件"契约在加载后绑定为同名全局（外部/测试按 host.encode_bgr、
+# host.CaptureManager 等取用）。
+pipeline = None
+CaptureManager = STILL_STEP = downsample_frame = motion_changed = None
+still_gate_update = calc_output_size = encode_bgr = None
+
+
+def _load_heavy():
+    """惰性加载采集/编码重依赖并绑定 screen 转发名（幂等）。"""
+    global pipeline, CaptureManager, STILL_STEP, downsample_frame
+    global motion_changed, still_gate_update, calc_output_size, encode_bgr
+    if pipeline is not None:
+        return
+    import pipeline as _pipeline
+    import screen as _screen
+    pipeline = _pipeline
+    CaptureManager = _screen.CaptureManager
+    STILL_STEP = _screen.STILL_STEP
+    downsample_frame = _screen.downsample_frame
+    motion_changed = _screen.motion_changed
+    still_gate_update = _screen.still_gate_update
+    calc_output_size = _screen.calc_output_size
+    encode_bgr = _screen.encode_bgr
 
 # 注（C9）：MSG_CTRL 属协议常量，本模块只在注释里提到它；保留导入以便
 # `host.MSG_CTRL` 这类既有引用不失效（pyflakes F401 已知无害）。
@@ -46,15 +73,8 @@ from common import (  # noqa: F401
     normalize_region, safe_float, safe_int,
 )
 
-# 采集/静止检测公共件从 screen.py 导入并保持同名（viewer 上传端复用同一实现）。
-# 第 110/111 条后 host 本模块已不再直接调用这些符号——采集句柄与静止门控在
-# pipeline.CaptureSource / pipeline.StillGate，编码与回退在 pipeline.FrameEncoder，
-# 但按 test_multiview.TestScreenExtraction 锁定的"host 转发 screen 公共件"契约继续保留
-# （外部/测试按 host.encode_bgr、host.CaptureManager 等取用）。pyflakes F401 已知无害。
-from screen import (  # noqa: F401
-    CaptureManager, STILL_STEP, downsample_frame, motion_changed,
-    still_gate_update, calc_output_size, encode_bgr,
-)
+# 采集/静止检测公共件（CaptureManager、encode_bgr 等 screen 转发名）由
+# _load_heavy() 绑定——见上方 A3（第 133 条）注释。
 
 #: 全局日志器（未初始化时按默认配置惰性初始化）
 log = logger.get_logger()
@@ -802,6 +822,7 @@ class HostRuntime:
     """
 
     def __init__(self, cfg):
+        _load_heavy()  # A3（第 133 条）：main() 之外的库用/测试路径在此兜底
         self.cfg = cfg
         self.stop_event = threading.Event()
         self.clients = {}  # sock -> ClientInfo
@@ -878,6 +899,10 @@ class HostRuntime:
                   # 第 112 条（C1）：各客户端最近 1 秒**实测**发送速率汇总（bit/s）
                   "egress_bps": 0}
         self.stats_lock = threading.Lock()
+        # B2（第 134 条）：公网隧道自检结论不再只写日志——锁内替换、锁外读取，
+        # 供面板行与诊断报告（diag.build_report_zip）消费。
+        self._net_status = {"state": "unknown",
+                            "detail": "未运行自检", "ts": 0.0}
         self.accounts = AccountManager()
         self.frp = FrpManager(cfg)
         self._next_share_id = 0  # 共享成员序号（连接递增分配，断开不复用）
@@ -1072,6 +1097,12 @@ class HostRuntime:
             if backend is not _UNSET:
                 self.slot["backend"] = backend
 
+    def set_net_status(self, state, detail):
+        """B2（第 134 条）：记录一次公网自检结论（state: ok|fail|unknown）。"""
+        with self.stats_lock:
+            self._net_status = {"state": state, "detail": detail,
+                                "ts": time.time()}
+
     def get_snapshot(self):
         """返回供 GUI 刷新的状态快照（线程安全）。
 
@@ -1100,6 +1131,7 @@ class HostRuntime:
             })
         with self.stats_lock:
             perf = dict(self.stats)
+            net_status = dict(self._net_status)
         with self.slot_lock:
             perf["quality"] = self.slot["quality"]
             perf["scale"] = self.slot["scale"]
@@ -1121,6 +1153,7 @@ class HostRuntime:
             "server_up": self._server is not None,
             "bound_addr": self.bound_addr or "0.0.0.0",
             "startup_error": self.startup_error,
+            "net_status": net_status,
         }
 
 
@@ -2092,6 +2125,8 @@ def _start_tunnel_selfcheck(runtime, port, delay=3.0):
         except Exception as e:
             log.warning("公网隧道自检失败：无法连接 %s:%s（%s）——请确认 frpc 已在运行、"
                         "隧道已启用；若连接被拒绝，检查樱花控制台里隧道的本地地址/端口", host, pub_port, e)
+            # B2（第 134 条）：四种结论除日志外同步进 _net_status（面板/诊断报告消费）
+            runtime.set_net_status("fail", "无法连接 %s:%s（隧道未就绪？）" % (host, pub_port))
             return
         try:
             sock.settimeout(8)
@@ -2105,12 +2140,15 @@ def _start_tunnel_selfcheck(runtime, port, delay=3.0):
                             "「连接映射目标 [tcp://localhost:%d] 失败，连接被拒绝」。"
                             "请把隧道本地地址显式写成 127.0.0.1，或确认共享端正在监听该端口。",
                             host, pub_port, e, port)
+                runtime.set_net_status("fail", "未收到握手（隧道本地地址未指向监听端口）")
                 return
             if got == MAGIC_SERVER:
                 log.info("公网隧道自检通过：%s:%s 回连本机并完成握手", host, pub_port)
+                runtime.set_net_status("ok", "%s:%s 回连握手成功" % (host, pub_port))
             else:
                 log.warning("公网隧道自检异常：%s:%s 返回 %r（期望 %r）——"
                             "该地址可能指向了别的服务", host, pub_port, got, MAGIC_SERVER)
+                runtime.set_net_status("fail", "返回了非本服务的响应（地址指向别的服务？）")
         finally:
             try:
                 sock.close()
@@ -2975,7 +3013,31 @@ def main():
         save_config(cfg, "host")
         log.info("监听端口已覆盖为 %d 并写入 config.json", args.port)
 
+    # A3（第 133 条）：GUI 模式先上屏纯 tkinter 极简 splash，再触发重依赖加载
+    # （HostRuntime.__init__ 里的 _load_heavy 兜底）——双击到可见窗口的间隔
+    # 不再包含 cv2/numpy/mss 的导入时间。splash 失败静默降级为旧行为。
+    splash_root = None
+    if not args.console:
+        try:
+            import tkinter as tk
+            import splash as splash_mod
+            splash_root = tk.Tk()
+            splash_mod.show_fast_splash(splash_root)
+        except Exception:
+            if splash_root is not None:
+                try:
+                    splash_root.destroy()
+                except Exception:
+                    pass
+            splash_root = None
+
     runtime = HostRuntime(cfg)
+
+    if splash_root is not None:
+        try:
+            splash_root.destroy()
+        except Exception:
+            pass
 
     # 自动启动 frpc（配置了 auto_start 时）
     if cfg["host"].get("frp", {}).get("auto_start"):
