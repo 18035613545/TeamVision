@@ -31,6 +31,7 @@ import threading
 import time
 
 import logger
+import ui_common
 
 # A3（第 133 条）：pipeline（→screen→cv2/numpy/mss）是 host 的导入大头，改为
 # main() 极简 splash 上屏后由 _load_heavy() 惰性加载（HostRuntime.__init__ 也
@@ -2968,31 +2969,14 @@ def _perf_loop(runtime, p):
             # 用户改回有效值即自动恢复。统计日志在配置读取之前，故仍每秒输出。
             log.exception("性能节拍异常，跳过本次评估（线程继续，配置修复后自动恢复）")
 def _install_excepthooks():
-    """第 15 条：host.exe 以 windowed 打包（console=False，无可用 stderr）。
+    """第 15 条 → 第 136 条（C3）：实现收拢至 ui_common.install_excepthooks。
 
-    默认 threading.excepthook 把未捕获异常写向不存在的 stderr，于是 accept/采集/
-    编码/发送/性能线程崩溃时无任何日志；且 viewer 装了 excepthook 而 host 没装，
-    两端不一致。这里统一改为写入文件日志：线程异常记线程名 + traceback，主线程
-    未捕获异常额外弹一次友好提示框（与 viewer 行为一致），KeyboardInterrupt 透传。
+    host.exe 以 windowed 打包（console=False，无可用 stderr），默认钩子会把未捕获
+    异常写向不存在的 stderr，线程崩溃时无任何日志。统一语义：线程异常记线程名 +
+    traceback；主线程未捕获异常额外弹一次友好提示框（host 无 Tk 根窗口，不传
+    get_root）；KeyboardInterrupt 透传。
     """
-    def _thread_hook(args):
-        name = getattr(getattr(args, "thread", None), "name", "thread")
-        log.error("线程 %s 未捕获异常", name,
-                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-
-    def _main_hook(exc_type, exc_value, exc_tb):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_tb)
-            return
-        log.exception("未捕获异常", exc_info=(exc_type, exc_value, exc_tb))
-        try:
-            import tkinter.messagebox as mb
-            mb.showerror(APP_NAME, "程序遇到错误，已写入 logs 目录日志文件")
-        except Exception:
-            pass
-
-    threading.excepthook = _thread_hook
-    sys.excepthook = _main_hook
+    ui_common.install_excepthooks(APP_NAME)
 
 
 def print_public_addr(cfg):

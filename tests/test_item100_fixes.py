@@ -31,6 +31,7 @@ import host
 import screen
 import viewer
 import host_ui
+import ui_common
 
 
 # ---------------------------------------------------------------- 1) dxgi 色彩
@@ -436,8 +437,10 @@ class TestLateProbeAnswered(unittest.TestCase):
 
 class TestViewerThreadHook(unittest.TestCase):
     def test_main_installs_threading_excepthook(self):
+        # 第 136 条（C3）：两份钩子合并进 ui_common.install_excepthooks，
+        # viewer.main 仍必须在入口处调用它（一次装齐主线程 + 工作线程）。
         src = inspect.getsource(viewer.main)
-        self.assertIn("threading.excepthook = _thread_excepthook", src)
+        self.assertIn("ui_common.install_excepthooks", src)
 
     def test_thread_hook_logs_without_dialog(self):
         class _Args:
@@ -446,9 +449,14 @@ class TestViewerThreadHook(unittest.TestCase):
             exc_traceback = None
             thread = None
 
-        with mock.patch.object(viewer, "messagebox") as mb:
-            viewer._thread_excepthook(_Args())     # 不得抛异常
-        mb.showerror.assert_not_called()
+        old_sys, old_threading = sys.excepthook, threading.excepthook
+        try:
+            ui_common.install_excepthooks("TestApp")
+            with mock.patch("tkinter.messagebox.showerror") as mb:
+                threading.excepthook(_Args())   # 不得抛异常
+            mb.assert_not_called()
+        finally:
+            sys.excepthook, threading.excepthook = old_sys, old_threading
 
 
 # ------------------------------------------------- 12) --addr 真正生效

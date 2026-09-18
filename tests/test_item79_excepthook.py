@@ -19,6 +19,7 @@ import sys
 import unittest
 
 import viewer
+import ui_common
 
 
 def _top_level_excepthook_assigns(module):
@@ -42,14 +43,14 @@ class TestNoImportTimeHijack(unittest.TestCase):
         self.assertEqual(_top_level_excepthook_assigns(viewer), [],
                          "viewer 模块顶层仍存在 sys.excepthook 赋值，import 会劫持全局钩子")
 
-    def test_handle_uncaught_still_defined(self):
-        # 兜底处理函数本身保留（main 仍要用它）
-        self.assertTrue(callable(viewer._handle_uncaught))
+    def test_shared_installer_still_defined(self):
+        # 兜底实现保留在 ui_common（第 136 条 C3 收拢），入口仍要用它
+        self.assertTrue(callable(ui_common.install_excepthooks))
 
     def test_main_installs_excepthook(self):
-        # 安装动作已移入 main() 函数体
+        # 安装动作仍在 main() 函数体里，只是实现换成了 ui_common 共享版本
         src = inspect.getsource(viewer.main)
-        self.assertIn("sys.excepthook = _handle_uncaught", src)
+        self.assertIn("ui_common.install_excepthooks", src)
 
     def test_clean_subprocess_import_leaves_excepthook_default(self):
         # 在干净解释器里 import viewer，断言 sys.excepthook 仍是默认（运行时确认）

@@ -17,21 +17,18 @@ import mss
 
 import logger as logger_mod
 import diag
+import ui_common
 from common import (
     APP_NAME, APP_VERSION, data_dir, save_config, register_policy, REGISTER_POLICIES,
 )
 
 log = logger_mod.get_logger()
 
-#: 与观看端面板一致的深色主题配色
-COL_BG = "#14141f"
-COL_CARD = "#1e1e2e"
-COL_CTRL = "#2a2a3c"
-COL_FG = "#e6e6ef"
-COL_DIM = "#9a9ab0"
-COL_ACCENT = "#7c5cff"
-COL_ONLINE = "#4ade80"
-COL_OFFLINE = "#f87171"
+#: 与观看端面板一致的深色主题配色（第 136 条 C3：单一来源在 ui_common，此处仅重导出）
+from ui_common import (
+    COL_BG, COL_CARD, COL_CTRL, COL_FG, COL_DIM, COL_ACCENT,
+    COL_ONLINE, COL_OFFLINE,
+)
 
 #: 注册策略 → 界面文案（顺序即下拉框顺序，首项为默认）
 REGISTER_LABELS = {
@@ -110,19 +107,10 @@ class HostConsole:
     # ---------- 界面搭建 ----------
 
     def _build_style(self):
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        style.configure("Treeview",
-                        background=COL_CTRL, foreground=COL_FG, fieldbackground=COL_CTRL,
-                        bordercolor=COL_CARD, lightcolor=COL_CARD, darkcolor=COL_CARD)
-        style.configure("Treeview.Heading",
-                        background=COL_CARD, foreground=COL_DIM, relief="flat")
-        style.map("Treeview", background=[("selected", COL_ACCENT)])
-        style.map("Treeview.Heading", background=[("active", COL_CARD)])
-        style.configure("TCombobox",
-                        fieldbackground=COL_CTRL, background=COL_CTRL, foreground=COL_FG,
-                        arrowcolor=COL_FG, bordercolor=COL_CARD, lightcolor=COL_CARD,
-                        darkcolor=COL_CARD, selectbackground=COL_CTRL, selectforeground=COL_FG)
+        # 第 136 条（C3）：风格配置收拢至 ui_common.build_style（含原基础控件
+        # Treeview/Heading/TCombobox 三项，逐字节一致；额外应用的 Panel.* 命名
+        # 风格来自观看端，本窗口未使用这些名字，不影响外观）。
+        ui_common.build_style(self.root)
 
     def _card(self, parent, title):
         card = tk.Frame(parent, bg=COL_CARD)
@@ -340,14 +328,12 @@ class HostConsole:
         return frp
 
     def _post_ui(self, fn):
-        """把回调调度回 Tk 主线程（C17：隧道启停不得在主线程内同步阻塞）。"""
-        try:
-            self.root.after(0, fn)
-        except Exception:
-            try:
-                fn()
-            except Exception:
-                pass
+        """把回调调度回 Tk 主线程（C17：隧道启停不得在主线程内同步阻塞）。
+
+        第 136 条（C3）：实现收拢至 ui_common.post_to_ui（观看端因第 108 条的
+        退出竞态走独立队列，不共用此函数）。
+        """
+        ui_common.post_to_ui(self.root, fn)
 
     def _monitor_label(self, idx):
         for s in self.monitors:

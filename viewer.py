@@ -47,6 +47,7 @@ import logger
 import splash
 import codec as codec_mod
 import diag
+import ui_common
 from common import (
     APP_NAME,
     APP_VERSION,
@@ -89,48 +90,10 @@ APP_TITLE = "%s v%s" % (APP_NAME, APP_VERSION)
 _TK_ROOT = None
 
 
-def _handle_uncaught(exc_type, exc_value, exc_tb):
-    """未捕获异常兜底：记录日志并弹出友好提示，避免静默崩溃。"""
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
-        return
-    log.exception("未捕获异常", exc_info=(exc_type, exc_value, exc_tb))
-    parent = None
-    try:
-        if _TK_ROOT is not None and _TK_ROOT.winfo_exists():
-            parent = _TK_ROOT
-    except Exception:
-        parent = None
-    try:
-        messagebox.showerror(
-            APP_NAME, "程序遇到错误，已写入 logs 目录日志文件", parent=parent
-        )
-    except Exception:
-        try:
-            print("程序遇到错误，已写入 logs 目录日志文件")
-        except Exception:
-            pass
-
-
-def _thread_excepthook(args):
-    """工作线程未捕获异常兜底（第 100 条）。
-
-    windowed 打包下 sys.stderr 为 None，threading 默认钩子什么都不会写：接收/心跳/
-    上传/热键/诊断线程一旦崩溃就是"画面突然不动、日志空白"。host.py 早已安装同名
-    钩子，viewer 此前只有 sys.excepthook（只覆盖主线程）。这里补上，并**不弹模态框**
-    （工作线程崩溃不该阻塞主线程绘制）。
-    """
-    name = getattr(getattr(args, "thread", None), "name", "thread")
-    if getattr(args, "exc_type", None) is SystemExit:
-        return
-    log.error("线程 %s 未捕获异常", name,
-              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
-
-
-# 第 79 条：sys.excepthook 的安装移到 main() 里，不在 import 时无条件执行。
-# 否则任何 import viewer 的进程（含单元测试套件）都会被全局换成这个会弹**模态**
+# 第 136 条（C3）：兜底钩子实现收拢至 ui_common.install_excepthooks（第 79/100/15 条
+# 语义并集）。sys.excepthook 的**安装**仍延迟到 main()，不在 import 时无条件执行：
+# 否则任何 import viewer 的进程（含单元测试套件）都会被全局换成会弹**模态**
 # messagebox 的钩子；测试期间一旦有异常逃逸到解释器顶层，整套件就卡在 GUI 对话框后面。
-# 与 host.py 的 _install_excepthooks()（同样延迟到入口调用）保持一致。
 
 #: 全局热键修饰键
 MOD_ALT = 0x0001
@@ -170,17 +133,11 @@ HOTKEY_NAMES = {
     HOTKEY_ID_SRC_NEXT: "Ctrl+Alt+↓ 下一个画面源",
 }
 
-#: 控制台面板深色主题配色
-COL_BG = "#14141f"          # 窗口背景
-COL_CARD = "#1e1e2e"        # 卡片/输入区背景
-COL_CTRL = "#2a2a3c"        # 控件背景
-COL_FG = "#e6e6ef"          # 主要前景文字
-COL_DIM = "#9a9ab0"         # 次要文字
-COL_ACCENT = "#7c5cff"      # 强调色（按钮/选中高亮）
-COL_ONLINE = "#4ade80"      # 在线绿
-COL_CONNECTING = "#fbbf24"  # 连接中黄
-COL_OFFLINE = "#f87171"     # 断开红
-COL_ACTIVE_ROW = "#2a2440"  # 活动频道行高亮背景
+#: 控制台面板深色主题配色（第 136 条 C3：色板单一来源在 ui_common，此处仅重导出）
+from ui_common import (  # noqa: E402
+    COL_BG, COL_CARD, COL_CTRL, COL_FG, COL_DIM, COL_ACCENT,
+    COL_ONLINE, COL_CONNECTING, COL_OFFLINE, COL_ACTIVE_ROW,
+)
 
 #: 频道状态 -> 中文文本 / 状态色
 STATUS_TEXT = {
@@ -1734,48 +1691,9 @@ class ViewerApp:
         if self.panel_topmost:
             panel.attributes("-topmost", True)
 
-        # ---------- 深色主题（基于 clam） ----------
-        style = ttk.Style(panel)
-        style.theme_use("clam")
-        style.configure("Panel.TFrame", background=COL_BG)
-        style.configure("Card.TFrame", background=COL_CARD)
-        style.configure("Panel.TLabel", background=COL_BG, foreground=COL_FG)
-        style.configure("Card.TLabel", background=COL_CARD, foreground=COL_FG)
-        style.configure("PanelDim.TLabel", background=COL_BG, foreground=COL_DIM)
-        style.configure("CardDim.TLabel", background=COL_CARD, foreground=COL_DIM)
-        style.configure("Title.TLabel", background=COL_BG, foreground=COL_FG,
-                        font=("Microsoft YaHei", 14, "bold"))
-        style.configure("Subtitle.TLabel", background=COL_BG, foreground=COL_DIM,
-                        font=("Microsoft YaHei", 8))
-        style.configure("Section.TLabel", background=COL_CARD, foreground=COL_DIM,
-                        font=("Microsoft YaHei", 9, "bold"))
-        style.configure("Panel.TButton", background=COL_CTRL, foreground=COL_FG,
-                        bordercolor=COL_CTRL, padding=(10, 4))
-        style.map("Panel.TButton",
-                  background=[("active", "#3a3a52"), ("pressed", "#33334a")])
-        style.configure("Accent.TButton", background=COL_ACCENT,
-                        foreground="#ffffff", bordercolor=COL_ACCENT, padding=(12, 4))
-        style.map("Accent.TButton",
-                  background=[("active", "#8a70ff"), ("pressed", "#6b4de8")])
-        style.configure("Panel.TEntry", fieldbackground=COL_CTRL, foreground=COL_FG,
-                        bordercolor=COL_CTRL, lightcolor=COL_CTRL,
-                        darkcolor=COL_CTRL, insertcolor=COL_FG)
-        style.configure("Panel.Treeview", background=COL_CARD, fieldbackground=COL_CARD,
-                        foreground=COL_FG, bordercolor=COL_CARD, rowheight=24,
-                        font=("Microsoft YaHei", 9))
-        style.map("Panel.Treeview",
-                  background=[("selected", "#4a3f8a")],
-                  foreground=[("selected", "#ffffff")])
-        style.configure("Panel.Treeview.Heading", background=COL_CTRL,
-                        foreground=COL_FG, bordercolor=COL_CTRL, relief="flat",
-                        font=("Microsoft YaHei", 9, "bold"))
-        style.map("Panel.Treeview.Heading", background=[("active", COL_CTRL)])
-        style.configure("Panel.Horizontal.TScale", background=COL_ACCENT,
-                        troughcolor="#3a3a52", bordercolor=COL_CARD,
-                        lightcolor=COL_ACCENT, darkcolor=COL_ACCENT)
-        style.configure("Panel.TCheckbutton", background=COL_CARD, foreground=COL_FG)
-        style.map("Panel.TCheckbutton",
-                  background=[("active", COL_CARD)], foreground=[("active", COL_FG)])
+        # ---------- 深色主题（第 136 条 C3：配置块收拢至 ui_common.build_style，
+        # 逐行照搬，Panel.* 命名与原内联块完全一致） ----------
+        ui_common.build_style(panel)
 
         # ---------- 顶部：标题 + 快捷键提示 ----------
         header = ttk.Frame(panel, style="Panel.TFrame")
@@ -3393,10 +3311,9 @@ def main():
     # 第 79 条：仅在作为 GUI 应用运行时安装兜底 excepthook（覆盖 load_config /
     # ViewerApp 构造等位于下方 try 之外、异常会逃逸到解释器顶层的启动阶段）。
     # 不在 import 时安装，避免劫持测试套件等仅 import viewer 的进程的全局错误处理。
-    sys.excepthook = _handle_uncaught
-    # 第 100 条：工作线程也要有兜底（与 host.py 一致）。windowed 打包下 sys.stderr
-    # 为 None，默认 threading.excepthook 什么都不会写 → 线程崩溃后日志空白、画面定格。
-    threading.excepthook = _thread_excepthook
+    # 第 100 条 + 第 136 条（C3）：主线程/工作线程两份兜底合并进 ui_common，
+    # get_root 保留"以 Tk 根窗口为父弹窗"的原语义。
+    ui_common.install_excepthooks(APP_NAME, get_root=lambda: _TK_ROOT)
     parser = argparse.ArgumentParser(description="FPS 画面观看端（TCP 客户端 + 置顶悬浮窗）")
     parser.add_argument(
         "--addr", help="服务端地址 host:port，本次运行作为首个频道使用（无频道时覆盖 viewer.server_addr）"
