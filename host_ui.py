@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 
 import mss
 
@@ -230,8 +230,11 @@ class HostConsole:
                        bg=COL_CARD, fg=COL_FG, selectcolor=COL_CTRL,
                        activebackground=COL_CARD, activeforeground=COL_FG,
                        font=("Microsoft YaHei", 9)).pack(side="left")
-        self._button(trans_card, "应用传输设置", self._trans_save, accent=True).pack(
-            anchor="w", padx=10, pady=(4, 8))
+        btn_row = tk.Frame(trans_card, bg=COL_CARD)
+        btn_row.pack(fill="x", padx=10, pady=(4, 8))
+        self._button(btn_row, "应用传输设置", self._trans_save, accent=True).pack(side="left")
+        # B3（实现方案 §5）：closed/bootstrap 策略下无需改配置即可本地增删账户
+        self._button(btn_row, "账户管理", self._open_accounts).pack(side="left", padx=(8, 0))
 
         # ---------- 客户端区 ----------
         client_card = self._card(self.root, "已连接观看端")
@@ -525,6 +528,121 @@ class HostConsole:
                 listen, policy, fps, quality, scale,
                 "开" if self._adaptive_var.get() else "关",
                 "开" if self._auth_var.get() else "关", restart_hint))
+
+    def _open_accounts(self):
+        """B3（实现方案 §5）：账户管理窗——本地列表/添加/删除/改密，不动协议与注册策略。
+
+        数据来自共享端进程内的 AccountManager（与观看端注册同一份 accounts.json），
+        因此 closed/bootstrap 策略下也能加账户；PBKDF2 在本地一次性计算（约 0.2s），
+        期间面板短暂卡顿可接受。
+        """
+        accounts = getattr(self.runtime, "accounts", None)
+        if accounts is None:
+            messagebox.showwarning(APP_NAME, "共享端尚未初始化账户表，稍后再试")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("账户管理")
+        win.configure(bg=COL_BG)
+        win.geometry("460x300")
+        tree = ttk.Treeview(win, columns=("created", "last"),
+                            show="tree headings", height=10)
+        tree.heading("#0", text="用户名")
+        tree.heading("created", text="注册时间")
+        tree.heading("last", text="最近登录")
+        tree.column("#0", width=130, stretch=False)
+        tree.column("created", width=150, stretch=False)
+        tree.column("last", width=150, stretch=False)
+        tree.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        hint = tk.Label(win, text="", bg=COL_BG, fg=COL_DIM,
+                        font=("Microsoft YaHei", 8), justify="left")
+        hint.pack(anchor="w", padx=10)
+
+        def refresh():
+            tree.delete(*tree.get_children())
+            rows = accounts.list_users()
+            for user, created, last in rows:
+                tree.insert("", "end", text=user,
+                            values=(created or "-", last or "-"))
+            if not rows:
+                hint.configure(text="（无账户；准入开启时观看端将无法登录）")
+            return rows
+
+        def selected_user():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showwarning("账户管理", "请先在列表中选择一个账户", parent=win)
+                return None
+            return tree.item(sel[0])["text"]
+
+        def add_account():
+            user = simpledialog.askstring("添加账户", "用户名：", parent=win)
+            if not user:
+                return
+            pw = simpledialog.askstring("添加账户", "密码：", show="*", parent=win)
+            if not pw:
+                return
+            pw2 = simpledialog.askstring("添加账户", "再次输入密码确认：",
+                                         show="*", parent=win)
+            if pw2 is None:
+                return
+            if pw != pw2:
+                messagebox.showerror("添加账户", "两次输入的密码不一致", parent=win)
+                return
+            ok, msg = accounts.register(user.strip(), pw)
+            (messagebox.showinfo if ok else messagebox.showerror)(
+                "添加账户", msg, parent=win)
+            refresh()
+
+        def del_account():
+            user = selected_user()
+            if user is None:
+                return
+            if accounts.count() <= 1:
+                # 防自锁：删掉唯一账户后若准入开着，没人能再登录
+                if not messagebox.askyesno(
+                        "删除账户",
+                        "这是当前唯一账户。删除后若「账户准入」开启，"
+                        "所有观看端都将无法登录。确定删除？", parent=win):
+                    return
+                if not messagebox.askyesno(
+                        "删除账户", "再次确认：真的要删除账户 %s 吗？" % user,
+                        parent=win):
+                    return
+            elif not messagebox.askyesno("删除账户", "确定删除账户 %s？" % user,
+                                        parent=win):
+                return
+            ok, msg = accounts.remove(user)
+            (messagebox.showinfo if ok else messagebox.showerror)(
+                "删除账户", msg, parent=win)
+            refresh()
+
+        def chg_password():
+            user = selected_user()
+            if user is None:
+                return
+            pw = simpledialog.askstring("修改密码", "为 %s 设置新密码：" % user,
+                                        show="*", parent=win)
+            if not pw:
+                return
+            pw2 = simpledialog.askstring("修改密码", "再次输入新密码确认：",
+                                         show="*", parent=win)
+            if pw2 is None:
+                return
+            if pw != pw2:
+                messagebox.showerror("修改密码", "两次输入的密码不一致", parent=win)
+                return
+            ok, msg = accounts.set_password(user, pw)
+            (messagebox.showinfo if ok else messagebox.showerror)(
+                "修改密码", msg, parent=win)
+            refresh()
+
+        btns = tk.Frame(win, bg=COL_BG)
+        btns.pack(fill="x", padx=10, pady=(2, 10))
+        for text, fn in (("添加", add_account), ("删除", del_account),
+                         ("改密", chg_password)):
+            self._button(btns, text, fn).pack(side="left", padx=(0, 8))
+        self._button(btns, "关闭", win.destroy).pack(side="right")
+        refresh()
 
     def _on_export_diag(self):
         """B2（第 134 条）：一键导出诊断包（脱敏 config + 近两日日志 + 运行时概况）。"""

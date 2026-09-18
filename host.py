@@ -329,6 +329,52 @@ class AccountManager:
         log.info("账户注册成功: %s（挑战-应答）", user)
         return True, "注册成功"
 
+    # ---- B3（实现方案 §5）：账户管理面板的本地运维接口，纯本地读写、不动协议 ----
+
+    def list_users(self):
+        """返回 [(用户名, 注册时间, 最近登录)]，按注册时间排序；供面板展示，不含任何口令材料。"""
+        with self._lock:
+            rows = [
+                (u, (r.get("created") or "") if isinstance(r, dict) else "",
+                 (r.get("last_login") or "") if isinstance(r, dict) else "")
+                for u, r in self._users.items()
+            ]
+        rows.sort(key=lambda x: (x[1], x[0]))
+        return rows
+
+    def remove(self, user):
+        """删除账户，返回 (ok, 提示语)。写盘失败回滚内存，避免"面板已删、重启复活"。"""
+        user = (user or "").strip()
+        with self._lock:
+            record = self._users.get(user)
+            if not isinstance(record, dict):
+                return False, "账号不存在"
+            self._users.pop(user)
+            if not self._save():
+                self._users[user] = record
+                return False, "无法写入账户文件（磁盘或权限问题），删除未生效"
+        log.info("账户已删除: %s（本地管理）", user)
+        return True, "删除成功"
+
+    def set_password(self, user, password):
+        """本地改口令：生成新盐重新哈希（第 22 条：PBKDF2 在锁外算）。返回 (ok, 提示语)。"""
+        user = (user or "").strip()
+        if not user or not password:
+            return False, "用户名与密码不能为空"
+        salt = secrets.token_hex(16)
+        pw_hash = _hash_password(password, salt)
+        with self._lock:
+            record = self._users.get(user)
+            if not isinstance(record, dict):
+                return False, "账号不存在"
+            old = record
+            self._users[user] = dict(record, salt=salt, hash=pw_hash)
+            if not self._save():
+                self._users[user] = old
+                return False, "无法写入账户文件（磁盘或权限问题），改密未生效"
+        log.info("账户口令已重置: %s（本地管理）", user)
+        return True, "修改成功"
+
 
 class ClientInfo:
     """单个观看端连接的信息：地址、登录用户名、连接时刻、累计发送字节与 1 秒滑动窗口速率。
