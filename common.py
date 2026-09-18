@@ -20,6 +20,7 @@ kind 标记让接收端无需猜测即可区分帧与控制消息（ping/pong �
 import copy
 import json
 import os
+import select
 import shutil
 import socket
 import struct
@@ -40,6 +41,53 @@ MAGIC_CLIENT = b"FS02"
 #: 服务端握手魔数
 MAGIC_SERVER = b"OK02"
 
+#: C2（实现方案 §7）：协议版本单一载体。当前线上语义 = FS02 握手（v2.1）；
+#: D1（挑战-应答认证）落地时升 (2, 2)。握手 JSON 已随带 proto 字段，
+#: 服务端主判仍用 MAGIC（旧客户端拒绝行为不变）。
+PROTOCOL_VERSION = (2, 1)
+
+#: C2 §7 第 3 步：proto 强校验开关——"先只加不启用"。当前唯一版本载体仍是
+#: FS02 MAGIC；置 True 后服务端会拒绝 proto 不兼容的客户端（D1 的翻转点）。
+PROTO_ENFORCE = False
+
+
+def proto_compatible(msg):
+    """判定认证期 CTRL 消息随带的 proto=[major,minor]。
+
+    返回 (present, compatible)：字段缺失视为旧客户端（present=False，
+    compatible=True——主判仍是 MAGIC，保持对旧客户端的既有拒绝行为）。
+    主版本相同即兼容（次版本只要求客户端与服务端主版本一致）。
+    """
+    proto = msg.get("proto") if isinstance(msg, dict) else None
+    if not isinstance(proto, list) or not proto:
+        return False, True
+    major = proto[0]
+    if isinstance(major, bool) or not isinstance(major, int):
+        return True, False
+    return True, major == PROTOCOL_VERSION[0]
+
+
+class Act:
+    """C2：控制消息 action 常量表——两端唯一字面量来源。
+
+    UI 登录对话框的返回值（"login"/"register"）即协议 action，故同样用本表，
+    避免同一语义在协议层与 UI 层各写一份字符串。"""
+
+    AUTH_RESULT = "auth_result"
+    REQ_KEYFRAME = "req_keyframe"
+    WATCH_REJECT = "watch_reject"
+    WATCH = "watch"
+    UNSHARE = "unshare"
+    REGISTER = "register"
+    LOGIN = "login"
+    PROBE = "probe"
+    PING = "ping"
+    PONG = "pong"
+    PEERS = "peers"
+    CAP = "cap"
+    CAP_PROBE = "cap_probe"
+
+
 #: 消息 kind：JPEG 帧 / 控制消息 / H.264 视频帧
 MSG_FRAME = 0x01
 MSG_CTRL = 0x02
@@ -54,7 +102,7 @@ VIDEO_FLAG_KEY = 0x01
 
 #: 品牌与应用信息
 APP_NAME = "队友视野"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_COPYRIGHT = "Copyright © 2026 TeamVision Team"
 #: 作者署名（显示于启动画面与 exe 版本信息）
 APP_AUTHOR = "by 西琳"
@@ -69,7 +117,7 @@ _config_lock = threading.Lock()
 MAX_PAYLOAD = 32 * 1024 * 1024
 
 #: 配置结构版本：用于把 1.x 遗留配置一次性迁移到更安全的默认值（见 _upgrade_config）。
-#: 1 = 1.3.0 及更早（监听 0.0.0.0、准入默认关闭）；2 = 默认只监听本机 + 准入默认开启。
+#: 1 = 1.3.x 及更早（监听 0.0.0.0、准入默认关闭）；2 = 默认只监听本机 + 准入默认开启。
 CONFIG_VERSION = 2
 
 #: B10（2026-09-11）：认证窗口的默认值与**下界**（秒）。
@@ -309,6 +357,84 @@ def parse_message_raw(buf):
         return 0, None, None
     kind, length = scanned
     return 5 + length, kind, bytes(memoryview(buf)[:5 + length])
+
+
+def message_pump(sock, *, should_stop, on_idle, on_message,
+                 on_rx=None, on_recv_error=None, on_eof=None,
+                 on_chunk=None, on_batch=None, on_buf=None, raw_kinds=()):
+    """C2（实现方案 §7 第 2 步）：两端共用的 socket 接收泵。
+
+    骨架 = select(1s) → recv → bytearray 累积 → parse_message(_raw) 逐条排空。
+    超时判定、按 kind 解析/分发、退出语义全部留在回调里（host 的 keepalive/
+    slowloris 与 viewer 的 read_idle/重连分类保持各自配置，泵不统一默认值）：
+
+      should_stop()            每轮开始检查；True → 泵以 None 返回。
+      on_idle(now, buf)        select 超时；返回非 None 原因串结束泵（host 半开/
+                               单条消息超时）；viewer 的停滞判定改为 raise。
+      on_rx(now)               收到非空数据块（在累积前）。
+      on_recv_error(exc)       recv OSError；返回原因串结束泵；返回 None/未提供
+                               则重新抛出（viewer 借此让异常到达外层重连分类）。
+      on_eof()                 对端关闭：返回原因串结束泵，或直接 raise（viewer）。
+      on_chunk()               数据已并入缓冲区、排空开始之前（viewer 重置批处理）。
+      on_message(kind, payload, raw)
+                               每条完整消息；raw_kinds 命中的 kind 走
+                               parse_message_raw（payload 为 memoryview 切片、
+                               raw 为整条 bytes，A4 零拷贝中继），否则
+                               parse_message（payload 为 bytes，raw=None）。
+                               返回非 None 原因串**立即**结束泵（host fatal/协议错误）。
+      on_batch(buf)            一次排空结束后（viewer 的批解码点）。
+      on_buf(event, buf, now)  缓冲区状态位：event="pre_empty"（recv 前缓冲区为空，
+                               host 记 partial_since 起点）/"post"（排空后，
+                               host 按 C2/第 103 条语义重置 partial 计时）。
+
+    返回结束原因（str）或 None（should_stop 置位）。
+    """
+    buf = bytearray()
+    raw_set = frozenset(raw_kinds)
+    while not should_stop():
+        r, _, _ = select.select([sock], [], [], 1.0)
+        if not r:
+            reason = on_idle(time.monotonic(), buf)
+            if reason is not None:
+                return reason
+            continue
+        try:
+            data = sock.recv(65536)
+        except OSError as e:
+            reason = on_recv_error(e) if on_recv_error is not None else None
+            if reason is None:
+                raise
+            return reason
+        if not data:
+            return on_eof() if on_eof is not None else None
+        now = time.monotonic()
+        if on_rx is not None:
+            on_rx(now)
+        if on_buf is not None and not buf:
+            on_buf("pre_empty", buf, now)
+        buf += data
+        if on_chunk is not None:
+            on_chunk()
+        while True:
+            if raw_set and buf and buf[0] in raw_set:
+                consumed, kind, raw = parse_message_raw(buf)
+                if consumed == 0:
+                    break
+                del buf[:consumed]
+                reason = on_message(kind, memoryview(raw)[5:], raw)
+            else:
+                consumed, kind, payload = parse_message(buf)
+                if consumed == 0:
+                    break
+                del buf[:consumed]
+                reason = on_message(kind, payload, None)
+            if reason is not None:
+                return reason
+        if on_batch is not None:
+            on_batch(buf)
+        if on_buf is not None:
+            on_buf("post", buf, time.monotonic())
+    return None
 
 
 def recv_msg(sock, deadline=None):

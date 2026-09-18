@@ -65,9 +65,13 @@ def _load_heavy():
 from common import (  # noqa: F401
     load_config, save_config, server_handshake, pack_frame, pack_video, exe_dir, app_dirs,
     APP_NAME, enable_dpi_awareness, accounts_path, register_policy,
-    recv_msg, send_msg, tune_socket, parse_message, parse_message_raw, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
+    recv_msg, send_msg, tune_socket, parse_message, parse_message_raw, message_pump, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
     VIDEO_FLAG_KEY, CODEC_H264, parse_video, _MSG_HDR, MAGIC_CLIENT, MAGIC_SERVER,
     AUTH_TIMEOUT_DEFAULT_S, AUTH_TIMEOUT_MIN_S,
+    # C2（实现方案 §7）：action 常量表单点来源
+    Act,
+    # C2 §7 第 3 步：握手版本字段（先只加不启用）
+    PROTOCOL_VERSION, PROTO_ENFORCE, proto_compatible,
     # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
     # 各有一套 clamp），share.py 不再反向 import host。
     normalize_region, safe_float, safe_int,
@@ -1048,7 +1052,7 @@ class HostRuntime:
                     if time.monotonic() - getattr(c, "last_up_at", 0.0) > _MEMBER_STALE_S:
                         row["stale"] = True
                     rows.append(row)
-                msg = {"action": "peers", "peers": rows}
+                msg = {"action": Act.PEERS, "peers": rows}
                 for sock, info in snapshot:
                     try:
                         info.send_ctrl(sock, msg)
@@ -1358,17 +1362,29 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
         while True:
             msg = recv_msg(sock, deadline)
             action = msg.get("action")
+            # C2 §7 第 3 步：认证期 CTRL 随带 proto=[2,1]。主判仍是 MAGIC，
+            # 这里只留痕；PROTO_ENFORCE（当前 False）翻转后不兼容客户端被拒——
+            # 这条拒绝通道为 D1 的协议版本协商铺路。
+            present, compatible = proto_compatible(msg)
+            if present and not compatible:
+                log.warning("客户端 %s 协议版本不兼容（proto=%r，服务端=%s）",
+                            addr, msg.get("proto"), PROTOCOL_VERSION)
+                if PROTO_ENFORCE:
+                    send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
+                                    "msg": "协议版本不匹配，请更新观看端"})
+                    sock.close()
+                    return False, None
             raw_user, ok_user = _str_field(msg, "user")
             raw_pass, ok_pass = _str_field(msg, "pass")
             if not ok_user:
-                send_msg(sock, {"action": "auth_result", "ok": False,
+                send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
                                 "msg": "认证消息格式非法（user 必须是字符串）"})
                 log.warning("客户端 %s 认证消息 user 类型非法（%s），已拒绝",
                             addr, type(msg.get("user")).__name__)
                 sock.close()
                 return False, None
             if not ok_pass:
-                send_msg(sock, {"action": "auth_result", "ok": False,
+                send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
                                 "msg": "认证消息格式非法（pass 必须是字符串）"})
                 log.warning("客户端 %s 认证消息 pass 类型非法（%s），已拒绝",
                             addr, type(msg.get("pass")).__name__)
@@ -1376,23 +1392,23 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                 return False, None
             user = (raw_user or "").strip()
             password = raw_pass or ""
-            if action == "login":
+            if action == Act.LOGIN:
                 ok, text = runtime.accounts.authenticate(user, password)
-            elif action == "register":
+            elif action == Act.REGISTER:
                 allowed, why = _register_allowed(runtime, auth_cfg, addr)
                 if allowed:
                     ok, text = runtime.accounts.register(user, password)
                 else:
                     ok, text = False, why
-            elif action == "probe":
+            elif action == Act.PROBE:
                 # 观看端无凭据时的探测：告知需要登录，但不作为认证失败告警记录
                 ok, text = False, "需要登录"
             else:
                 ok, text = False, "不支持的认证请求"
-            send_msg(sock, {"action": "auth_result", "ok": ok, "msg": text})
+            send_msg(sock, {"action": Act.AUTH_RESULT, "ok": ok, "msg": text})
             if ok:
                 return True, user
-            if action == "probe":
+            if action == Act.PROBE:
                 # 第 30 条：probe 后保持连接，等观看端在同一 socket 提交真实凭据。
                 # 旧实现 probe→立刻 close，观看端第二次弹框把凭据发进死连接 →
                 # 报「认证通信失败」，重连后再弹一次才成功（首连必失败、弹两次框）。
@@ -1435,6 +1451,16 @@ def _auth_optional_phase(sock, addr):
     try:
         sock.settimeout(2.0)
         msg = recv_msg(sock)
+        # C2 §7 第 3 步：准入关闭路径同样只留痕不启用（与 _do_auth 一致）
+        present, compatible = proto_compatible(msg)
+        if present and not compatible:
+            log.warning("客户端 %s 协议版本不兼容（proto=%r，服务端=%s）",
+                        addr, msg.get("proto"), PROTOCOL_VERSION)
+            if PROTO_ENFORCE:
+                send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
+                                "msg": "协议版本不匹配，请更新观看端"})
+                sock.close()
+                return False, None
         # B1：非字符串 user 不再抛 AttributeError（那会被下面 except 记成"可选 auth 解析
         # 失败"并断开连接）；这里忽略该字段继续放行，只留一条明确日志。
         user, ok_user = _str_field(msg, "user")
@@ -1443,7 +1469,7 @@ def _auth_optional_phase(sock, addr):
                         addr, type(msg.get("user") if isinstance(msg, dict) else None).__name__)
             user = ""
         user = (user or "").strip()
-        send_msg(sock, {"action": "auth_result", "ok": True,
+        send_msg(sock, {"action": Act.AUTH_RESULT, "ok": True,
                         "msg": "账户准入已关闭，无需登录"})
         if user:
             log.info("客户端 %s 在准入关闭状态发送登录：%s（已直接放行）", addr, user)
@@ -1481,13 +1507,13 @@ def _ctrl_watch(sock, info, runtime, msg, addr):
         # B1：{"source": ["x"]} 会让 `src in _live_share_ids(runtime)` 抛
         # TypeError: unhashable type: 'list'，连接被静默断开。非字符串源按"无效源"回绝。
         log.debug("watch 拒绝非字符串源 %r（%s）", src, addr)
-        if not _reply_ctrl(sock, info, {"action": "watch_reject",
+        if not _reply_ctrl(sock, info, {"action": Act.WATCH_REJECT,
                                         "source": None, "reason": "invalid"}, addr):
             return "控制消息写入失败（连接已损坏）"
         return None
     if src != "local" and src == info.share_id:
         log.debug("watch 拒绝订阅自身 %r（%s）", src, addr)
-        if not _reply_ctrl(sock, info, {"action": "watch_reject",
+        if not _reply_ctrl(sock, info, {"action": Act.WATCH_REJECT,
                                         "source": src, "reason": "self"}, addr):
             return "控制消息写入失败（连接已损坏）"
     elif src == "local" or src in _live_share_ids(runtime):
@@ -1495,10 +1521,10 @@ def _ctrl_watch(sock, info, runtime, msg, addr):
         info.need_key = True  # 切换源：重新从关键帧开始收
         if src != "local":
             _send_ctrl_safe(runtime, _sharer_sock(runtime, src),
-                            {"action": "req_keyframe"})
+                            {"action": Act.REQ_KEYFRAME})
     else:
         log.debug("watch 无效源 %r（%s），保持原源 %r", src, addr, info.watch_source)
-        if not _reply_ctrl(sock, info, {"action": "watch_reject",
+        if not _reply_ctrl(sock, info, {"action": Act.WATCH_REJECT,
                                         "source": src, "reason": "invalid"}, addr):
             return "控制消息写入失败（连接已损坏）"
     return None
@@ -1512,32 +1538,32 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
     if not isinstance(msg, dict):
         return None
     action = msg.get("action")
-    if action == "ping":
-        if not _reply_ctrl(sock, info, {"action": "pong", "t": msg.get("t", 0)}, addr):
+    if action == Act.PING:
+        if not _reply_ctrl(sock, info, {"action": Act.PONG, "t": msg.get("t", 0)}, addr):
             return "控制消息写入失败（连接已损坏）"
-    elif action == "cap_probe":
-        if not _reply_ctrl(sock, info, {"action": "cap", "multiview": True}, addr):
+    elif action == Act.CAP_PROBE:
+        if not _reply_ctrl(sock, info, {"action": Act.CAP, "multiview": True}, addr):
             return "控制消息写入失败（连接已损坏）"
-    elif action == "watch":
+    elif action == Act.WATCH:
         return _ctrl_watch(sock, info, runtime, msg, addr)
-    elif action == "unshare":
+    elif action == Act.UNSHARE:
         # 成员主动停止共享（连接保留）：注销并广播 roster，
         # 让订阅该 peer 的观看端回落 local（viewer peers 处理）
         if info.share_id is not None:
             old_id = info.share_id
             runtime._unregister_sharer(info)
             log.info("共享成员 %s 注销：%s（%s）", addr, old_id, info.username or "-")
-    elif action == "req_keyframe":
+    elif action == Act.REQ_KEYFRAME:
         if info.watch_source.startswith("peer:"):
             # 转达成员端：其共享会话强制出一帧关键帧（第 56 条：安全发送）
             _send_ctrl_safe(runtime, _sharer_sock(runtime, info.watch_source),
-                            {"action": "req_keyframe"})
+                            {"action": Act.REQ_KEYFRAME})
         else:
             with runtime.slot_lock:
                 runtime.force_key = True  # 原逻辑：本地下一帧 IDR
             _wake_raw(runtime)  # C2：唤醒编码线程（静止期也在等 raw_evt）
             log.debug("客户端 %s 请求关键帧，已置位强制 IDR", addr)
-    elif action in ("probe", "login", "register"):
+    elif action in (Act.PROBE, Act.LOGIN, Act.REGISTER):
         # 第 100 条：迟到超过 2 秒的认证消息。准入关闭时上面的可选 auth 窗口（select 2s）
         # 已把本连接按"旧客户端"放行，此后到达的 probe/login 若无人应答，观看端会把
         # 下一条 roster/pong 当认证回复 → 在"无需登录"的服务端上反复弹登录框、最后报
@@ -1550,13 +1576,13 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
             late_user = ""
         late_user = (late_user or "").strip()
         if auth_cfg.get("enabled", False):
-            if not _reply_ctrl(sock, info, {"action": "auth_result", "ok": False,
+            if not _reply_ctrl(sock, info, {"action": Act.AUTH_RESULT, "ok": False,
                                             "msg": "需要登录"}, addr):
                 return "控制消息写入失败（连接已损坏）"
         else:
             if late_user:
                 info.username = late_user
-            if not _reply_ctrl(sock, info, {"action": "auth_result", "ok": True,
+            if not _reply_ctrl(sock, info, {"action": Act.AUTH_RESULT, "ok": True,
                                             "msg": "账户准入已关闭，无需登录"}, addr):
                 return "控制消息写入失败（连接已损坏）"
             log.debug("客户端 %s 迟到的认证消息（%s），已按准入关闭放行", addr, action)
@@ -1566,91 +1592,71 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
 def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
     """控制消息/上行帧接收循环；返回断开原因（供统一收尾记录）。
 
-    用 select 空闲轮询 + 应用层活跃时间戳做半开连接检测，避免与发送线程共享
-    settimeout 造成相互干扰；收到 ping 立即回 pong（同机测 RTT）。
+    C2（实现方案 §7 第 2 步）：select 1s + recv + bytearray 累积 + 逐条排空的
+    骨架并入 common.message_pump（与 viewer Channel._receiver_loop 共用一份）；
+    半开检测（keepalive_idle_s）、单条消息超时（第 103 条 slowloris 防线）、
+    分发与退出语义仍全部在本函数的回调里，行为逐分支不变。
     """
     # 第 102 条：走 safe_float——手改成 "abc" 时旧写法在每个客户端接入后立刻抛
     # ValueError（表现为"连上就断"），且违反本文件"配置数值一律走 safe_*"的约定。
     idle_s = safe_float(net_cfg.get("keepalive_idle_s", 60), 60, 1, 3600)
-    # 第 57 条：rx_buf 用 bytearray，+= 原地扩展（摊还 O(1)）；bytes 的 += 每次整份
-    # 重拷，攒一条大帧时退化为 O(n²) memcpy。配套 del rx_buf[:consumed] 原地弹出已
-    # 消费前缀，parse_message 已统一返回 bytes payload（不随缓冲区类型变化）。
-    rx_buf = bytearray()
-    # 第 103 条（B1）：当前未完成消息的"首字节到达时刻"。半开检测以"收到任意字节"
-    # 刷新 last_rx_at，攻击者每 <idle_s 秒发 1 字节即可永久占用线程，并把 rx_buf 攒到
-    # MAX_PAYLOAD(32MB)。这里给单条消息（头+体）设总时限，超时按协议错误断开——
-    # 正常客户端一条控制消息是毫秒级，15 秒余量充足。
+    # 第 57 条：rx_buf 用 bytearray，+= 原地扩展（摊还 O(1)）——泵内维持同一实现。
+    # 第 103 条：partial_since 记录"当前未完成消息的首字节到达时刻"，半开检测以
+    # 收到任意字节刷新 last_rx_at，攻击者每 <idle_s 秒发 1 字节即可永久占用线程，
+    # 这里给单条消息（头+体）设总时限，超时按协议错误断开。
     partial_since = None
     msg_timeout = safe_float(getattr(runtime, "msg_timeout", 15.0), 15.0, 1.0, 600.0)
-    reason = "断开"
+
+    def _on_idle(now, buf):
+        if now - info.last_rx_at > idle_s:
+            return "空闲超时（半开连接）"
+        if partial_since is not None and now - partial_since > msg_timeout:
+            return "单条消息超时（%.0f 秒内未收完整）" % msg_timeout
+        return None
+
+    def _on_buf(event, buf, now):
+        nonlocal partial_since
+        if event == "pre_empty":
+            partial_since = now  # 本段是某条新消息的第一段
+        elif not buf:
+            partial_since = None  # 缓冲区已清空：当前没有半截消息在等
+        else:
+            # C2（2026-09-11）：一段 recv 若"凑完上一条消息 + 留下下一条的半截"，
+            # partial_since 仍保留上一条消息首字节的时刻——消费完消息后缓冲区
+            # 非空即重置计时，下一条从"现在"起算自己的总时限。
+            partial_since = now
+
+    def _on_message(kind, payload, raw):
+        if kind in (MSG_VIDEO, MSG_FRAME):
+            # A4 §3.1：上行帧走泵内 parse_message_raw 零拷贝通道——整条消息
+            # （含 5 字节头）一次物化，中继直接入队该 bytes，不再重打包。
+            _forward_upstream_frame(runtime, sock, info, kind, payload, addr,
+                                    raw=raw)
+            return None
+        # MSG_CTRL
+        try:
+            msg = json.loads(payload.decode("utf-8"))
+        except ValueError:
+            return "协议错误（控制消息 JSON 损坏）"
+        return _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg)
+
     try:
-        while not runtime.stop_event.is_set():
-            r, _, _ = select.select([sock], [], [], 1.0)
-            if not r:
-                now_mono = time.monotonic()
-                if now_mono - info.last_rx_at > idle_s:
-                    reason = "空闲超时（半开连接）"
-                    break
-                if partial_since is not None and now_mono - partial_since > msg_timeout:
-                    reason = "单条消息超时（%.0f 秒内未收完整）" % msg_timeout
-                    break
-                continue
-            try:
-                data = sock.recv(65536)
-            except OSError:
-                reason = "接收错误"
-                break
-            if not data:
-                break
-            info.note_rx()
-            if not rx_buf:
-                partial_since = time.monotonic()  # 本段是某条新消息的第一段
-            rx_buf += data
-            # 逐条解析缓冲区内完整消息：CTRL 即时处理；上行帧（MSG_VIDEO/MSG_FRAME）
-            # 视为共享声明：首帧登记为共享成员并路由给 peer 源订阅者
-            protocol_error = False
-            while True:
-                if rx_buf and rx_buf[0] in (MSG_VIDEO, MSG_FRAME):
-                    # A4 §3.1：上行帧走 parse_message_raw——整条消息（含 5 字节头）
-                    # 一次物化，中继直接入队该 bytes，省掉原先 payload 切片 +
-                    # _fwd_member_frame 重打包的第 2 次整帧拷贝。
-                    consumed, kind, raw = parse_message_raw(rx_buf)
-                    if consumed == 0:
-                        break
-                    del rx_buf[:consumed]
-                    _forward_upstream_frame(runtime, sock, info, kind,
-                                            memoryview(raw)[5:], addr, raw=raw)
-                    continue
-                consumed, kind, payload = parse_message(rx_buf)
-                if consumed == 0:
-                    break
-                del rx_buf[:consumed]
-                # MSG_CTRL
-                try:
-                    msg = json.loads(payload.decode("utf-8"))
-                except ValueError:
-                    reason = "协议错误（控制消息 JSON 损坏）"
-                    protocol_error = True
-                    break
-                fatal = _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg)
-                if fatal:
-                    reason = fatal
-                    protocol_error = True
-                    break
-            if not rx_buf:
-                partial_since = None  # 缓冲区已清空：当前没有半截消息在等
-            else:
-                # C2（2026-09-11）：一段 recv 若"凑完上一条消息 + 留下下一条的半截"，
-                # partial_since 仍保留**上一条消息首字节**的时刻，第二条消息的
-                # "单条消息总时限"（msg_timeout_s，默认 15s）被提前起算——理论上可在
-                # 只收到它一小部分时被判定超时断开。消费完消息后缓冲区非空即重置计时。
-                partial_since = time.monotonic()
-            if protocol_error:
-                break  # 协议错误：立即断开，避免异常字节滞留缓冲区导致内存增长
+        reason = message_pump(
+            sock,
+            should_stop=runtime.stop_event.is_set,
+            on_idle=_on_idle,
+            on_rx=lambda now: info.note_rx(),
+            on_recv_error=lambda exc: "接收错误",
+            on_eof=lambda: "断开",
+            on_message=_on_message,
+            on_buf=_on_buf,
+            raw_kinds=(MSG_VIDEO, MSG_FRAME),
+        )
+        return reason if reason is not None else "断开"
     except Exception as e:
         reason = "异常: %s" % e
         log.debug("客户端 %s %s", addr, reason)
-    return reason
+        return reason
 
 
 def _client_teardown(sock, info, runtime, addr, username, reason):
@@ -1815,7 +1821,7 @@ def _request_peer_keyframe(runtime, share_id, cooldown=1.0):
     sock = _sharer_sock(runtime, share_id)
     if sock is None:
         return False
-    _send_ctrl_safe(runtime, sock, {"action": "req_keyframe"})
+    _send_ctrl_safe(runtime, sock, {"action": Act.REQ_KEYFRAME})
     return True
 
 

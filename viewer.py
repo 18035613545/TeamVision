@@ -14,7 +14,6 @@ import ctypes.wintypes
 import json
 import os
 import queue
-import select
 import socket
 import struct
 import sys
@@ -64,6 +63,7 @@ from common import (
     enable_dpi_awareness,
     tune_socket,
     parse_message,
+    message_pump,
     parse_video,
     MSG_FRAME,
     MSG_VIDEO,
@@ -73,6 +73,10 @@ from common import (
     # C1（优化方案 2026-09-17）：原 _cfg_int/_cfg_float 私有副本并入 common。
     safe_float,
     safe_int,
+    # C2（实现方案 §7）：action 常量表单点来源
+    Act,
+    # C2 §7 第 3 步：认证期 CTRL 随带协议版本
+    PROTOCOL_VERSION,
 )
 
 #: 模块级日志（logger.setup_logger(cfg) 幂等初始化后生效）
@@ -443,10 +447,10 @@ class Channel:
                 try:
                     # 第 100 条：三条消息各自有界（_send_locked），避免对端不读时
                     # 接收线程在连接初始化阶段就无限阻塞。
-                    self._send_locked(sock, {"action": "req_keyframe", "t": time.time_ns()})
-                    self._send_locked(sock, {"action": "cap_probe"})
+                    self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()})
+                    self._send_locked(sock, {"action": Act.CAP_PROBE})
                     if self.watch_source != "local":
-                        self._send_locked(sock, {"action": "watch",
+                        self._send_locked(sock, {"action": Act.WATCH,
                                                  "source": self.watch_source})
                 except (OSError, ValueError):
                     pass
@@ -460,59 +464,66 @@ class Channel:
                 self._share_sync_timer.daemon = True
                 self._share_sync_timer.start()
                 self._notify_owner_peers()
-                # 第 57 条：rx_buf 用 bytearray，+= 原地扩展（摊还 O(1)），避免攒大帧时
-                # bytes += 的整份重拷退化为 O(n²)。配套 del rx_buf[:consumed] 原地弹出，
-                # parse_message 统一返回 bytes payload，下游解码不受缓冲区类型影响。
-                rx_buf = bytearray()
+                # C2（实现方案 §7 第 2 步）：select 1s + recv + bytearray 累积 +
+                # 逐条排空的骨架并入 common.message_pump（与 host._client_recv_loop
+                # 共用一份）；停滞判定、关键帧请求、批解码语义仍留在下面的回调里，
+                # 第 2/7/12/57 条行为逐分支不变。
                 last_rx = time.monotonic()
                 last_media_rx = last_rx  # 最近一次收到画面帧（第 2/12 条用）
-                while self._running:
-                    r, _, _ = select.select([sock], [], [], 1.0)
-                    if not r:
-                        now_m = time.monotonic()
-                        # 第 12 条：超过 1 秒无画面帧则衰减 fps，避免死频道锁存旧帧率
-                        if now_m - last_media_rx > 1.0:
-                            self._note_no_media()
-                        # 第 2 条：连接活着（pong 在流）但长时间收不到画面帧 → 主动请求
-                        # 关键帧，打破「need_key 门控 + 仅解码失败才请求 + pong 击败停滞
-                        # 检测」三者叠加导致的画面永久定格（状态仍显示 receiving）。
-                        if (self.status == "receiving"
-                                and now_m - last_media_rx > self._read_idle_s):
-                            self._request_keyframe(sock)
-                        # 完全无任何数据（含 pong）超过阈值：判定连接停滞，退出重连
-                        if now_m - last_rx > self._read_idle_s:
-                            raise ConnectionError(
-                                "%.0f 秒未收到数据，判定连接停滞" % self._read_idle_s)
-                        continue
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        raise ConnectionError("连接关闭")
-                    last_rx = time.monotonic()
-                    rx_buf += chunk
-                    # 解析缓冲区中所有完整消息。第 7 条：JPEG 各帧独立可解，只留最新一份；
-                    # H.264/HEVC 必须按序解码批次内全部帧以维持参考帧链（丢中间帧会花屏/
-                    # 拖影直到下一个关键帧），故视频帧收集成有序列表逐帧喂解码器。
-                    latest_jpeg = None       # (ts, jpeg_bytes)
-                    video_batch = []         # [(ts, codec, flags, nal)]，按到达顺序
-                    while True:
-                        consumed, kind, payload = parse_message(rx_buf)
-                        if consumed == 0:
-                            break
-                        del rx_buf[:consumed]
-                        if kind == MSG_VIDEO:
-                            try:
-                                ts, codec, flags, nal = parse_video(payload)
-                            except ValueError:
-                                continue
-                            video_batch.append((ts, codec, flags, nal))
-                        elif kind == MSG_FRAME:
-                            if len(payload) < 8:
-                                log.warning("频道[%s] 帧 payload 过短，跳过", self.name)
-                                continue
-                            (ts,) = struct.unpack(">Q", payload[:8])
-                            latest_jpeg = (ts, payload[8:])
-                        else:  # MSG_CTRL
-                            self._handle_ctrl(payload)
+                latest_jpeg = None       # (ts, jpeg_bytes)
+                video_batch = []         # [(ts, codec, flags, nal)]，按到达顺序
+
+                def _on_idle(now, buf):
+                    # 第 12 条：超过 1 秒无画面帧则衰减 fps，避免死频道锁存旧帧率
+                    if now - last_media_rx > 1.0:
+                        self._note_no_media()
+                    # 第 2 条：连接活着（pong 在流）但长时间收不到画面帧 → 主动请求
+                    # 关键帧，打破「need_key 门控 + 仅解码失败才请求 + pong 击败停滞
+                    # 检测」三者叠加导致的画面永久定格（状态仍显示 receiving）。
+                    if (self.status == "receiving"
+                            and now - last_media_rx > self._read_idle_s):
+                        self._request_keyframe(sock)
+                    # 完全无任何数据（含 pong）超过阈值：判定连接停滞，退出重连
+                    if now - last_rx > self._read_idle_s:
+                        raise ConnectionError(
+                            "%.0f 秒未收到数据，判定连接停滞" % self._read_idle_s)
+                    return None
+
+                def _on_rx(now):
+                    nonlocal last_rx
+                    last_rx = now
+
+                def _on_eof():
+                    raise ConnectionError("连接关闭")
+
+                def _on_chunk():
+                    nonlocal latest_jpeg
+                    latest_jpeg = None
+                    del video_batch[:]
+
+                def _on_message(kind, payload, raw):
+                    nonlocal latest_jpeg
+                    # 第 7 条：JPEG 各帧独立可解，只留最新一份；H.264/HEVC 必须按序
+                    # 解码批次内全部帧以维持参考帧链（丢中间帧会花屏/拖影直到下一个
+                    # 关键帧），故视频帧收集成有序列表逐帧喂解码器。
+                    if kind == MSG_VIDEO:
+                        try:
+                            ts, codec, flags, nal = parse_video(payload)
+                        except ValueError:
+                            return None
+                        video_batch.append((ts, codec, flags, nal))
+                    elif kind == MSG_FRAME:
+                        if len(payload) < 8:
+                            log.warning("频道[%s] 帧 payload 过短，跳过", self.name)
+                            return None
+                        (ts,) = struct.unpack(">Q", payload[:8])
+                        latest_jpeg = (ts, payload[8:])
+                    else:  # MSG_CTRL
+                        self._handle_ctrl(payload)
+                    return None
+
+                def _on_batch(buf):
+                    nonlocal last_media_rx
                     if video_batch:
                         last_media_rx = time.monotonic()  # 收到画面帧（第 2/12 条）
                         self._decode_video_batch(sock, video_batch)
@@ -528,6 +539,12 @@ class Channel:
                             self._retry_delay = 0.0
                         else:
                             log.warning("频道[%s] 帧解码失败，跳过该帧", self.name)
+
+                message_pump(sock,
+                             should_stop=lambda: not self._running,
+                             on_idle=_on_idle, on_rx=_on_rx, on_eof=_on_eof,
+                             on_chunk=_on_chunk, on_message=_on_message,
+                             on_batch=_on_batch)
             except Exception as exc:
                 self._active_sock = None
                 log.warning("频道[%s] 连接断开: %s", self.name, exc)
@@ -600,7 +617,7 @@ class Channel:
             if self._active_sock is not sock:
                 return  # 连接已重建/断开：旧连接的心跳线程退出
             try:
-                self._send_locked(sock, {"action": "ping", "t": time.time_ns()})
+                self._send_locked(sock, {"action": Act.PING, "t": time.time_ns()})
             except (OSError, ValueError):
                 return  # 连接已断/发送超时，接收循环会负责重连
 
@@ -611,7 +628,7 @@ class Channel:
             return
         self._key_requested_at = now
         try:
-            self._send_locked(sock, {"action": "req_keyframe", "t": time.time_ns()})
+            self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()})
         except (OSError, ValueError):
             pass
 
@@ -693,18 +710,18 @@ class Channel:
         if not isinstance(msg, dict):
             return
         action = msg.get("action")
-        if action == "pong":
+        if action == Act.PONG:
             t = msg.get("t")
             if isinstance(t, int) and t > 0:
                 rtt_ms = (time.time_ns() - t) / 1_000_000.0
                 if 0 < rtt_ms < 60_000:  # 过滤异常值（>60s 视为脏数据）
                     self.round_trip_ms = rtt_ms
-        elif action == "cap":
+        elif action == Act.CAP:
             if msg.get("multiview"):
                 self.multiview = True
                 self._cap_event.set()
                 self._maybe_resume_share()
-        elif action == "peers":
+        elif action == Act.PEERS:
             rows = msg.get("peers")
             if isinstance(rows, list):
                 with self.lock:
@@ -714,10 +731,10 @@ class Channel:
                 self._cap_event.set()
                 self._on_peers_updated()
                 self._maybe_resume_share()
-        elif action == "req_keyframe":
+        elif action == Act.REQ_KEYFRAME:
             # host 转达（别的 viewer 正在观看本机共享）：请求上传器补关键帧
             self.request_keyframe()
-        elif action == "watch_reject":
+        elif action == Act.WATCH_REJECT:
             # 第 9 条：host 拒绝切源（订阅自身/源已失效）。本地已提交的新源未生效，
             # 回落 local（host 永不拒绝 local），避免状态栏长期谎报「源:队友·X」。
             # 仅当被拒源仍等于当前 watch_source 时才回落，免得清掉更晚发起的切源。
@@ -750,12 +767,12 @@ class Channel:
             if not user or not password:
                 if self._anon_ok:
                     # 已确认准入关闭（匿名放行）：每次重连直接 probe，不弹框
-                    action, user, password = "probe", "", ""
+                    action, user, password = Act.PROBE, "", ""
                 elif not self._auth_probed:
                     # 首次无凭据时先发探测：服务端准入关闭会直接放行，
                     # 就不需要再弹登录框；服务端仍要求认证时下一轮再弹框。
                     self._auth_probed = True
-                    action, user, password = "probe", "", ""
+                    action, user, password = Act.PROBE, "", ""
                 else:
                     result = self._ask_credentials()
                     if result is None:  # 用户取消
@@ -765,11 +782,12 @@ class Channel:
                     action, user, password = result
                     self.username = user
             else:
-                action = "login"
+                action = Act.LOGIN
             try:
                 if user:
                     self._last_auth_user = user   # 第 133 条：失败后预填用
-                send_msg(sock, {"action": action, "user": user, "pass": password})
+                send_msg(sock, {"action": action, "user": user, "pass": password,
+                                "proto": list(PROTOCOL_VERSION)})
                 sock.settimeout(5.0)
                 reply = recv_msg(sock)
             except Exception as exc:
@@ -805,14 +823,14 @@ class Channel:
                 continue
             # 第 28 条：注册时用户名被占用并不代表已保存的登录凭据失效，绝不能据此清空
             # 凭据（原 bug：点“注册”输了个已占用的名字，该频道有效的登录凭据被抹掉）。
-            if action == "register" and msg == "用户名已存在":
+            if action == Act.REGISTER and msg == "用户名已存在":
                 # 第 133 条：带原因重新弹框（而不是静默 30 秒），让用户能立刻改名重试
                 self._auth_error_text = "注册失败：用户名已被占用，请换一个或改点「登录」"
                 self.auth_msg = self._auth_error_text
                 self._retry_delay = 0.0
                 log.warning("频道[%s] 注册用户名已被占用：%s（稍后重新弹出登录框）", self.name, user)
                 return False
-            if action == "register" and msg:
+            if action == Act.REGISTER and msg:
                 # 第 131 条：服务端关闭了自助注册（bootstrap/closed 策略）或账户文件写不
                 # 进去时，必须把原因显示出来并停止本轮重试；否则用户看到的只是"输完又弹
                 # 框"，误以为是自己密码打错了。
@@ -1004,7 +1022,7 @@ class Channel:
             sock = self._active_sock
             if sock is not None:
                 try:
-                    self._send_locked(sock, {"action": "unshare"})
+                    self._send_locked(sock, {"action": Act.UNSHARE})
                 except (OSError, ValueError):
                     pass
             log.info("频道[%s] 共享已关闭", self.name)
@@ -1067,10 +1085,10 @@ class Channel:
             return False
         try:
             # 第 100 条：有界发送；超时抛 socket.timeout（OSError 子类）→ 回滚
-            self._send_locked(sock, {"action": "watch", "source": source})
+            self._send_locked(sock, {"action": Act.WATCH, "source": source})
             if source == "local":
                 # 本地源由 host 编码线程消费 force_key；看 peer 由 host 转达
-                self._send_locked(sock, {"action": "req_keyframe", "t": time.time_ns()})
+                self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()})
         except (OSError, ValueError):
             self._revert_source(prev_source)  # 第 9 条：发包失败，回滚避免谎报
             return False
@@ -1191,7 +1209,7 @@ class Channel:
         sock = self._active_sock
         if sock is not None:
             try:
-                self._send_locked(sock, {"action": "unshare"})
+                self._send_locked(sock, {"action": Act.UNSHARE})
             except (OSError, ValueError):
                 pass
         log.warning("频道[%s] 共享已停止：%s", self.name, reason)
@@ -2510,11 +2528,11 @@ class ViewerApp:
         tk.Button(btns, text="登录", bg=COL_ACCENT, fg="#ffffff", relief="flat",
                   activebackground="#8a70ff", activeforeground="#ffffff",
                   padx=14, pady=4,
-                  command=lambda: _submit("login")).pack(side="left")
+                  command=lambda: _submit(Act.LOGIN)).pack(side="left")
         tk.Button(btns, text="注册并登录", bg=COL_CTRL, fg=COL_FG, relief="flat",
                   activebackground="#3a3a52", activeforeground=COL_FG,
                   padx=14, pady=4,
-                  command=lambda: _submit("register")).pack(side="left", padx=(8, 0))
+                  command=lambda: _submit(Act.REGISTER)).pack(side="left", padx=(8, 0))
         tk.Button(btns, text="取消", bg=COL_CTRL, fg=COL_FG, relief="flat",
                   activebackground="#3a3a52", activeforeground=COL_FG,
                   padx=14, pady=4, command=win.destroy).pack(side="right")
