@@ -6,6 +6,15 @@
 示例（演示新格式）：
 - `codec-001｜解码上下文切源复用 + flush，重建前先 close，不再每次 new VideoDecoder（原第 116 条 C6）｜tests/test_optimize_stage1.py`
 
+codec-002｜set_fps 改「锁外构造、锁内切换」，失败保留旧编码器（第 112 条口径补齐）｜—
+codec-003｜一次 encode 多包合并输出（不再只取 pkts[-1]），空包跳过｜—
+codec-004｜静止期强制 IDR 校验 is_key 与缓存帧尺寸，未生效不发且保留请求｜—
+codec-005｜解码器释放与编码侧同口径（PyAV 17 无 close 时 flush + 解引用）｜—
+codec-006｜FrameEncoder.encode(bitrate=) 对已存在编码器生效（带 ±15% 迟滞）｜—
+codec-007｜候选编码器不可用原因按名字记一次（INFO 可见）｜—
+codec-008｜_send_key_response 返回是否真送出，失败不再消费 key_evt（第 3 条口径恢复）｜—
+codec-009｜stop() join 超时保留 _thread 引用，幂等 start() 不再可能双线程共用编码器｜—
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 codec 的条目。一行一条 `第 N 条｜简述`。

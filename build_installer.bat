@@ -8,14 +8,26 @@ echo   安装包生成脚本 (Inno Setup 6)
 echo ============================================
 echo.
 
-rem ===== [1/4] 前置检查：提醒先打包 exe =====
+rem ===== [1/4] 前置检查：dist 产物缺失即中止 =====
+rem dist-002（2026-09-18）：旧实现缺 exe 只打印「提示」继续走——Inno 的 dist\fps-host\*
+rem 通配在目录不存在时仅 warning，于是能编译出"安装包已生成"的**空壳包**且脚本 exit 0。
+rem 两个端的 exe 是硬前提，缺失直接失败（CI 才能正确拦截）。
 echo [1/4] 检查 dist 目录下的编译产物...
 set "HAS_FRPC=1"
+set "MISSING=0"
 if not exist "dist\fps-host\fps-host.exe" (
-    echo [提示] 未找到 dist\fps-host\fps-host.exe，请先运行 build_exe.bat 生成共享端。
+    echo [错误] 未找到 dist\fps-host\fps-host.exe，请先运行 build_exe.bat 生成共享端。
+    set "MISSING=1"
 )
 if not exist "dist\fps-viewer\fps-viewer.exe" (
-    echo [提示] 未找到 dist\fps-viewer\fps-viewer.exe，请先运行 build_exe.bat 生成观看端。
+    echo [错误] 未找到 dist\fps-viewer\fps-viewer.exe，请先运行 build_exe.bat 生成观看端。
+    set "MISSING=1"
+)
+if "%MISSING%"=="1" (
+    echo.
+    echo [错误] dist 产物不完整，已中止（避免生成空壳安装包）。
+    if not defined CI if not defined NOPAUSE pause
+    exit /b 1
 )
 if not exist "dist\frpc.exe" (
     set "HAS_FRPC=0"
@@ -57,8 +69,20 @@ echo [3/4] 编译安装包 installer.iss ...
 if errorlevel 1 goto :failed
 echo.
 
-rem ===== [4/4] 对安装包做 Authenticode 签名 =====
-echo [4/4] 签名安装包 ...
+rem ===== [4/4] 校验产物 + Authenticode 签名 =====
+echo [4/4] 校验并签名安装包 ...
+rem dist-002：ISCC 返回 0 仍可能是"空壳包"（见 [1/4]），这里再校验产物存在且非空壳
+if not exist "dist\TeamVision-Setup-1.4.0.exe" (
+    echo [错误] 未找到 dist\TeamVision-Setup-1.4.0.exe，安装包未生成。
+    if not defined CI if not defined NOPAUSE pause
+    exit /b 1
+)
+for %%A in ("dist\TeamVision-Setup-1.4.0.exe") do set "SETUP_SIZE=%%~zA"
+if %SETUP_SIZE% LSS 1048576 (
+    echo [错误] 安装包体积异常小（%SETUP_SIZE% 字节），疑似空壳包，请检查 [1/4] 的产物。
+    if not defined CI if not defined NOPAUSE pause
+    exit /b 1
+)
 if exist "dist\TeamVision-Setup-1.4.0.exe" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1" ^
         -Files "dist\TeamVision-Setup-1.4.0.exe"

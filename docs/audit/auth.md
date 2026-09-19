@@ -6,6 +6,19 @@
 示例（演示新格式）：
 - `auth-001｜反作弊误报收敛 + 默认安全加固（listen_host / auth 一次性迁移）（原第 131 条）｜tests/test_item131_hardening.py`
 
+auth-002｜KDF 参数强校验（iter 区间/salt 定长/非空 nonce）+ proof 绑定 user 与域分隔串（协议 v2.3）｜tests/test_d1_challenge_auth.py
+auth-003｜观看端拒绝明文口令降级路径（proto 被剥/旧服务端即拒绝并提示升级）｜tests/test_d1_challenge_auth.py
+auth-004｜注册仍把验证子 dk 过网（pass-the-hash）：已评估需信道层（TLS/PAKE）根治，登记为待设计｜—
+auth-005｜认证分档时限（首消息 30s/挑战 60s+宽限/probe 后 150s）+ 未认证连接配额（max_clients/4）｜—
+auth-006｜注册凭据上下界（用户名 ≤64、salt 32 位 hex、dk 64 位 hex）｜—
+auth-007｜注册策略非法值 fail-closed 归一为 closed（错别字不再静默开放注册）｜tests/test_item131_hardening.py
+auth-008｜账号枚举面抹平：不存在/损坏账号同样下发伪盐挑战 + 统一「用户名或密码错误」+ 同代价假比较（服务端限速按项目裁定不做）｜tests/test_d1_challenge_auth.py
+auth-009｜accounts.json 跨进程文件锁 + 锁内读-改-写 + 唯一临时名（双开实例不再抹账户/复活）｜tests/test_optimize_stage0.py
+auth-010｜bootstrap 窗口持久「已消耗」标记（删唯一账户不再静默重开注册）+ 面板文案与后果对齐｜—
+auth-011｜改密同步写入当前 iter（常量上调后不再永久登录失败）｜tests/test_b3_account_manage.py
+auth-012｜诊断包脱敏改包含式键名匹配 + 用户名遮蔽 + 只收本进程日志（两端日志不再混包）｜tests/test_diag.py
+auth-013｜mask_secret 短串自适应（9~24 位只留尾 2 位，不再近乎明文）｜—
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 auth 的条目。一行一条 `第 N 条｜简述`。

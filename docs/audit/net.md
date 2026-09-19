@@ -6,6 +6,19 @@
 示例（演示新格式）：
 - `net-001｜协议层单点：Act 常量表 + 共享接收泵 + proto 字段（原第 135 条）｜tests/test_protocol_single_point.py`
 
+net-015｜泵把「本轮消费条数」传给 on_buf，note_rx 按完整消息刷新（滴字节不能再续命慢速攻击）｜tests/test_protocol_single_point.py
+net-016｜ABR 判据只采信本机源订阅者（含实测吞吐），降级补订阅者门控｜—
+net-017｜解码积压检测 + 追新模式（重置解码器、只喂关键帧直到 IDR），延迟不再只增不减｜—
+net-018｜parse_addr 支持 IPv6（[::1]:5700、裸 ::1 不再被当成端口 1）｜—
+net-019｜入册后任何异常都走统一收尾（不再泄漏客户端/发送线程/删不掉的源）｜—
+net-020｜触发全量 roster 广播的 watch/unshare 加限速（10 秒 3 条）｜—
+net-021｜peer 源订阅者丢帧不再置本机 force_key（IDR 风暴正反馈）｜—
+net-022｜准入关闭时可选 auth 消息加总时限（滴字节不再永久挂连接名额）｜—
+net-023｜公网自检周期化（10 分钟）+ sendall 进 try + 面板结论带时效提示｜—
+net-024｜tune_socket 接住 TypeError/ValueError；Windows py<3.13 用 WSAIoctl 补 keepalive 空闲/间隔｜—
+net-025｜safe_int/safe_float/normalize_region 防 Infinity/NaN/1e999（OverflowError 同接）｜—
+net-026｜认证消息非 dict（如 [1,2]）明确按协议错误拒绝，不再误标通信失败｜—
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 net 的条目。一行一条 `第 N 条｜简述`。

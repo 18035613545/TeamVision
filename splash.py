@@ -8,6 +8,11 @@
   用 root.after 定时销毁，不阻塞主程序。
 
 任何异常静默降级，不影响主程序。
+
+dist-003（2026-09-18）：**现行实现是 show_fast_splash()**（纯 tkinter 现绘，重依赖
+加载前即可上屏）。上面的图片版 show_splash() 自 A3（第 133 条，4b2668a）起已无
+调用方，保留仅为兼容旧引用；`assets/splash.png` 已随 common.APP_VERSION 重新生成
+（不再内嵌过期版本号）。
 """
 
 import os
