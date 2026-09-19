@@ -107,7 +107,8 @@ def _answer_challenge(client, user, password, action_proof, extra=None, chal=Non
     salt = (extra or {}).get("salt") or chal.get("salt") or ""
     dk = derive_dk(password, salt, int(chal.get("iter") or PBKDF2_ITERATIONS))
     reply = {"action": action_proof, "user": user,
-             "proof": b64e(challenge_mac(dk, nonce)),
+             # auth-002（协议 v2.3）：proof 绑定用户名
+             "proof": b64e(challenge_mac(dk, nonce, user)),
              "proto": list(common.PROTOCOL_VERSION)}
     if extra:
         reply.update(extra)
@@ -164,6 +165,7 @@ class D1HostStateMachine(unittest.TestCase):
         ok, msg = rt.accounts.register("bob", PW)
         self.assertTrue(ok, msg)
         record = rt.accounts._users["bob"]
+        record.pop("iter", None)          # 模拟第 131 条前的记录（无 iter 字段）
         self.assertNotIn("iter", record)
         c = _Client(rt, self._cfg())
         self.addCleanup(c.close)
@@ -194,10 +196,14 @@ class D1HostStateMachine(unittest.TestCase):
         self.addCleanup(c.close)
         c.send({"action": Act.LOGIN, "user": "ghost", "pass": "",
                 "proto": list(common.PROTOCOL_VERSION)})
-        res = c.recv()
-        self.assertEqual(res.get("action"), Act.AUTH_RESULT)
+        chal = c.recv()
+        # auth-008（2026-09-18）：账号不存在也照常下发挑战（确定性伪盐），
+        # 响应形态与真实账号一致——不能据此枚举用户名
+        self.assertEqual(chal.get("action"), Act.CHAL)
+        self.assertRegex(chal.get("salt") or "", r"^[0-9a-f]{32}$")
+        res = _answer_challenge(c, "ghost", PW, Act.AUTH_PROOF, chal=chal)
         self.assertFalse(res.get("ok"))
-        self.assertEqual(res.get("msg"), "账号不存在")
+        self.assertEqual(res.get("msg"), "用户名或密码错误")
         self.assertTrue(c.wait_closed())
 
     def test_proof_without_pending_challenge_rejected(self):
@@ -224,7 +230,7 @@ class D1HostStateMachine(unittest.TestCase):
         chal = c.recv()
         self.assertEqual(chal.get("action"), Act.CHAL)
         c.send({"action": Act.AUTH_PROOF, "user": "bob",
-                "proof": b64e(challenge_mac(b"k" * 32, b64d(chal["nonce"]))),
+                "proof": b64e(challenge_mac(b"k" * 32, b64d(chal["nonce"]), "bob")),
                 "proto": list(common.PROTOCOL_VERSION)})
         res = c.recv()
         self.assertFalse(res.get("ok"))
@@ -305,7 +311,8 @@ class D1HostStateMachine(unittest.TestCase):
         c.send({"action": Act.LOGIN, "user": "alice", "pass": "",
                 "proto": list(common.PROTOCOL_VERSION)})
         res = c.recv()
-        self.assertEqual(res.get("msg"), "账号不存在")
+        # auth-008：未注册账号同样收到挑战（伪盐），形态与真实账号一致
+        self.assertEqual(res.get("action"), Act.CHAL)
 
     # ---------------- wire：口令不过网 ----------------
 
@@ -384,12 +391,13 @@ class D1AccountManagerApi(unittest.TestCase):
         self.assertIsNone(self.mgr.challenge_for("ghost"))
         nonce = os.urandom(16)
         ok, msg = self.mgr.verify_login_proof("alice", nonce,
-                                              challenge_mac(dk, nonce))
+                                              challenge_mac(dk, nonce, "alice"))
         self.assertTrue(ok, msg)
         self.assertEqual(self.mgr._users["alice"].get("last_login"),
                          time.strftime("%Y-%m-%d %H:%M:%S"))
         ok, msg = self.mgr.verify_login_proof("alice", nonce,
-                                              challenge_mac(os.urandom(32), nonce))
+                                              challenge_mac(os.urandom(32), nonce,
+                                                            "alice"))
         self.assertFalse(ok)
         self.assertEqual(msg, "用户名或密码错误")
 
@@ -399,7 +407,8 @@ class D1AccountManagerApi(unittest.TestCase):
         self.assertIsNotNone(self.mgr.challenge_for("broken"))  # 字段在，格式后验
         ok, msg = self.mgr.verify_login_proof("broken", os.urandom(16), b"x" * 32)
         self.assertFalse(ok)
-        self.assertEqual(msg, "账号不存在")
+        # auth-008：记录损坏/不存在与口令错误统一文案（不可枚举）
+        self.assertEqual(msg, "用户名或密码错误")
 
 
 class D1ViewerIntegration(unittest.TestCase):
@@ -481,32 +490,41 @@ class D1ViewerIntegration(unittest.TestCase):
         self.assertIsNone(ch._password)
         self.assertEqual(ch._last_auth_user, "alice")
 
-    def test_old_host_without_proto_keeps_legacy_path(self):
-        # 旧服务端（probe 回包无 proto）→ 能力判定 False → 仍直发口令登录
+    def test_old_host_without_proto_refuses_cleartext(self):
+        # auth-003（2026-09-18）：旧服务端（probe 回包无 proto）不再降级为明文口令
+        # 直发——明确拒绝，且不再向对端发送任何登录消息
         a, b = socket.socketpair()
         self.addCleanup(a.close)
         self.addCleanup(b.close)
         b.settimeout(10.0)
+        seen = []
 
         def serve():
-            # 旧服务端在 socketpair 的另一端（a）；观看端用 b
-            common.recv_msg(a)   # probe（新观看端的能力探测，旧服务端也会收到）
-            common.send_msg(a, {"action": Act.AUTH_RESULT, "ok": False,
-                                "msg": "需要登录"})          # 旧版：无 proto
-            login = common.recv_msg(a)
-            common.send_msg(a, {"action": Act.AUTH_RESULT,
-                                "ok": login.get("pass") == PW})
+            try:
+                # 旧服务端在 socketpair 的另一端（a）；观看端用 b
+                common.recv_msg(a)   # probe（新观看端的能力探测，旧服务端也会收到）
+                common.send_msg(a, {"action": Act.AUTH_RESULT, "ok": False,
+                                    "msg": "需要登录"})          # 旧版：无 proto
+                seen.append(common.recv_msg(a))   # 若观看端仍直发口令，这里会收到
+            except Exception:
+                pass
 
         threading.Thread(target=serve, daemon=True).start()
         ch = self._channel(username="alice", _password=PW)
         with mock.patch.object(viewer, "_dpapi_encrypt", return_value=None):
-            self.assertTrue(ch._authenticate(b), ch.auth_msg)
+            self.assertFalse(ch._authenticate(b))
         self.assertEqual(ch._chal_capable, False)
+        self.assertIn("挑战-应答", ch.auth_msg)
+        b.close()
+        time.sleep(0.3)
+        self.assertEqual(seen, [], "auth-003：不得再降级直发口令")
 
 
 class D1ProtocolSurface(unittest.TestCase):
     def test_defaults_and_constants(self):
-        self.assertEqual(common.PROTOCOL_VERSION, (2, 2))
+        # auth-002（2026-09-18）：2.3 = proof 绑定 user + 域分隔串
+        self.assertEqual(common.PROTOCOL_VERSION, (2, 3))
+        self.assertEqual(common.PROTO_CHAL_MIN_MINOR, 3)
         self.assertEqual(common.DEFAULT_CONFIG["host"]["auth"]["chal_response"],
                          "require")
         self.assertEqual(Act.CHAL, "chal")

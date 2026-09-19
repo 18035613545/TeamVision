@@ -22,6 +22,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import select
 import shutil
@@ -45,10 +46,15 @@ MAGIC_CLIENT = b"FS02"
 MAGIC_SERVER = b"OK02"
 
 #: C2（实现方案 §7）：协议版本单一载体。v2.2 = D1 挑战-应答认证（chal/auth_proof/
-#: reg_proof）上线；握手主判仍是 MAGIC（旧客户端拒绝行为不变），proto 字段随认证
-#: 期 CTRL 消息携带，服务端据此判断对端能力（观看端以 auth_result.proto ≥ 2.2
-#: 作为"可走挑战流"的探测结果）。次版本向后兼容：2.1 客户端仍可走 legacy 通道。
-PROTOCOL_VERSION = (2, 2)
+#: reg_proof）上线；v2.3（2026-09-18，auth-002）= proof 绑定 user + 域分隔串。
+#: 握手主判仍是 MAGIC（旧客户端拒绝行为不变），proto 字段随认证期 CTRL 消息携带，
+#: 服务端据此判断对端能力（观看端以 auth_result.proto 的次版本号作为探测结果）。
+PROTOCOL_VERSION = (2, 3)
+
+#: 观看端要求的最低次版本：v2.2 的 proof 只签 nonce、且原实现信任对端下发的
+#: KDF 参数（auth-002）；新版只与 ≥ 该版本的共享端走挑战-应答，旧版本明确拒绝
+#: 并提示升级（比"发出去被静默拒绝/降级"可排查）。
+PROTO_CHAL_MIN_MINOR = 3
 
 #: C2 §7 第 3 步：proto 强校验开关——"先只加不启用"。当前唯一版本载体仍是
 #: FS02 MAGIC；置 True 后服务端会拒绝 proto 不兼容的客户端（D1 的翻转点）。
@@ -101,16 +107,56 @@ class Act:
 #: 保证既有账户（10 万次迭代派生）无需迁移即可继续登录）。
 PBKDF2_ITERATIONS = 100_000
 
+#: auth-002（2026-09-18）：KDF 参数的合法区间。iter/salt 可能来自链路上对端
+#:（D1 挑战由服务端下发、注册 salt 由观看端上报），使用前必须校验。
+KDF_ITER_MIN = 1_000
+KDF_ITER_MAX = 2_000_000
+#: salt 约定长度：32 位十六进制 = 16 字节（secrets.token_hex(16)），与两端生成口径一致
+KDF_SALT_HEX_LEN = 32
+
+
+def _is_hex_str(text, length=None):
+    """是否为（指定长度的）十六进制字符串。"""
+    if not isinstance(text, str) or not text:
+        return False
+    if length is not None and len(text) != length:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in text)
+
 
 def derive_dk(password, salt_hex, iterations=PBKDF2_ITERATIONS):
-    """由口令与盐派生密钥 dk（bytes）。salt 为十六进制字符串。"""
+    """由口令与盐派生密钥 dk（bytes）。salt 为十六进制字符串。
+
+    auth-002（2026-09-18）：参数可能来自链路上对端，使用前强校验——
+    iterations 必须落在 [KDF_ITER_MIN, KDF_ITER_MAX]：对端回 {iter:1} 即得
+    "攻击者选盐、一次迭代"的离线口令爆破 oracle（比正常快 ~10^5 倍），
+    回 {iter:10^9} 则本端在 PBKDF2 上挂死（重连即再挂）。越界抛 ValueError
+    （调用方按协议错误处理）而非静默钳制——静默钳制会与对端算出不同 dk，
+    表现为"密码正确却登录失败"，比明确拒绝更难排查。
+    salt 限 16~64 位偶数长度十六进制（服务端约定 32 位）。
+    """
+    try:
+        it = int(iterations)
+    except (TypeError, ValueError):
+        raise ValueError("KDF 迭代次数非法: %r" % (iterations,))
+    if not (KDF_ITER_MIN <= it <= KDF_ITER_MAX):
+        raise ValueError("KDF 迭代次数越界: %d（允许 %d~%d）" % (it, KDF_ITER_MIN, KDF_ITER_MAX))
+    if (not _is_hex_str(salt_hex) or not (16 <= len(salt_hex) <= 64)
+            or len(salt_hex) % 2):
+        raise ValueError("salt 必须是 16~64 位偶数长度十六进制字符串")
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
-                               bytes.fromhex(salt_hex), iterations)
+                               bytes.fromhex(salt_hex), it)
 
 
-def challenge_mac(dk, nonce):
-    """挑战-应答核心：proof = HMAC-SHA256(key=dk, msg=nonce)。"""
-    return hmac.new(dk, nonce, hashlib.sha256).digest()
+def challenge_mac(dk, nonce, user=""):
+    """挑战-应答核心：proof = HMAC-SHA256(key=dk, msg=域分隔串 | user | nonce)。
+
+    auth-002（2026-09-18，协议 v2.3）：proof 输入绑定 user 与域分隔串——
+    旧实现只签 nonce，同一口令/密钥在"换账号名"或其它 HMAC 用途之间可被搬运。
+    两端必须传同一个 user（登录/注册链路上即消息里的用户名）。
+    """
+    msg = (b"tv-auth-v2|" + str(user).encode("utf-8", "replace") + b"|" + nonce)
+    return hmac.new(dk, msg, hashlib.sha256).digest()
 
 
 def b64e(data):
@@ -170,9 +216,12 @@ DEFAULT_CONFIG = {
         "level": "info"
     },
     # B4（实现方案 §6）：启动后查一次 GitHub Releases 最新 tag，仅状态栏提示，
-    # 不做自动更新；结果缓存 24h，网络失败静默。关掉它只需置 false。
+    # 不做自动更新；结果缓存 24h。
+    # dist-004（2026-09-18）：**默认关闭**——开启意味着每 24h 向 api.github.com
+    # 暴露使用者 IP 与"在用本程序"的事实，按第 131 条默认安全口径应为 opt-in；
+    # 需要更新提示时在共享端控制台勾选（或手改本键为 true）。
     "update_check": {
-        "enabled": True
+        "enabled": False
     },
     "host": {
         # 默认只监听本机：默认形态下不存在对外监听的端口（局域网内其他人连不上，
@@ -285,24 +334,31 @@ REGISTER_POLICIES = ("open", "bootstrap", "closed")
 def register_policy(auth_cfg):
     """把 host.auth.allow_register 归一为 open / bootstrap / closed。
 
-    布尔与未知取值按兼容口径归一（True→open、False→closed、非法→open 并告警），
-    避免用户手改配置写成布尔或错别字时注册功能整个失灵。host 与共享端控制台共用
-    同一份语义，防止界面显示的策略与服务端实际执行的策略不一致。
+    布尔按兼容口径归一（True→open、False→closed），缺失键/null 取默认 open；
+    **非法取值（错别字/数字/其它类型）一律 fail-closed 归一为 closed** 并告警。
+
+    auth-007（2026-09-18）：旧口径对非法取值 fail-open（"colosed" 这类错别字 →
+    open），公网隧道下注册静默全开、任意人可自建账号看屏；安全开关的兜底取向必须
+    与"默认安全"口径一致。host 与共享端控制台共用同一份语义，防止界面显示的策略
+    与服务端实际执行的策略不一致。
     """
     raw = auth_cfg.get("allow_register", "open") if isinstance(auth_cfg, dict) else "open"
     if raw is True:
         return "open"
     if raw is False:
         return "closed"
-    policy = str(raw or "").strip().lower()
+    if raw is None:
+        return "open"          # 键存在但为 null：视作未设置，走默认
+    policy = str(raw).strip().lower()
     if policy in REGISTER_POLICIES:
         return policy
     try:
         import logger
-        logger.get_logger().warning("host.auth.allow_register 取值非法（%r），按 open 处理", raw)
+        logger.get_logger().warning(
+            "host.auth.allow_register 取值非法（%r），按 closed 处理（不开放自助注册）", raw)
     except Exception:
         pass
-    return "open"
+    return "closed"
 
 
 # 第 114 条（C3）：预打包 Struct，替代原先 bytes((kind,))+struct.pack+... 的多段拼接。
@@ -429,9 +485,14 @@ def message_pump(sock, *, should_stop, on_idle, on_message,
                                parse_message（payload 为 bytes，raw=None）。
                                返回非 None 原因串**立即**结束泵（host fatal/协议错误）。
       on_batch(buf)            一次排空结束后（viewer 的批解码点）。
-      on_buf(event, buf, now)  缓冲区状态位：event="pre_empty"（recv 前缓冲区为空，
-                               host 记 partial_since 起点）/"post"（排空后，
-                               host 按 C2/第 103 条语义重置 partial 计时）。
+      on_buf(event, buf, now, n_msgs=0)
+                               缓冲区状态位：event="pre_empty"（recv 前缓冲区为空，
+                               新消息首字节到达；host 记 partial_since 起点）/"post"
+                               （排空后，n_msgs=本轮**真正消费掉的完整消息条数**）。
+                               net-015（2026-09-18）：host 只应在 n_msgs>0 时重置
+                               "单条消息总时限"起点——旧实现无条件重置，攻击者发
+                               `长度=32MB-1` 的头上限后每 <15s 滴 1 字节即可把
+                               计时起点无限后移（第 103 条 slowloris 防线被绕过）。
 
     返回结束原因（str）或 None（should_stop 置位）。
     """
@@ -461,6 +522,7 @@ def message_pump(sock, *, should_stop, on_idle, on_message,
         buf += data
         if on_chunk is not None:
             on_chunk()
+        n_msgs = 0
         while True:
             if raw_set and buf and buf[0] in raw_set:
                 consumed, kind, raw = parse_message_raw(buf)
@@ -474,12 +536,13 @@ def message_pump(sock, *, should_stop, on_idle, on_message,
                     break
                 del buf[:consumed]
                 reason = on_message(kind, payload, None)
+            n_msgs += 1
             if reason is not None:
                 return reason
         if on_batch is not None:
             on_batch(buf)
         if on_buf is not None:
-            on_buf("post", buf, time.monotonic())
+            on_buf("post", buf, time.monotonic(), n_msgs)
     return None
 
 
@@ -499,31 +562,68 @@ def recv_msg(sock, deadline=None):
     return json.loads(data.decode("utf-8"))
 
 
+def _win_keepalive_ioctl(sock, idle_s, intvl_s):
+    """Windows 上用 WSAIoctl(SIO_KEEPALIVE_VALS) 设置 TCP keepalive 空闲/间隔。
+
+    net-024（2026-09-18）：`socket.TCP_KEEPIDLE` 等常量自 Python 3.13 才在 Windows
+    提供；py<3.13 时上面的 setsockopt 分支整段是死代码。这里走 Winsock 原生
+    ioctl（探测次数沿用系统默认），失败静默（与其它调优项同口径）。
+    """
+    try:
+        import ctypes
+        fd = sock.fileno()
+        if fd is None or fd < 0:
+            return
+        inbuf = struct.pack("III", 1, max(1, int(idle_s)) * 1000,
+                            max(1, int(intvl_s)) * 1000)
+        out_len = ctypes.c_ulong(0)
+        ws2 = ctypes.WinDLL("ws2_32")
+        ws2.WSAIoctl.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p, ctypes.c_ulong,
+            ctypes.c_char_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        ws2.WSAIoctl(ctypes.c_void_p(fd), 0x98000004, inbuf, len(inbuf),
+                     None, 0, ctypes.byref(out_len), None, None)
+    except Exception:
+        pass
+
+
 def tune_socket(sock, sndbuf=None, rcvbuf=None, keepalive=True, keepalive_idle=60):
     """低延迟网络调优：禁用 Nagle（TCP_NODELAY）+ 加大收发缓冲 + TCP keepalive。
 
     所有 setsockopt 都单独 try/except：个别平台不支持特定选项时静默忽略，
     保证在任何环境都能工作。
     """
+    # net-024（2026-09-18）：除 OSError 外还要接 TypeError/ValueError——Windows
+    # 上超界值 setsockopt 抛 OSError(WSAEINVAL) 的兄弟平台/替身对象会抛
+    # TypeError，旧实现漏防会沿调用线程上抛（"调优失败"打死整条连接）。
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except OSError:
+    except (OSError, TypeError, ValueError):
         pass
     if sndbuf:
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(sndbuf))
-        except OSError:
+        except (OSError, TypeError, ValueError):
             pass
     if rcvbuf:
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(rcvbuf))
-        except OSError:
+        except (OSError, TypeError, ValueError):
             pass
     if keepalive:
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        except OSError:
+        except (OSError, TypeError, ValueError):
             keepalive_idle = 0
+        if keepalive_idle > 0 and not hasattr(socket, "TCP_KEEPIDLE") \
+                and sys.platform == "win32":
+            # net-024：Python < 3.13 的 Windows 没有 TCP_KEEPIDLE/KEEPINTVL 常量
+            # （内核支持），旧实现整段跳过 → SO_KEEPALIVE 只是打开了 2 小时默认
+            # 空闲的开关，等于没调优。用 Winsock 原生 ioctl 补上空闲/探测间隔。
+            _win_keepalive_ioctl(sock, keepalive_idle,
+                                 max(1, int(keepalive_idle) // 6))
         if keepalive_idle > 0:
             # 第 59 条：三个选项语义不同，不能全取 keepalive_idle。
             # KEEPIDLE=首次探测前空闲秒数；KEEPINTVL=探测间隔；KEEPCNT=探测次数。
@@ -589,6 +689,32 @@ def parse_addr(addr_str, default_port=5700):
     addr_str = addr_str.strip()
     if not addr_str:
         raise ValueError("地址不能为空")
+    # net-018（2026-09-18）：IPv6 支持——旧实现把 `[::1]:5700` 的 host 解析成
+    # "[::1]"（连接必然失败），把裸 `::1` 的 "1" 当成端口（连到端口 1）。
+    if addr_str.startswith("["):
+        end = addr_str.find("]")
+        if end <= 1:
+            raise ValueError("IPv6 地址缺少 ']': %s" % addr_str)
+        host = addr_str[1:end].strip()
+        rest = addr_str[end + 1:].strip()
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":"):
+            raise ValueError("IPv6 地址后缀非法（应为 [地址] 或 [地址]:端口）: %s" % addr_str)
+        port_str = rest[1:].strip()
+        if not port_str:
+            raise ValueError("地址缺少端口号: %s" % addr_str)
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise ValueError("端口无效: %s" % port_str) from None
+        if not (1 <= port <= 65535):
+            raise ValueError("端口超出范围 1~65535: %d" % port)
+        return host, port
+    if addr_str.count(":") >= 2:
+        # 裸 IPv6（无方括号、无端口）：整串都是主机，用默认端口——
+        # 旧实现 rsplit 后把最后一段当端口（`::1` → 端口 1）
+        return addr_str, default_port
     if ":" in addr_str:
         host, port_str = addr_str.rsplit(":", 1)
         host = host.strip()
@@ -618,7 +744,10 @@ def safe_int(value, default, lo=None, hi=None, warn=True):
         value = int(value)
     try:
         out = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # net-025（2026-09-18）：OverflowError 也要接住——合法 JSON 里的
+        # `Infinity`/`1e999` 解析成 float('inf')，`int(inf)` 抛 OverflowError，
+        # 旧实现漏防会沿调用线程上抛（配置可写即可打死采集/编码线程）。
         if warn:
             _log_warning("配置值 %r 不是整数，回退默认值 %r", value, default)
         out = int(default)
@@ -630,9 +759,15 @@ def safe_int(value, default, lo=None, hi=None, warn=True):
 
 
 def safe_float(value, default, lo=None, hi=None, warn=True):
-    """把配置值安全转为 float：非法时回退 default，并按需夹到 [lo, hi]。"""
+    """把配置值安全转为 float：非法时回退 default，并按需夹到 [lo, hi]。
+
+    net-025（2026-09-18）：NaN/±inf（JSON 合法但异常：`Infinity`/`1e999`）一律
+    视为非法——NaN 与任何值比较均为 False，能穿透 lo/hi 夹取直达下游。
+    """
     try:
         out = float(value)
+        if not math.isfinite(out):
+            raise ValueError("非有限数: %r" % (value,))
     except (TypeError, ValueError):
         if warn:
             _log_warning("配置值 %r 不是数字，回退默认值 %r", value, default)
@@ -661,7 +796,9 @@ def normalize_region(region):
         top = int(region["top"])
         width = int(region["width"])
         height = int(region["height"])
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
+        # net-025：Infinity/1e999 走到 int() 时抛 OverflowError，旧实现漏防会
+        # 直接打断 GUI 构造/采集线程
         _log_warning("采集区域配置缺少 left/top/width/height 或非整数（%r），按全屏处理", region)
         return None
     if left < 0 or top < 0 or width <= 0 or height <= 0:
@@ -718,13 +855,22 @@ _DATA_DIR = None
 
 
 def _probe_writable(d):
-    """探测目录是否可写（创建目录 + 写一个探针文件再删除），绝不抛异常。"""
+    """探测目录是否可写（创建目录 + 写一个探针文件再删除），绝不抛异常。
+
+    cfg-002（2026-09-18）：探针文件名加线程号——旧实现只用 PID，同一进程的两个
+    线程首次同时探测时互删对方的探针（A 写、B 删、A 的 os.remove 抛 FileNotFound
+    Error）→ 误判"不可写"→ config/日志整体回退 %TEMP%。删除失败也视为本次探测成功。
+    """
     try:
         os.makedirs(d, exist_ok=True)
-        probe = os.path.join(d, ".wprobe_%d" % os.getpid())
+        probe = os.path.join(d, ".wprobe_%d_%d"
+                             % (os.getpid(), threading.get_ident()))
         with open(probe, "w", encoding="utf-8") as f:
             f.write("x")
-        os.remove(probe)
+        try:
+            os.remove(probe)
+        except OSError:
+            pass   # 被他人（清理/杀软）清掉也算本次探测成功
         return True
     except OSError:
         return False
@@ -928,10 +1074,15 @@ def _persist_upgrade(path, raw, changes, silent=False):
     """
     try:
         with _config_lock:
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(raw, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
+            # cfg-001：与 save_config 同一套跨进程保护（唯一临时名 + replace 重试）
+            fd = _config_file_lock(path)
+            try:
+                tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(raw, f, ensure_ascii=False, indent=2)
+                _replace_retry(tmp, path)
+            finally:
+                _config_file_unlock(path, fd)
     except OSError as e:
         try:
             import logger
@@ -1018,6 +1169,58 @@ def _recover_corrupt_config(path, exc):
         pass
 
 
+def _config_file_lock(path, timeout=2.0):
+    """跨进程互斥（cfg-001）：`<config>.lock` 排他创建；返回 fd 或 None（超时/不可用）。
+
+    陈旧锁（持有者被强杀）超过 10 秒未更新即接管。超时不阻塞——宁可放行本次写
+    （极小概率竞争），也不能让 GUI 回调卡死。
+    """
+    lock_path = path + ".lock"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_path) > 10.0:
+                    os.remove(lock_path)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+        except OSError:
+            return None
+
+
+def _config_file_unlock(path, fd):
+    """释放 `_config_file_lock` 持有的锁（幂等）。"""
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.remove(path + ".lock")
+    except OSError:
+        pass
+
+
+def _replace_retry(src, dst, attempts=5, delay=0.05):
+    """os.replace 重试封装（cfg-001）：Windows 上目标被他人持有句柄（杀软扫描 /
+    另一实例正在读）时 replace 抛 PermissionError，短暂重试即可成功。"""
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def save_config(cfg, section=None):
     """以 ensure_ascii=False、indent=2 原子写回 config.json（先写临时文件再替换）。
 
@@ -1026,38 +1229,46 @@ def save_config(cfg, section=None):
     （如 "host"/"viewer"）时改为读-改-写：重新读取磁盘上的最新配置，只把本进程拥有
     的 section 覆盖上去再落盘，从而保留另一进程的 section。section=None 时维持原
     整文件回写行为。
+
+    cfg-001（2026-09-18）：第 17 条修复不彻底——进程内锁对**双开实例**互不排斥，
+    且读-改-写用固定 `.tmp`、`os.replace` 撞读即静默失败。现在整体放进跨进程文件锁，
+    临时文件名唯一（PID+线程），replace 失败重试。
     """
     path = _config_path()
-    tmp = path + ".tmp"
     with _config_lock:
-        out = cfg
-        if section is not None:
-            base = {}
-            if os.path.exists(path):
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        base = json.load(f)
-                    if not isinstance(base, dict):
-                        base = {}
-                except Exception:
-                    base = {}
-            base[section] = cfg.get(section)
-            out = base
-        # 第 102 条：写盘失败（目录只读/磁盘满/杀软占用）只记一条 ERROR 并返回。
-        # 调用方在 Tk 回调/接收线程里，抛出去要么被 Tk 静默吞掉（用户看到"改了没反应"），
-        # 要么直接打死接收线程；吞掉 + 明确日志既保住本次运行的行为，又留下可排查的痕迹。
+        fd = _config_file_lock(path)
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except OSError as e:
+            out = cfg
+            if section is not None:
+                base = {}
+                if os.path.exists(path):
+                    try:
+                        with open(path, encoding="utf-8") as f:
+                            base = json.load(f)
+                        if not isinstance(base, dict):
+                            base = {}
+                    except Exception:
+                        base = {}
+                base[section] = cfg.get(section)
+                out = base
+            # 第 102 条：写盘失败（目录只读/磁盘满/杀软占用）只记一条 ERROR 并返回。
+            # 调用方在 Tk 回调/接收线程里，抛出去要么被 Tk 静默吞掉（用户看到"改了没反应"），
+            # 要么直接打死接收线程；吞掉 + 明确日志既保住本次运行的行为，又留下可排查的痕迹。
+            tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
             try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            try:
-                import logger
-                logger.get_logger().error(
-                    "config.json 写入失败（%s）：本次改动仅在内存生效，重启后丢失", e)
-            except Exception:
-                pass
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+                _replace_retry(tmp, path)
+            except OSError as e:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                try:
+                    import logger
+                    logger.get_logger().error(
+                        "config.json 写入失败（%s）：本次改动仅在内存生效，重启后丢失", e)
+                except Exception:
+                    pass
+        finally:
+            _config_file_unlock(path, fd)

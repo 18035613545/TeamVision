@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 
 from common import data_dir, exe_dir
@@ -43,6 +44,8 @@ _LOG_DATE_RE = re.compile(r"^app_(\d{8})")
 
 #: 是否已完成 handler 初始化（幂等标志）
 _initialized = False
+#: cfg-003（2026-09-18）：初始化互斥锁（防双线程各挂一套 handler）
+_init_lock = threading.Lock()
 
 
 class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
@@ -138,11 +141,17 @@ class _SafeStreamHandler(logging.StreamHandler):
 def mask_secret(s, keep=4):
     """敏感信息打码：保留前 keep 位与后 keep 位，中间用 **** 替换。
 
-    字符串长度不足（<= keep*2）或为 None 时整体替换为 ****。
+    auth-013（2026-09-18）：短串按长度自适应——旧实现 9~16 位串（常见 API token
+    长度）只遮 1~4 个字符，日志里近乎明文，还给人"已脱敏"的错觉。
+    <=8 位全遮；<=24 位只留尾部 2 位；其余保持前后各 keep 位。
     """
     if s is None:
         return "****"
     s = str(s)
+    if len(s) <= 8:
+        return "****"
+    if len(s) <= 24:
+        return "****" + s[-2:]
     keep = max(1, int(keep))
     if len(s) <= keep * 2:
         return "****"
@@ -177,10 +186,16 @@ def _writable_log_dir():
     for d in candidates:
         try:
             os.makedirs(d, exist_ok=True)
-            probe = os.path.join(d, ".wprobe_%d" % os.getpid())
+            # cfg-002（2026-09-18）：探针名加线程号——只用 PID 时同进程两个线程
+            # 首调互删探针，误判"不可写"使日志整体回退 %TEMP%
+            probe = os.path.join(d, ".wprobe_%d_%d"
+                                 % (os.getpid(), threading.get_ident()))
             with open(probe, "w", encoding="utf-8") as f:
                 f.write("x")
-            os.remove(probe)
+            try:
+                os.remove(probe)
+            except OSError:
+                pass   # 被他人清掉也算本次探测成功（目录确实可写）
             return d
         except OSError:
             continue
@@ -200,14 +215,21 @@ def setup_logger(cfg=None):
       格式 "[sakura] %(levelname)s: %(message)s"。
     - logger.propagate = False；已初始化时仅更新级别并返回。
     """
-    global _initialized
-
     cfg = cfg or {}
     logs_cfg = cfg.get("logs") or {}
     level = _resolve_level(logs_cfg.get("level", "info"))
 
     logger = logging.getLogger(LOGGER_NAME)
 
+    # cfg-003（2026-09-18）：初始化必须加锁——旧实现 `_initialized` 无锁，两个线程
+    # 首次同时调用会各挂一套 file handler（同文件重复写 + 滚动改名 WinError 32）
+    with _init_lock:
+        return _setup_logger_locked(logger, level)
+
+
+def _setup_logger_locked(logger, level):
+    """setup_logger 的加锁实现体（cfg-003：初始化只做一次）。"""
+    global _initialized
     if not _initialized:
         logger.setLevel(level)
         logger.propagate = False

@@ -73,11 +73,18 @@ class TestRegisterPolicyNormalization(unittest.TestCase):
         self.assertEqual(common.register_policy({"allow_register": True}), "open")
         self.assertEqual(common.register_policy({"allow_register": False}), "closed")
 
-    def test_missing_or_bogus_falls_back_to_open(self):
+    def test_missing_or_null_falls_back_to_default_open(self):
         self.assertEqual(common.register_policy({}), "open")
-        self.assertEqual(common.register_policy({"allow_register": "nonsense"}), "open")
         self.assertEqual(common.register_policy({"allow_register": None}), "open")
         self.assertEqual(common.register_policy("not-a-dict"), "open")
+
+    def test_illegal_values_fail_closed(self):
+        # auth-007（2026-09-18）：非法取值（错别字/数字/列表）必须 fail-closed，
+        # 旧口径 fail-open 会让公网隧道下注册静默全开
+        self.assertEqual(common.register_policy({"allow_register": "nonsense"}), "closed")
+        self.assertEqual(common.register_policy({"allow_register": "colosed"}), "closed")
+        self.assertEqual(common.register_policy({"allow_register": 0}), "closed")
+        self.assertEqual(common.register_policy({"allow_register": []}), "closed")
 
     def test_case_and_whitespace_tolerated(self):
         self.assertEqual(common.register_policy({"allow_register": " Closed "}), "closed")
@@ -235,7 +242,11 @@ class TestAppDirs(unittest.TestCase):
 
 
 class TestViewerRegisterRejected(unittest.TestCase):
-    """服务端关闭自助注册时，观看端要显示原因并停止重试（而不是反复弹框）。"""
+    """服务端关闭自助注册时，观看端要显示原因并停止重试（而不是反复弹框）。
+
+    auth-003（2026-09-18）后观看端不再有"明文口令直发"降级路径，本组用例改走
+    挑战流（serve 端对首个请求直接回 auth_result，等价于服务端即时拒绝）。
+    """
 
     def _channel(self):
         ch = viewer.Channel.__new__(viewer.Channel)
@@ -246,7 +257,9 @@ class TestViewerRegisterRejected(unittest.TestCase):
         ch.owner = None
         ch._anon_ok = False
         ch._auth_probed = True       # 跳过首轮 probe，让下一轮直接询问凭据
-        ch._chal_capable = False     # D1：本文件锁定的是旧直发口令路径（serve 端直接回 auth_result）
+        # auth-003（2026-09-18）：明文口令直发路径已废除；能力缓存置 True 走挑战流，
+        # serve 端直接回 auth_result（_auth_via_challenge 对非 chal 回包原样返回）
+        ch._chal_capable = True
         ch._prompt_blocked_until = 0.0
         ch.auth_msg = ""
         return ch

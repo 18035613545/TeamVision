@@ -78,8 +78,16 @@ class TestRouteFrameDropHeals(unittest.TestCase):
         sub = _DropSender(watch_source="peer:1", need_key=False, dropped=True)
         rt = _route({"a": sub}, "peer:1", b"P", is_key=False, is_jpeg=False)
         self.assertTrue(sub.need_key)        # 门控到下一个关键帧
-        self.assertTrue(rt.force_key)        # 强制编码器出 IDR
+        # net-021（2026-09-18）：peer 源丢帧不得置**本机** force_key——本机编码器
+        # 与 peer 订阅者的丢帧无关，旧口径会造成 IDR 风暴正反馈
+        self.assertFalse(rt.force_key)
         self.assertEqual(sub.captured, [b"P"])
+
+    def test_local_video_drop_forces_local_keyframe(self):
+        sub = _DropSender(watch_source="local", need_key=False, dropped=True)
+        rt = _route({"a": sub}, "local", b"P", is_key=False, is_jpeg=False)
+        self.assertTrue(sub.need_key)
+        self.assertTrue(rt.force_key)        # 本机源：强制本机编码器出 IDR
 
     def test_jpeg_drop_does_not_heal(self):
         # JPEG 各帧独立，丢帧无需强制关键帧/门控。
@@ -102,10 +110,11 @@ class TestRouteFrameDropHeals(unittest.TestCase):
         self.assertFalse(rt.force_key)
 
     def test_only_dropping_subscriber_is_gated(self):
-        # 多订阅者：只有发生丢帧的那个被门控，其余不受影响（force_key 为全局编码信号）。
-        drop = _DropSender(watch_source="peer:1", need_key=False, dropped=True)
-        ok = _DropSender(watch_source="peer:1", need_key=False, dropped=False)
-        rt = _route({"a": drop, "b": ok}, "peer:1", b"P", is_key=False, is_jpeg=False)
+        # 多订阅者：只有发生丢帧的那个被门控，其余不受影响（force_key 为全局编码信号；
+        # net-021 后 peer 源不再置本机 force_key）。
+        drop = _DropSender(watch_source="local", need_key=False, dropped=True)
+        ok = _DropSender(watch_source="local", need_key=False, dropped=False)
+        rt = _route({"a": drop, "b": ok}, "local", b"P", is_key=False, is_jpeg=False)
         self.assertTrue(drop.need_key)
         self.assertFalse(ok.need_key)
         self.assertTrue(rt.force_key)

@@ -17,6 +17,7 @@ av/PyAV（host.codec.encoder!="jpeg" 时用于 H.264 编码）。
 """
 
 import argparse
+import contextlib
 import hmac
 import json
 import os
@@ -74,6 +75,8 @@ from common import (  # noqa: F401
     PROTOCOL_VERSION, PROTO_ENFORCE, proto_compatible,
     # D1（实现方案 §10）：挑战-应答认证公共件（PBKDF2/HMAC/base64 单一真源）
     PBKDF2_ITERATIONS, derive_dk, challenge_mac, b64e, b64d,
+    # auth-002/auth-006（2026-09-18）：KDF 参数与凭据长度的校验口径
+    KDF_ITER_MIN, KDF_ITER_MAX, KDF_SALT_HEX_LEN, _is_hex_str,
     # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
     # 各有一套 clamp），share.py 不再反向 import host。
     normalize_region, safe_float, safe_int,
@@ -90,6 +93,10 @@ log = logger.get_logger()
 #: 会永久阻塞；不发魔数的连接每个永久占用一个线程 + 一个 fd，而 accept 循环没有
 #: 并发上限，一次端口扫描即可把服务耗死。
 HANDSHAKE_TIMEOUT_S = 10.0
+
+#: auth-006（2026-09-18）：用户名长度上界——注册/登录链路上没有上界时，一条超长
+#: 用户名的记录会撑爆 accounts.json（且每次写盘全量重写放大量级）。
+MAX_USERNAME_LEN = 64
 
 #: 第 112 条（C1）：客户端发送速率滑动窗口的**保留**时长（秒）。
 #: 带宽日志按 1 秒窗口展示（灵敏），ABR 按 3 秒窗口取平均（跨过一个 GOP，见 rate_kbps）。
@@ -143,7 +150,11 @@ class AccountManager:
         # 第 102 条：账户文件与 config.json 一样落在**可写**数据目录。安装在
         # Program Files 后非管理员运行时 exe 目录只读，原实现写这里会让注册直接失败。
         self._path = accounts_path()
+        #: auth-010（2026-09-18）：bootstrap 策略"已消耗"标记文件——删除唯一账户
+        #: 不得静默重开"任意人可自助注册"窗口（旧判定只看当前账户数）
+        self._bootstrap_marker = self._path + ".bootstrap-used"
         self._users = {}  # 用户名 -> {salt, hash, created, last_login}
+        self._pending_users = None  # auth-009：_mutate → _save 之间的写盘快照
         self._load()
 
     def _load(self):
@@ -172,17 +183,32 @@ class AccountManager:
             except OSError:
                 log.error("accounts.json 损坏（%s）且无法改名留存，已重置账户表", e)
 
-    def _save(self):
+    def _read_disk(self):
+        """读磁盘上的账户表副本（None = 文件缺失/损坏/非法）；不抛异常。
+
+        auth-009（2026-09-18）：每次写操作前在文件锁内重读，避免双开实例用旧内存
+        快照整表覆盖（另一方刚注册的账户被静默抹掉、已删除的账户复活）。
+        """
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            users = data.get("users") if isinstance(data, dict) else None
+            return users if isinstance(users, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _write_users(self, users):
         """原子写回账户表；返回是否成功（写失败只告警，绝不改变认证结论）。
 
         第 102 条：原实现让 OSError 直接抛出——`authenticate` 末尾记 last_login 时
         磁盘满/目录只读会让**口令正确的用户被拒**（且提示是"认证异常"而不是"无法写入
         账户文件"），`register` 则留下"内存里已注册、磁盘上没有"的假成功。
+        auth-009：临时文件名带 PID + 线程号（唯一），避免两个进程写坏同一个 .tmp。
         """
-        tmp = self._path + ".tmp"
+        tmp = "%s.%d.%d.tmp" % (self._path, os.getpid(), threading.get_ident())
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"users": self._users}, f, ensure_ascii=False, indent=2)
+                json.dump({"users": users}, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self._path)
             return True
         except OSError as e:
@@ -193,51 +219,181 @@ class AccountManager:
             log.error("accounts.json 写入失败（%s）：账户改动未持久化", e)
             return False
 
+    @contextlib.contextmanager
+    def _file_lock(self):
+        """跨进程互斥（auth-009）：`<accounts>.lock` 排他创建，陈旧锁自动接管。
+
+        双开实例时进程内锁互不排斥，没有它就会出现"账户被静默抹掉/复活"。
+        等待超时（2 秒）后不再阻塞——宁可放行本次写（极小概率竞争），也不能让
+        GUI 线程永久卡死。
+        """
+        lock_path = self._path + ".lock"
+        fd = None
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                # 陈旧锁（持有者被强杀）：超过 10 秒未更新直接接管
+                try:
+                    if time.time() - os.path.getmtime(lock_path) > 10.0:
+                        os.remove(lock_path)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    log.warning("accounts.json 文件锁等待超时，本次写可能与另一实例竞争")
+                    break
+                time.sleep(0.05)
+            except OSError as e:
+                log.warning("accounts.json 文件锁创建失败（%s），本次写无跨进程保护", e)
+                break
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
+
+    def _save(self):
+        """写回账户表（`_mutate` 在本方法调用前置入读-改-写快照）；返回是否成功。
+
+        auth-009：内部写路径统一经 `_mutate`（文件锁内读磁盘→改→写），本方法只做
+        实际写盘。保留无参形态，既有测试/桩 `m._save = lambda: False`（模拟磁盘
+        不可写）语义不变。
+        """
+        users = getattr(self, "_pending_users", None)
+        if users is None:
+            users = self._users
+        try:
+            return self._write_users(users)
+        finally:
+            self._pending_users = None
+
+    def _mutate(self, fn, fail_msg="无法写入账户文件（磁盘或权限问题），未生效"):
+        """跨进程安全的读-改-写（auth-009）：返回 fn 的 (ok, 提示语)。
+
+        调用方传入 `fn(users)`：收到**锁内重读的磁盘快照**并就地修改，返回 (ok, msg)。
+        写盘成功才用该快照替换内存表；写失败保持内存原状（调用方无需回滚）。
+        """
+        with self._lock, self._file_lock():
+            users = self._read_disk()
+            if users is None:
+                users = {u: dict(r) if isinstance(r, dict) else r
+                         for u, r in self._users.items()}
+            ok, msg = fn(users)
+            if not ok:
+                self._users = users   # 内存与磁盘对齐（本轮未改动）
+                return ok, msg
+            self._pending_users = users
+            if not self._save():
+                return False, fail_msg
+            self._users = users
+            return True, msg
+
+    def _touch_last_login(self, user):
+        """把 last_login 写回磁盘；账户在别处已被删除时静默跳过（auth-009）。"""
+        def _apply(users):
+            record = users.get(user)
+            if isinstance(record, dict):
+                record["last_login"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            return True, ""
+
+        try:
+            ok, _msg = self._mutate(_apply, fail_msg="last_login 未落盘")
+            if not ok:
+                log.warning("账户 %s 最近登录时间未落盘（不影响本次登录）", user)
+        except Exception as e:                     # 记一次登录不应影响认证结论
+            log.warning("账户 %s last_login 写盘失败：%s", user, e)
+
     def count(self):
         """当前账户数（自助注册策略判定用；bootstrap 策略下 >0 即关闭注册）。"""
         with self._lock:
             return len(self._users)
+
+    def bootstrap_used(self):
+        """bootstrap 策略是否已消耗过（曾成功注册过账户）。
+
+        auth-010（2026-09-18）：只看 `count()==0` 时，面板删掉唯一账户（或账户文件
+        被清空）会静默重开"任意人可自助注册"窗口——确认文案却说"所有观看端都将无法
+        登录"，与真实后果相反。这里以持久标记判定"窗口是否用过"。
+        """
+        try:
+            return os.path.exists(self._bootstrap_marker)
+        except OSError:
+            return False
+
+    def _mark_bootstrap_used(self):
+        """记录 bootstrap 窗口已消耗（幂等；写标记失败降级为旧行为，不影响注册）。"""
+        try:
+            with open(self._bootstrap_marker, "w", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        except OSError:
+            pass
 
     def register(self, user, password):
         """注册新账户，返回 (ok: bool, 提示语)。"""
         user = (user or "").strip()
         if not user or not password:
             return False, "用户名与密码不能为空"
+        if len(user) > MAX_USERNAME_LEN:
+            return False, "用户名过长（最多 %d 字符）" % MAX_USERNAME_LEN
         # 第 22 条：PBKDF2（10 万次迭代）在锁外计算，避免并发注册/错误口令把全局
         # 账户锁占满导致所有正常登录排队、host CPU 打满。
         salt = secrets.token_hex(16)
         pw_hash = _hash_password(password, salt)
-        with self._lock:
-            if user in self._users:
+        record = {
+            "salt": salt,
+            "hash": pw_hash,
+            "iter": PBKDF2_ITERATIONS,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        def _apply(users):
+            if user in users:
                 return False, "用户名已存在"
-            self._users[user] = {
-                "salt": salt,
-                "hash": pw_hash,
-                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            # 第 102 条：写盘失败要回滚内存，否则本次运行能登录、重启后就"账号不存在"
-            if not self._save():
-                self._users.pop(user, None)
-                return False, "无法写入账户文件（磁盘或权限问题），注册未生效"
+            users[user] = record
+            return True, "注册成功"
+
+        ok, msg = self._mutate(
+            _apply, fail_msg="无法写入账户文件（磁盘或权限问题），注册未生效")
+        if not ok:
+            return ok, msg
+        self._mark_bootstrap_used()   # auth-010：bootstrap 窗口一经使用即消耗
         log.info("账户注册成功: %s", user)
-        return True, "注册成功"
+        return True, msg
 
     def authenticate(self, user, password):
-        """认证账户，返回 (ok: bool, 提示语)；账号不存在与密码错误给出不同提示。"""
+        """认证账户，返回 (ok: bool, 提示语)。
+
+        auth-008（2026-09-18）：账号不存在与口令错误统一为"用户名或密码错误"
+        （旧版明文路径同样不得暴露账号是否存在）。
+        """
         user = (user or "").strip()
         # 第 22 条：锁内只取校验字段，PBKDF2（10 万次迭代）放到锁外计算，避免并发
         # 错误口令占满全局账户锁让所有正常登录排队、host CPU 打满。
         with self._lock:
             record = self._users.get(user)
-            if not isinstance(record, dict):
-                return False, "账号不存在"
-            salt = record.get("salt")
-            expected = record.get("hash")
         # 第 27 条：单条记录字段损坏（缺 salt/hash 或 salt 非十六进制）时优雅拒绝，
         # 不再让 bytes.fromhex 抛错被当成“认证异常”踢连接（否则该账号永远登不进）。
+        salt = record.get("salt") if isinstance(record, dict) else None
+        expected = record.get("hash") if isinstance(record, dict) else None
         if not isinstance(salt, str) or not isinstance(expected, str):
-            log.warning("账户 %s 记录损坏（缺 salt/hash），拒绝登录", user)
-            return False, "账号不存在"
+            if isinstance(record, dict):
+                log.warning("账户 %s 记录损坏（缺 salt/hash），拒绝登录", user)
+            # 同代价假比较（口令派生的 PBKDF2 仍照算，避免用耗时枚举账号）
+            try:
+                _hash_password(password or "", "0" * 32)
+            except Exception:
+                pass
+            return False, "用户名或密码错误"
         try:
             matched = hmac.compare_digest(expected, _hash_password(password, salt))
         except (ValueError, TypeError) as e:
@@ -245,11 +401,7 @@ class AccountManager:
             return False, "账号不存在"
         if not matched:
             return False, "用户名或密码错误"
-        with self._lock:
-            record = self._users.get(user)
-            if isinstance(record, dict):
-                record["last_login"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                self._save()
+        self._touch_last_login(user)   # auth-009：读-改-写落在文件锁内
         log.info("账户登录成功: %s", user)
         return True, "登录成功"
 
@@ -271,63 +423,79 @@ class AccountManager:
             iter_ = record.get("iter", PBKDF2_ITERATIONS)
         if not isinstance(iter_, int) or iter_ <= 0:
             iter_ = PBKDF2_ITERATIONS
+        # auth-002（2026-09-18）：记录里的 iter 必须有界——手改/损坏的记录若含
+        # 1（弱化 KDF）或 10^9（让观看端挂死）都会被原样下发
+        if not (KDF_ITER_MIN <= iter_ <= KDF_ITER_MAX):
+            log.warning("账户 %s 记录的 iter=%r 越界，按默认 %d 处理",
+                        user, iter_, PBKDF2_ITERATIONS)
+            iter_ = PBKDF2_ITERATIONS
         return salt, iter_
 
     def verify_login_proof(self, user, nonce, proof):
         """D1：校验 auth_proof。key=存储的 dk（hash 字段即 pbkdf2 派生字节），
-        期望 proof = HMAC-SHA256(dk, nonce)。返回 (ok, 提示语)。"""
+        期望 proof = HMAC-SHA256(dk, nonce, user)。返回 (ok, 提示语)。
+
+        auth-008（2026-09-18）：账号不存在/记录损坏与"口令错误"统一文案，且做一次
+        同代价的假比较（compare_digest）——否则响应时间/文案都能用来枚举账号名。
+        """
         user = (user or "").strip()
         with self._lock:
             record = self._users.get(user)
-            if not isinstance(record, dict):
-                return False, "账号不存在"
-            pw_hash = record.get("hash")
+        pw_hash = record.get("hash") if isinstance(record, dict) else None
         if not isinstance(pw_hash, str):
-            log.warning("账户 %s 记录损坏（缺 hash），拒绝登录", user)
-            return False, "账号不存在"
+            if isinstance(record, dict):
+                log.warning("账户 %s 记录损坏（缺 hash），拒绝登录", user)
+            hmac.compare_digest(hmac.new(b"tv-dummy", nonce, "sha256").digest(), proof)
+            return False, "用户名或密码错误"
         try:
             dk = bytes.fromhex(pw_hash)
-            expected = challenge_mac(dk, nonce)
+            expected = challenge_mac(dk, nonce, user)   # auth-002：proof 绑定用户名
         except (ValueError, TypeError) as e:
             log.warning("账户 %s 口令校验失败（记录损坏）：%s", user, e)
-            return False, "账号不存在"
+            # auth-008：记录损坏与口令错误统一文案（不可枚举）
+            return False, "用户名或密码错误"
         if not hmac.compare_digest(expected, proof):
             return False, "用户名或密码错误"
-        with self._lock:
-            record = self._users.get(user)
-            if isinstance(record, dict):
-                record["last_login"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                self._save()
+        self._touch_last_login(user)   # auth-009：读-改-写落在文件锁内
         log.info("账户登录成功: %s（挑战-应答）", user)
         return True, "登录成功"
 
     def register_derived(self, user, salt_hex, dk_hex):
         """D1：注册自助派生账户，salt/dk 由观看端计算上送，host 侧口令零接触。
-        返回 (ok, 提示语)。"""
+        返回 (ok, 提示语)。
+
+        auth-006（2026-09-18）：user/salt/dk 全部**上下界**校验——旧实现只有下界，
+        单条 ~20MB 记录即可撑爆 accounts.json，且每次 _save 都是二次方全量重写。
+        """
         user = (user or "").strip()
         if not user or not isinstance(salt_hex, str) or not isinstance(dk_hex, str):
             return False, "用户名与凭据不能为空"
-        try:
-            salt_bytes = bytes.fromhex(salt_hex)
-            dk_bytes = bytes.fromhex(dk_hex)
-        except ValueError:
-            return False, "凭据格式无效"
-        if len(salt_bytes) < 8 or len(dk_bytes) < 16:
-            return False, "凭据长度无效"
-        with self._lock:
-            if user in self._users:
+        if len(user) > MAX_USERNAME_LEN:
+            return False, "用户名过长（最多 %d 字符）" % MAX_USERNAME_LEN
+        # salt 定长 32 位 hex（与观看端 secrets.token_hex(16) 一致）；dk 定长 64 位
+        # hex（PBKDF2-SHA256 32 字节摘要）——均只放下界会让超大记录落库
+        if not _is_hex_str(salt_hex, KDF_SALT_HEX_LEN) or not _is_hex_str(dk_hex, 64):
+            return False, "凭据格式无效（salt 须为 32 位、dk 须为 64 位十六进制）"
+        record = {
+            "salt": salt_hex,
+            "hash": dk_hex,
+            "iter": PBKDF2_ITERATIONS,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        def _apply(users):
+            if user in users:
                 return False, "用户名已存在"
-            self._users[user] = {
-                "salt": salt_hex,
-                "hash": dk_hex,
-                "iter": PBKDF2_ITERATIONS,
-                "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            if not self._save():
-                self._users.pop(user, None)
-                return False, "无法写入账户文件（磁盘或权限问题），注册未生效"
+            users[user] = record
+            return True, "注册成功"
+
+        ok, msg = self._mutate(
+            _apply, fail_msg="无法写入账户文件（磁盘或权限问题），注册未生效")
+        if not ok:
+            return ok, msg
+        self._mark_bootstrap_used()   # auth-010：bootstrap 策略一经使用即消耗
         log.info("账户注册成功: %s（挑战-应答）", user)
-        return True, "注册成功"
+        return True, msg
 
     # ---- B3（实现方案 §5）：账户管理面板的本地运维接口，纯本地读写、不动协议 ----
 
@@ -343,37 +511,47 @@ class AccountManager:
         return rows
 
     def remove(self, user):
-        """删除账户，返回 (ok, 提示语)。写盘失败回滚内存，避免"面板已删、重启复活"。"""
+        """删除账户，返回 (ok, 提示语)。写盘失败不落内存，避免"面板已删、重启复活"。"""
         user = (user or "").strip()
-        with self._lock:
-            record = self._users.get(user)
-            if not isinstance(record, dict):
+
+        def _apply(users):
+            if not isinstance(users.get(user), dict):
                 return False, "账号不存在"
-            self._users.pop(user)
-            if not self._save():
-                self._users[user] = record
-                return False, "无法写入账户文件（磁盘或权限问题），删除未生效"
-        log.info("账户已删除: %s（本地管理）", user)
-        return True, "删除成功"
+            users.pop(user)
+            return True, "删除成功"
+
+        ok, msg = self._mutate(
+            _apply, fail_msg="无法写入账户文件（磁盘或权限问题），删除未生效")
+        if ok:
+            log.info("账户已删除: %s（本地管理）", user)
+        return ok, msg
 
     def set_password(self, user, password):
-        """本地改口令：生成新盐重新哈希（第 22 条：PBKDF2 在锁外算）。返回 (ok, 提示语)。"""
+        """本地改口令：生成新盐重新哈希（第 22 条：PBKDF2 在锁外算）。返回 (ok, 提示语)。
+
+        auth-011（2026-09-18）：改密同步写入当前 `iter`——旧实现继承旧记录字段，
+        一旦 PBKDF2_ITERATIONS 常量上调，改密后的账户在挑战阶段仍按旧 iter
+        派生，输对口令也永久登录失败。
+        """
         user = (user or "").strip()
         if not user or not password:
             return False, "用户名与密码不能为空"
         salt = secrets.token_hex(16)
         pw_hash = _hash_password(password, salt)
-        with self._lock:
-            record = self._users.get(user)
+
+        def _apply(users):
+            record = users.get(user)
             if not isinstance(record, dict):
                 return False, "账号不存在"
-            old = record
-            self._users[user] = dict(record, salt=salt, hash=pw_hash)
-            if not self._save():
-                self._users[user] = old
-                return False, "无法写入账户文件（磁盘或权限问题），改密未生效"
-        log.info("账户口令已重置: %s（本地管理）", user)
-        return True, "修改成功"
+            users[user] = dict(record, salt=salt, hash=pw_hash,
+                               iter=PBKDF2_ITERATIONS)
+            return True, "修改成功"
+
+        ok, msg = self._mutate(
+            _apply, fail_msg="无法写入账户文件（磁盘或权限问题），改密未生效")
+        if ok:
+            log.info("账户口令已重置: %s（本地管理）", user)
+        return ok, msg
 
 
 class ClientInfo:
@@ -448,6 +626,31 @@ class ClientInfo:
             return False
         self._up_tokens -= nbytes
         self._up_frames -= 1.0
+        return True
+
+    def allow_ctrl_broadcast(self, now=None, burst=3, window=10.0):
+        """限速触发 O(N) 全量广播的控制消息（net-020，2026-09-18）。
+
+        滑动窗口内最多 burst 条（默认 10 秒 3 条）：正常用户切源/停共享远低于此，
+        滥用者则被丢弃并计数（10 秒最多告警一次）。
+        """
+        now_m = time.monotonic() if now is None else now
+        try:
+            times = self._ctrl_btimes
+        except AttributeError:
+            times = self._ctrl_btimes = []
+        cutoff = now_m - window
+        while times and times[0] < cutoff:
+            times.pop(0)
+        if len(times) >= burst:
+            self._ctrl_bdropped = getattr(self, "_ctrl_bdropped", 0) + 1
+            last = getattr(self, "_ctrl_bwarn_at", 0.0)
+            if now_m - last >= 10.0:
+                self._ctrl_bwarn_at = now_m
+                log.warning("客户端 %s 控制消息过于频繁（已丢弃 %d 条触发广播的 "
+                            "watch/unshare）", self.addr, self._ctrl_bdropped)
+            return False
+        times.append(now_m)
         return True
 
     def note_rx(self, now=None):
@@ -965,6 +1168,11 @@ class HostRuntime:
         self.msg_timeout = safe_float(net_cfg.get("msg_timeout_s", 15.0), 15.0, 1.0, 600.0)
         self._conn_lock = threading.Lock()
         self._conn_count = 0
+        # auth-005（2026-09-18）：未认证（握手+登录）连接的单独名额上限。不加限制时
+        # 未认证 socket 可占满全部 max_clients（每条约 7.5 秒开一条即可维持），
+        # 对所有正常观众关门；这里给已认证/正常连接预留至少 3/4 名额。
+        self.max_pending_auth = max(4, self.max_clients // 4)
+        self._pending_count = 0
         # 第 104 条（B3）：向 peer 共享者转发关键帧请求的冷却表（share_id -> 时刻）
         self._peer_key_lock = threading.Lock()
         self._peer_key_at = {}
@@ -1065,6 +1273,24 @@ class HostRuntime:
         """当前连接数（含握手中）。"""
         with self._conn_lock:
             return self._conn_count
+
+    def acquire_pending(self):
+        """占用一个"未认证连接"名额（auth-005）；超限返回 False。
+
+        与 acquire_conn 的总名额叠加使用：攻击者用"连上不登录"的 socket 最多只能
+        挤满 max_pending_auth（默认 1/4），其余名额留给已认证连接与正常观众。
+        """
+        with self._conn_lock:
+            if self._pending_count >= self.max_pending_auth:
+                return False
+            self._pending_count += 1
+            return True
+
+    def release_pending(self):
+        """归还未认证连接名额（幂等）。"""
+        with self._conn_lock:
+            if self._pending_count > 0:
+                self._pending_count -= 1
 
     def shutdown(self):
         self.stop_event.set()
@@ -1435,9 +1661,16 @@ def _register_allowed(runtime, auth_cfg, addr):
         return False, "共享端已关闭自助注册，请向共享端索取账号"
     # bootstrap：只允许创建第一个账户——公网隧道已暴露、账户表还是空的时候，
     # 不能让人人都能自建账号，那样准入形同虚设。
-    if runtime.accounts.count() == 0:
+    # auth-010（2026-09-18）：以"曾注册过"的持久标记判定是否消耗过该窗口，而不是
+    # 只看当前账户数——否则删掉唯一账户（或清空账户文件）会静默重开"任意人可注册"。
+    try:
+        bootstrap_open = (runtime.accounts.count() == 0
+                          and not runtime.accounts.bootstrap_used())
+    except AttributeError:
+        bootstrap_open = runtime.accounts.count() == 0   # 测试替身无标记接口
+    if bootstrap_open:
         return True, ""
-    log.warning("客户端 %s 尝试注册，但已有账户（bootstrap 策略），已拒绝", addr)
+    log.warning("客户端 %s 尝试注册，但 bootstrap 注册窗口已关闭，已拒绝", addr)
     return False, "共享端已有账户，自助注册已关闭（请向共享端索取账号）"
 
 
@@ -1463,6 +1696,29 @@ def _str_field(msg, key, default=""):
 
 
 CHALLENGE_TTL_S = 60.0  # D1（实现方案 §10.1）：挑战 nonce 有效期，超时须重新发起登录
+
+#: auth-005（2026-09-18）：认证期的分档"进展"时限——总时限（auth_timeout，默认
+#: 240s）单独存在时，攻击者连上后一次不发也能占满一个连接名额 240 秒，约每 7.5 秒
+#: 开一条 socket 即可永久占满 max_clients。拆档后：
+#:  - 首条消息 30s：新版观看端握手后立即发 probe/login（等待界面就绪在**连接之前**），
+#:    正常远快于此；
+#:  - 下发挑战后 60s：观看端收到挑战时用户已提交口令，正常 1 秒内回 proof；
+#:  - probe 后等用户输密码：须覆盖登录框最长等待（120s），给 150s。
+AUTH_FIRST_MSG_S = 30.0
+AUTH_DIALOG_WINDOW_S = 150.0
+#: 挑战应答的宽限：挑战 TTL 到期后仍多等这几秒，让"挑战已过期"的明确回复能发出去
+#: （而不是直接在 recv 超时处断开，用户看到的只是"连接断了"）
+AUTH_CHALLENGE_GRACE_S = 5.0
+
+
+def _fake_login_salt(user):
+    """账号不存在时下发的确定性伪盐（auth-008，2026-09-18）。
+
+    32 位十六进制、与真实盐（secrets.token_hex(16)）同形，且对同一用户名稳定——
+    对端无法从"有没有挑战 / 盐长什么样"判断账号是否存在，账号名枚举面被抹平。
+    """
+    return hmac.new(b"tv-nouser", (user or "").encode("utf-8"),
+                    "sha256").hexdigest()[:32]
 
 
 def _auth_required_phase(sock, addr, runtime, auth_cfg):
@@ -1491,15 +1747,20 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
             log.warning("auth.chal_response=%r 非预期值，按 require 处理", mode)
         mode = "require"
     deadline = time.monotonic() + auth_timeout
+    # auth-005：当前 recv 的截止时刻。首条消息 30s；此后每收到一条完整消息（=进展）
+    # 恢复到总时限；下发挑战 / probe 后按对应档位收紧（见常量注释）。
+    msg_deadline = min(deadline, time.monotonic() + AUTH_FIRST_MSG_S)
     sock.settimeout(auth_timeout)
     pending = None  # 本连接当前挑战：{kind, user, nonce, salt, iter, exp}
 
     def _issue_challenge(kind, user, salt=None, iter_=PBKDF2_ITERATIONS):
-        nonlocal pending
+        nonlocal pending, msg_deadline
         nonce = secrets.token_bytes(16)
         pending = {"kind": kind, "user": user, "nonce": nonce,
                    "salt": salt, "iter": iter_,
                    "exp": time.monotonic() + CHALLENGE_TTL_S}
+        msg_deadline = min(deadline, time.monotonic() + CHALLENGE_TTL_S
+                           + AUTH_CHALLENGE_GRACE_S)
         reply = {"action": Act.CHAL, "nonce": b64e(nonce), "iter": iter_,
                  "proto": list(PROTOCOL_VERSION)}
         if salt is not None:
@@ -1515,7 +1776,16 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
 
     try:
         while True:
-            msg = recv_msg(sock, deadline)
+            msg = recv_msg(sock, msg_deadline)
+            # auth-005：收到任何完整消息都算进展，后续消息回到总时限
+            msg_deadline = deadline
+            if not isinstance(msg, dict):
+                # net-026（2026-09-18）：发 `[1,2]` 这类合法 JSON 非对象时旧实现
+                # 直接在 `.get` 上抛 AttributeError，被兜底记成"认证通信失败"
+                # （误导排障）；这里按协议错误明确拒绝。
+                return _reject_and_close("认证消息格式非法（应为 JSON 对象）",
+                                         "认证消息不是 JSON 对象（%s），已断开"
+                                         % type(msg).__name__)
             action = msg.get("action")
             # C2 §7 第 3 步：认证期 CTRL 随带 proto=[2,2]。主判仍是 MAGIC，
             # 这里只留痕；PROTO_ENFORCE（当前 False）翻转后不兼容客户端被拒。
@@ -1572,7 +1842,8 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                     if dk_bytes is None:
                         return _reject_and_close("注册凭据格式非法",
                                                  "reg_proof salt/dk 格式非法，已断开")
-                    if not hmac.compare_digest(challenge_mac(dk_bytes, p["nonce"]), proof):
+                    if not hmac.compare_digest(
+                            challenge_mac(dk_bytes, p["nonce"], user), proof):
                         ok, text = False, "挑战校验失败"
                     else:
                         ok, text = runtime.accounts.register_derived(user, raw_salt, raw_dk)
@@ -1602,10 +1873,13 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                     return False, None
                 got = runtime.accounts.challenge_for(user)
                 if got is None:
-                    return _reject_and_close("账号不存在",
-                                             "登录失败: 账号不存在（%s）"
-                                             % (user or "-"))
-                _issue_challenge("login", user, salt=got[0], iter_=got[1])
+                    # auth-008（2026-09-18）：账号不存在不再单独回 "账号不存在"
+                    # （响应有无即可枚举用户名）——照常下发挑战（确定性伪盐），
+                    # 应答阶段与"口令错误"统一报"用户名或密码错误"。
+                    log.info("客户端 %s 登录请求：账号不存在（已下发伪盐挑战）", addr)
+                    _issue_challenge("login", user, salt=_fake_login_salt(user))
+                else:
+                    _issue_challenge("login", user, salt=got[0], iter_=got[1])
                 continue
             if action == Act.REGISTER:
                 allowed, why = _register_allowed(runtime, auth_cfg, addr)
@@ -1635,6 +1909,10 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                 send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
                                 "msg": "需要登录", "proto": list(PROTOCOL_VERSION)})
                 # 第 30 条：probe 后保持连接，等观看端在同一 socket 提交真实凭据。
+                # auth-005：此时用户可能正对着登录框输入，窗口收紧到
+                # AUTH_DIALOG_WINDOW_S（覆盖观看端登录框 120s 上限），
+                # 而不是让"probe 后空等"吃掉完整 auth_timeout。
+                msg_deadline = min(deadline, time.monotonic() + AUTH_DIALOG_WINDOW_S)
                 continue
             return _reject_and_close("不支持的认证请求")
     except socket.timeout:
@@ -1669,8 +1947,12 @@ def _auth_optional_phase(sock, addr):
         log.debug("客户端 %s 未发送可选 auth，按旧客户端直连处理", addr)
         return True, None
     try:
+        # net-022（2026-09-18）：可选 auth 阶段同样要有**总时限**——只设 per-recv
+        # 超时时，攻击者每 <2 秒喂 1 字节即可让这条消息永久挂住线程 + 连接名额
+        # （准入关闭时该分支无登录框等待，不存在需要放宽的合法场景）。
+        deadline = time.monotonic() + 2.0
         sock.settimeout(2.0)
-        msg = recv_msg(sock)
+        msg = recv_msg(sock, deadline)
         # C2 §7 第 3 步：准入关闭路径同样只留痕不启用（与 _do_auth 一致）
         present, compatible = proto_compatible(msg)
         if present and not compatible:
@@ -1766,8 +2048,15 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
         if not _reply_ctrl(sock, info, {"action": Act.CAP, "multiview": True}, addr):
             return "控制消息写入失败（连接已损坏）"
     elif action == Act.WATCH:
+        # net-020（2026-09-18）：watch/unshare 会触发 O(N) 全量 roster 广播
+        # （逐个客户端上 _write_lock 同步写），且不经过上行帧限速——廉价控制消息
+        # 即可把 CPU 与目标观众的 _write_lock 打满。这里加一道独立限速。
+        if not info.allow_ctrl_broadcast():
+            return None
         return _ctrl_watch(sock, info, runtime, msg, addr)
     elif action == Act.UNSHARE:
+        if not info.allow_ctrl_broadcast():
+            return None
         # 成员主动停止共享（连接保留）：注销并广播 roster，
         # 让订阅该 peer 的观看端回落 local（viewer peers 处理）
         if info.share_id is not None:
@@ -1822,9 +2111,12 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
     # ValueError（表现为"连上就断"），且违反本文件"配置数值一律走 safe_*"的约定。
     idle_s = safe_float(net_cfg.get("keepalive_idle_s", 60), 60, 1, 3600)
     # 第 57 条：rx_buf 用 bytearray，+= 原地扩展（摊还 O(1)）——泵内维持同一实现。
-    # 第 103 条：partial_since 记录"当前未完成消息的首字节到达时刻"，半开检测以
-    # 收到任意字节刷新 last_rx_at，攻击者每 <idle_s 秒发 1 字节即可永久占用线程，
-    # 这里给单条消息（头+体）设总时限，超时按协议错误断开。
+    # 第 103 条：partial_since 记录"当前未完成消息的首字节到达时刻"。
+    # net-015（2026-09-18）：半开检测与单条消息总时限都必须以"完整消息"为进度单位——
+    # 旧实现由 on_rx（任意字节）刷新 last_rx_at、并由 post 回调无条件重置
+    # partial_since，攻击者发 `0x02 + 长度=32MB-1` 头后每 <15s 滴 1 字节即可把
+    # 计时起点无限后移，永久占用接收线程 + fd + 连接名额 + ≤32MB 缓冲
+    # （max_clients 全占即对所有观众关门）。现在：仅真正消费完整消息才刷新。
     partial_since = None
     msg_timeout = safe_float(getattr(runtime, "msg_timeout", 15.0), 15.0, 1.0, 600.0)
 
@@ -1835,17 +2127,17 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
             return "单条消息超时（%.0f 秒内未收完整）" % msg_timeout
         return None
 
-    def _on_buf(event, buf, now):
+    def _on_buf(event, buf, now, n_msgs=0):
         nonlocal partial_since
         if event == "pre_empty":
             partial_since = now  # 本段是某条新消息的第一段
-        elif not buf:
-            partial_since = None  # 缓冲区已清空：当前没有半截消息在等
-        else:
-            # C2（2026-09-11）：一段 recv 若"凑完上一条消息 + 留下下一条的半截"，
-            # partial_since 仍保留上一条消息首字节的时刻——消费完消息后缓冲区
-            # 非空即重置计时，下一条从"现在"起算自己的总时限。
-            partial_since = now
+        elif n_msgs > 0:
+            # 本轮消费掉了完整消息：半截消息（如有）从"现在"起算自己的总时限；
+            # 完整消息即"客户端还活着"的证据，刷新半开检测时钟（net-015）
+            partial_since = now if buf else None
+            info.note_rx(now)
+        # n_msgs == 0 且缓冲区非空：同一截未完成消息又收到一段字节——
+        # **不**刷新 partial_since / last_rx_at，否则滴字节即可无限续命
 
     def _on_message(kind, payload, raw):
         if kind in (MSG_VIDEO, MSG_FRAME):
@@ -1866,7 +2158,8 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
             sock,
             should_stop=runtime.stop_event.is_set,
             on_idle=_on_idle,
-            on_rx=lambda now: info.note_rx(),
+            # net-015：note_rx 改由 _on_buf 在"消费完整消息"时刷新——任意字节刷新
+            # 会让滴字节攻击同时绕过 60s 半开检测
             on_recv_error=lambda exc: "接收错误",
             on_eof=lambda: "断开",
             on_message=_on_message,
@@ -1908,11 +2201,33 @@ def _handle_client_inner(sock, addr, runtime):
 
     第 109 条（阶段 2）：原 384 行拆为 _do_handshake / _do_auth / _client_recv_loop
     （内部再走 _dispatch_ctrl 与 _forward_upstream_frame）/ _client_teardown。
+
+    auth-005（2026-09-18）：握手+认证阶段占用**未认证名额**（max_pending_auth），
+    完成后立即归还——未认证 socket 挤不满全部 max_clients。
     """
     host_cfg, net_cfg = _client_net_cfg(runtime)
-    if not _do_handshake(sock, addr, net_cfg):
+    acquired = None
+    acquire = getattr(runtime, "acquire_pending", None)
+    if callable(acquire) and not acquire():
+        log.warning("未认证连接数已达上限 %d，拒绝来自 %s 的新连接（多为连上不登录）",
+                    getattr(runtime, "max_pending_auth", 0), addr)
+        try:
+            sock.close()
+        except OSError:
+            pass
         return
-    ok, username = _do_auth(sock, addr, runtime, host_cfg)
+    if callable(acquire):
+        acquired = True
+    try:
+        if not _do_handshake(sock, addr, net_cfg):
+            return
+        ok, username = _do_auth(sock, addr, runtime, host_cfg)
+    finally:
+        if acquired:
+            try:
+                runtime.release_pending()
+            except Exception:
+                pass
     if not ok:
         return
     # 认证阶段设置的 socket 超时在进入接收循环前复位为阻塞模式：
@@ -1941,8 +2256,17 @@ def _handle_client_inner(sock, addr, runtime):
     auth_cfg = host_cfg.get("auth", {})
     if not isinstance(auth_cfg, dict):
         auth_cfg = {}
-    reason = _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg)
-    _client_teardown(sock, info, runtime, addr, username, reason)
+    # net-019（2026-09-18）：入册之后任何一步异常都必须走统一收尾——旧实现
+    # `_client_recv_loop`/`broadcast_roster` 抛异常时直接冒泡出 handle_client，
+    # 客户端留在 runtime.clients、发送线程继续活着（删不掉的源 + 线程/fd 泄漏）。
+    reason = "异常"
+    try:
+        reason = _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg)
+    except Exception as e:
+        reason = "异常: %s" % e
+        log.warning("客户端 %s 接收循环异常，按断开收尾: %s", addr, e)
+    finally:
+        _client_teardown(sock, info, runtime, addr, username, reason)
 def _subscriber_count(runtime, source="local"):
     """当前订阅指定源的存活客户端数（B9：ABR 判据要区分"有订阅者"与"没人看"）。"""
     try:
@@ -1985,9 +2309,13 @@ def route_frame(runtime, source, frame, is_key=False, is_jpeg=False, send_timeou
             # 愈合（且上方门控刚清过 need_key），二者均无需处理。
             if dropped and not is_jpeg and not is_key:
                 info.need_key = True
-                with runtime.slot_lock:
-                    runtime.force_key = True
-                _wake_raw(runtime)
+                # net-021（2026-09-18）：只有本机源才置本机 force_key——订阅 peer 源
+                # 的观众丢帧与本地编码器无关，旧实现照样强制本地流出 IDR
+                # （正反馈放大：慢观众 → 本机 IDR 风暴）。
+                if source == "local":
+                    with runtime.slot_lock:
+                        runtime.force_key = True
+                    _wake_raw(runtime)
                 # 第 104 条（B3）：source 为 peer:N 时，上面置的 force_key 只影响
                 # host 本地编码线程，**队友的编码器收不到任何请求**——订阅 peer 的
                 # 观看端只能等对方自然 keyint（默认 60 帧 ≈ 2s）才恢复。这里补一次
@@ -2343,21 +2671,37 @@ def _start_tunnel_selfcheck(runtime, port, delay=3.0):
         return
 
     def _probe():
-        host, pub_port = target
-        try:
-            runtime.stop_event.wait(delay)
-            if runtime.stop_event.is_set():
+        # net-023（2026-09-18）：自检改为**周期循环**——旧实现只在启动后跑一次，
+        # 隧道重启/掉线后面板仍显示旧"通过"；结论带 ts，面板据此提示时效。
+        waited = 0.0
+        while not runtime.stop_event.is_set():
+            host, pub_port = target
+            if runtime.stop_event.wait(max(0.0, delay - waited)):
                 return
-            sock = socket.create_connection((host, pub_port), timeout=8)
-        except Exception as e:
-            log.warning("公网隧道自检失败：无法连接 %s:%s（%s）——请确认 frpc 已在运行、"
-                        "隧道已启用；若连接被拒绝，检查樱花控制台里隧道的本地地址/端口", host, pub_port, e)
-            # B2（第 134 条）：四种结论除日志外同步进 _net_status（面板/诊断报告消费）
-            runtime.set_net_status("fail", "无法连接 %s:%s（隧道未就绪？）" % (host, pub_port))
-            return
+            waited = 0.0
+            delay = 600.0      # 首次 3 秒后自检，此后每 10 分钟复检一次
+            try:
+                sock = socket.create_connection((host, pub_port), timeout=8)
+            except Exception as e:
+                log.warning("公网隧道自检失败：无法连接 %s:%s（%s）——请确认 frpc 已在运行、"
+                            "隧道已启用；若连接被拒绝，检查樱花控制台里隧道的本地地址/端口", host, pub_port, e)
+                # B2（第 134 条）：四种结论除日志外同步进 _net_status（面板/诊断报告消费）
+                runtime.set_net_status("fail", "无法连接 %s:%s（隧道未就绪？）" % (host, pub_port))
+                continue
+            _probe_once(runtime, sock, host, pub_port, port)
+
+    def _probe_once(runtime, sock, host, pub_port, port):
         try:
             sock.settimeout(8)
-            sock.sendall(MAGIC_CLIENT)
+            try:
+                sock.sendall(MAGIC_CLIENT)
+            except OSError as e:
+                # net-023：sendall 也必须在 try 内——旧实现隧道半开时这里抛的
+                # OSError 直接冒出线程（无结论、无日志），自检静默消失
+                log.warning("公网隧道自检失败：向 %s:%s 发送握手失败（%s）",
+                            host, pub_port, e)
+                runtime.set_net_status("fail", "握手发送失败（隧道半开？）")
+                return
             try:
                 got = sock.recv(4)
             except OSError as e:
@@ -2987,7 +3331,15 @@ def _perf_log_and_bandwidth(runtime, stats):
         infos = list(runtime.clients.values())
     # 阶段 A2（优化方案 2026-09-17）：出锁逐个统计——旧实现在 clients_lock 内对每个
     # 客户端调用 recent_send_ms/rate_kbps/加 _lock，连接入册/注销要排在这些计算后面。
+    #
+    # net-016（2026-09-18）：ABR 判据只采信本机源订阅者（watch_source=="local"）。
+    # MultiView 下订阅 peer:X 的慢链路观众：其发送耗时/丢帧/吞吐走的是转发路径，
+    # 与本地编码器无关，但旧实现把它们并进判据持续"投毒"——降级侧被钉到
+    # min_bitrate/scale_min/fps_min，且只要那观众不断开就永不回升（回升分支有
+    # 订阅者门控、降级分支没有）。
     for info in infos:
+        if getattr(info, "watch_source", "local") != "local":
+            continue
         ms = info.recent_send_ms(now_mono)
         if ms > 0:
             client_send_ms.append(ms)
@@ -2996,8 +3348,10 @@ def _perf_log_and_bandwidth(runtime, stats):
     bw_lines = []
     for info in infos:
         rate = info.rate_kbps(now_mono)   # 最近 1 秒实测速率（KB/s，日志用）
-        # ABR 用 3 秒窗口取平均：跨过一个 GOP，避开关键帧突发造成的 10 倍跳变
-        egress_bps += info.rate_kbps(now_mono, window=_ABR_EGRESS_WINDOW_S) * 8192.0
+        if getattr(info, "watch_source", "local") == "local":
+            # ABR 用 3 秒窗口取平均：跨过一个 GOP，避开关键帧突发造成的 10 倍跳变；
+            # 仅本机源订阅者计入——否则慢的 peer 订阅者把本地码率压穿（net-016）
+            egress_bps += info.rate_kbps(now_mono, window=_ABR_EGRESS_WINDOW_S) * 8192.0
         lock = getattr(info, "_lock", None)
         if lock is not None:
             with lock:
@@ -3164,7 +3518,9 @@ def _perf_tick(runtime, p):
     lag_us = int(time.time() * 1_000_000) - frame_ts if frame_ts > 0 else 0
     congested = (effective_send_ms > budget_ms or recent_drop
                  or (frame_ts > 0 and lag_us > 800_000))
-    if congested:
+    # net-016：降级补与回升对称的订阅者门控——没有本机源订阅者时降级只损本机画质、
+    # 无人受益（回升分支同款门控见下）
+    if congested and stats.get("subscribers", 0) > 0:
         _abr_degrade(runtime, p, stats, effective_send_ms, recent_drop)
     elif (stats["send_fps"] >= 5 and not recent_drop
           # B9：没有订阅者时不回升——send_fps 已由 _send_loop 在"零投递"时归零，这里
@@ -3226,8 +3582,15 @@ def main():
     # A3（第 133 条）：GUI 模式先上屏纯 tkinter 极简 splash，再触发重依赖加载
     # （HostRuntime.__init__ 里的 _load_heavy 兜底）——双击到可见窗口的间隔
     # 不再包含 cv2/numpy/mss 的导入时间。splash 失败静默降级为旧行为。
+    #
+    # ui-020（第 36 条回退修复，2026-09-18）：DPI 感知必须**在建任何窗口之前**声明——
+    # Windows 在进程首个 HWND 创建时即定死 DPI 感知，第 133 条把 splash 的 tk.Tk()
+    # 提到了声明之前，使 enable_dpi_awareness() 必然失败且返回值被丢弃（完全静默）。
+    # 与 viewer 侧顺序对齐。
     splash_root = None
     if not args.console:
+        if not enable_dpi_awareness():
+            log.warning("DPI 感知声明失败，高 DPI 下界面文字可能发虚（详见日志）")
         try:
             import tkinter as tk
             import splash as splash_mod
@@ -3258,7 +3621,8 @@ def main():
     gui = None
     if not args.console:
         try:
-            enable_dpi_awareness()
+            # ui-020：DPI 已在上方（建 splash 之前）声明，此处不再重复调用——
+            # 重复调用的返回值恒 False，只会制造误导。
             import host_ui
             gui = host_ui.HostConsole(runtime)
         except Exception as e:

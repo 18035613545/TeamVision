@@ -132,10 +132,10 @@ class TestSetPassword(_MgrCase):
         dk = common.derive_dk("new-pw", salt, iter_)
         nonce = os.urandom(16)
         self.assertTrue(m.verify_login_proof("alice", nonce,
-                                             common.challenge_mac(dk, nonce))[0])
+                                             common.challenge_mac(dk, nonce, "alice"))[0])
         old_dk = common.derive_dk("new-pw-wrong", salt, iter_)
         self.assertFalse(m.verify_login_proof("alice", nonce,
-                                              common.challenge_mac(old_dk, nonce))[0])
+                                              common.challenge_mac(old_dk, nonce, "alice"))[0])
 
     def test_validation_and_rollback(self):
         m = self._mgr()

@@ -90,9 +90,9 @@ class TestActionSinglePoint(unittest.TestCase):
         self.assertEqual(Act.REG_PROOF, "reg_proof")
 
     def test_protocol_version_is_single_carrier(self):
-        # C2：PROTOCOL_VERSION 是唯一的版本载体；D1（挑战-应答）落地时按预案升 2.2
+        # C2：PROTOCOL_VERSION 是唯一的版本载体；2.3 = proof 绑定用户名（auth-002）
         self.assertEqual(Act.__dict__.get("AUTH_RESULT"), "auth_result")
-        self.assertEqual(common.PROTOCOL_VERSION, (2, 2))
+        self.assertEqual(common.PROTOCOL_VERSION, (2, 3))
         self.assertEqual(common.MAGIC_CLIENT, b"FS02")
 
 
@@ -138,7 +138,8 @@ class TestMessagePump(unittest.TestCase):
             on_message=lambda k, p, raw: events.append(("msg", k)) or None,
             on_batch=lambda buf: events.append(("batch", bytes(buf))) or None,
             on_rx=lambda now: events.append(("rx",)),
-            on_buf=lambda ev, buf, now: events.append(("buf", ev, bytes(buf))),
+            on_buf=lambda ev, buf, now, n=0: events.append(
+                ("buf", ev, bytes(buf), n)),
         )
         self.assertIsNone(reason)  # 之后 EOF 且无 on_eof → 以 None 结束
         kinds = [e for e in events if e[0] == "msg"]
@@ -151,6 +152,8 @@ class TestMessagePump(unittest.TestCase):
         # 第 1 次排空后缓冲区仍留有半截视频头 → post 时 buf 非空
         self.assertTrue(bufs[1][2])
         self.assertFalse(bufs[2][2])
+        # net-015：post 需带"本轮消费的完整消息条数"（0=仍是同一截半截消息）
+        self.assertEqual([b[3] for b in bufs], [0, 1, 2])
         # 每块 recv 一次 batch；EOF 块不再触发
         self.assertEqual(sum(1 for e in events if e[0] == "batch"), 2)
 
