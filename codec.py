@@ -107,7 +107,8 @@ class VideoEncoder:
             try:
                 av.Codec(name, "w")
                 usable.append(name)
-            except Exception:
+            except Exception as e:
+                _pick_encoder_logged_unavailable(name, e)   # codec-007：留痕（一次）
                 continue
         return usable
 
@@ -254,12 +255,28 @@ class VideoEncoder:
             return _CODEC_BY_NAME.get(self.name, CODEC_H264)
 
     def set_fps(self, fps):
-        """自适应帧率变化时重建编码器（time_base/framerate 需随之更新）。"""
+        """自适应帧率变化时重建编码器（time_base/framerate 需随之更新）。
+
+        codec-002（2026-09-18）：与 set_bitrate 同款"锁外构造、锁内切换"——旧实现
+        在锁内 `_recreate`（`keep_old_on_failure=False`），编码线程要停等一次 NVENC
+        拆装（约 100ms），且新上下文建不出来时连原本可用的旧编码器也一起拆掉
+        （自毁后只能回退 JPEG，直到下次成功重建）。
+        """
         fps = max(1, int(fps))
         with self._lock:
-            if fps != self._fps:
-                self._fps = fps
-                self._recreate(self._last_bitrate)
+            if self._closed or self._permafailed or fps == self._fps:
+                return
+            self._fps = fps
+            bitrate = self._last_bitrate
+            names = self._pick_encoder()
+        ctx, name = self._create_ctx_with(names, bitrate)
+        if ctx is None:
+            return                      # 保留旧上下文继续出帧；帧率不生效，下次再试
+        with self._lock:
+            if self._closed or self._permafailed:
+                self._retire_ctx(ctx)
+                return
+            self._install_ctx(ctx, name, bitrate)
 
     def encode(self, bgr, raw_ts=None, force_key=False):
         """编码一帧 BGR 图像（线程安全：与 set_bitrate/set_fps 串行执行）。
@@ -314,17 +331,26 @@ class VideoEncoder:
         if not pkts:
             # pre-roll（如 libx265 流水线延迟）：本帧无输出，不计入失败
             return None
+        # codec-003（2026-09-18）：一次 encode 可能出**多包**（repeat_headers / 编码器
+        # 内部拆分）：旧实现只取 `pkts[-1]`，前序 NAL 静默丢弃——关键帧的 SPS/PPS 与
+        # IDR 被拆成两包时直接丢掉 SPS/PPS，观看端后续帧无法起解；0 字节包照发还会
+        # 让观看端把空 payload 当关键帧处理（关键帧风暴）。这里合并全部非空包、
+        # 关键帧标志取任一包命中，时间戳取最后一包。
+        parts = [bytes(p) for p in pkts]
+        data = b"".join(p for p in parts if p)
+        if not data:
+            return None
         self._encode_failures = 0
         encode_ms = (time.perf_counter() - start) * 1000.0
-        pkt = pkts[-1]  # 低延迟下每次 encode 至多输出一帧；取最新
+        pkt = pkts[-1]
         self.frame_sent += 1
-        is_key = bool(getattr(pkt, "is_keyframe", False))
+        is_key = any(bool(getattr(p, "is_keyframe", False)) for p in pkts)
         if is_key:
             self.keyframe_sent += 1
         out_ts = getattr(pkt, "pts", None)
         if out_ts is None:
             out_ts = int(raw_ts) if raw_ts is not None else 0
-        return bytes(pkt), is_key, encode_ms, int(out_ts)
+        return data, is_key, encode_ms, int(out_ts)
 
     def set_bitrate(self, bps, hysteresis=0.15):
         """码率自适应：目标码率变化超过当前 ±hysteresis 时重建编码器。
@@ -460,14 +486,46 @@ class VideoDecoder:
         return out
 
     def close(self):
-        """释放解码上下文（幂等）。"""
+        """释放解码上下文（幂等）。
+
+        codec-005（2026-09-18）：PyAV 17 的 CodecContext 没有 close()——旧实现
+        `ctx.close()` 恒抛 AttributeError 被吞掉，释放全交 GC（重连风暴下线程/显存
+        堆积）。与编码侧 `_retire_ctx` 同一口径：解引用让 GC 释放，仅当底层确实
+        提供 close 时才调用；顺带 flush_buffers 提前归还 PyAV 内部缓冲。
+        """
         ctx = self._ctx
         self._ctx = None
-        if ctx is not None:
+        if ctx is None:
+            return
+        flush = getattr(ctx, "flush_buffers", None)
+        if callable(flush):
             try:
-                ctx.close()
+                flush()
             except Exception:
                 pass
+        close = getattr(ctx, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        del ctx
+
+
+#: codec-007：候选编码器"不可用"的原因只记一次（避免每次重建刷屏）
+_UNAVAILABLE_LOGGED = set()
+
+
+def _pick_encoder_logged_unavailable(name, exc):
+    """codec-007（2026-09-18）：候选编码器不可用的原因按名字只记一次。
+
+    旧实现 `except: continue` 全吞——"为什么没有硬件编码"在日志里可能一个字都不落。
+    只记一次避免每次重建都刷屏（编码器重建在自适应期间可达每秒一次）。
+    """
+    if name in _UNAVAILABLE_LOGGED:
+        return
+    _UNAVAILABLE_LOGGED.add(name)
+    log_note("视频编码器 %s 不可用（%s）；候选链中将跳过" % (name, exc))
 
 
 def log_note(msg):

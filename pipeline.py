@@ -113,6 +113,14 @@ class FrameEncoder:
             if fps is not None and fps != self._enc_fps:
                 self._encoder.set_fps(fps)   # 帧率档变化重建
                 self._enc_fps = fps
+            # codec-006（2026-09-18）：码率参数不能静默忽略——旧实现把 bitrate 记进
+            # self._bitrate 就完事，已存在的编码器只在"下次重建"时才采用，调用方
+            # （配置热更等）以为已生效。带 ±15% 迟滞，重复同值调用只做一次比较。
+            if bitrate is not None:
+                try:
+                    self._encoder.set_bitrate(int(bitrate))
+                except Exception as e:
+                    log.debug("%s码率下发失败（保持原码率）: %s", self._tag(), e)
             return
         if self._encoder_sel == "jpeg":
             return
@@ -260,9 +268,19 @@ class CaptureSource:
             log.debug(msg, *args)
 
     def working(self):
-        """采集后端是否可用：句柄存在且未自报失效（无 working 属性视为可用）。"""
+        """采集后端是否可用：句柄存在、未自报失效、且未连续抛错。
+
+        capture-002（2026-09-18）：旧判据只看句柄对象是否存在——真实后端句柄活着
+        但每帧抛错（RDP 断连/锁屏唤醒/GPU 重置后的 BitBlt/COMError）时恒 True，
+        空帧兜底 `none_rebuild_requires_dead` 被挡死、永不重建。`consecutive_errors`
+        由真实 CaptureManager 提供；伪采集器（测试注入，无此属性）保持原语义。
+        """
         cap = self.cap
-        return cap is not None and bool(getattr(cap, "working", True))
+        if cap is None:
+            return False
+        if not bool(getattr(cap, "working", True)):
+            return False
+        return getattr(cap, "consecutive_errors", 0) < self._rebuild_on_errors
 
     # ---------- 生命周期 ----------
 
@@ -353,7 +371,10 @@ class CaptureSource:
             bgr = self.cap.grab()
         except Exception as e:
             self._errors += 1
-            log.warning("%s采集错误: %s（连续 %d 次）", self._tag(), e, self._errors)
+            # capture-002：逐条告警加 10 秒冷却（故障持续时最高每帧一条 →
+            # 重建周期内最多 5 条 + 1 条重建日志），避免刷爆滚动日志
+            self._warn_throttled("%s采集错误: %s（连续 %d 次）",
+                                 self._tag(), e, self._errors)
             if self._errors >= self._rebuild_on_errors:
                 self._rebuild("采集后端持续异常，尝试重建采集器（故障恢复）")
                 self._errors = 0

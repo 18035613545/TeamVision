@@ -67,7 +67,10 @@ class TestStopSkipsCloseWhenThreadAlive(unittest.TestCase):
         self.assertEqual(s.close_calls, [],
                          "线程仍存活时 stop() 关闭了资源（在运行线程脚下抽掉 cap/encoder）")
         self.assertEqual(th.join_calls, [2.0], "应以 2 秒超时 join")
-        self.assertIsNone(s._thread, "stop() 应清掉 _thread 引用")
+        # codec-009（2026-09-18）：线程仍活着时**保留** _thread 引用——否则
+        # start() 的"已有活线程直接复用"承诺失效，可再起一条上传线程与旧线程
+        # 共用同一个非线程安全编码器
+        self.assertIsNotNone(s._thread, "线程仍存活时不得清掉 _thread 引用")
 
     def test_alive_thread_stop_still_signals_stop(self):
         """仍存活时也要置停止位：让卡住的线程 sendall 超时后复检 _stop 自行退出。"""

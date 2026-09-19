@@ -157,10 +157,27 @@ class CaptureManager:
         self._mss = None
         self._camera = None
         self._effective = backend  # 回退后的实际后端
+        self._errors = 0           # 连续采集异常次数（成功一帧即清零，capture-002）
         self._open()
 
     def _open(self):
+        # capture-003/004（2026-09-18）：mss 句柄在两种后端下都先打开——dxgi 的区域
+        # 换算（虚拟桌面绝对坐标 → 显示器内相对坐标）与"全部屏幕/几何不匹配"回退
+        # 都需要 mss 的显示器几何；mss 初始化失败只是失去回退能力，不影响 dxgi。
+        self._mss = None
+        try:
+            self._mss = mss.MSS()
+        except Exception as e:
+            log.error("mss 采集初始化失败: %s", e)
+            self._mss = None
         if self.backend == "dxgi":
+            out = self._pick_output_idx()
+            if out is None:
+                self._effective = "mss"
+                log.warning("dxgi 无法映射显示器 #%d（全部屏幕），改用 mss 采集",
+                            self.monitor)
+                return
+            device_idx, output_idx = out
             try:
                 ensure_vendor_on_path()   # B7：源码运行时 vendor/ 需显式接入 sys.path
                 import dxcam  # 延迟导入：可选依赖，未安装时回退 mss
@@ -169,9 +186,11 @@ class CaptureManager:
                 # imencode、av.VideoFrame(format="bgr24")、观看端 BGR2RGB）都按 BGR
                 # 处理，用默认值会让整路画面红蓝互换。必须显式要 BGR。
                 used_bgr = True
+                # capture-004：device_idx 仅在非 0 时显式传入（保持默认设备的调用形态不变）
+                extra = {"device_idx": device_idx} if device_idx else {}
                 try:
                     self._camera = dxcam.create(
-                        output_idx=max(0, self.monitor - 1), output_color="BGR")
+                        output_idx=output_idx, output_color="BGR", **extra)
                 except TypeError as e:
                     # C16（2026-09-11）：只把"未知关键字参数 output_color"当成版本不支持。
                     # dxcam.create 内部是一整条 DXGI/comtypes/winrt 第三方栈，任何位置抛出
@@ -182,7 +201,7 @@ class CaptureManager:
                         raise
                     log.warning("dxcam 不支持 output_color 参数（%s）；已回退为 RGB 帧，"
                                 "画面红蓝可能互换，请升级 dxcam", e)
-                    self._camera = dxcam.create(output_idx=max(0, self.monitor - 1))
+                    self._camera = dxcam.create(output_idx=output_idx, **extra)
                     used_bgr = False
                 self._effective = "dxgi"
                 # C16：日志必须与实际拿到的颜色格式一致，不再无条件宣称 BGR
@@ -195,14 +214,9 @@ class CaptureManager:
             except Exception as e:
                 log.warning("dxgi 后端不可用，回退 mss：%s", e)
                 self._camera = None
-        try:
-            self._mss = mss.MSS()
-            self._effective = "mss"
-            if self.backend == "dxgi":
-                log.info("已回退到 mss 采集后端")
-        except Exception as e:
-            log.error("mss 采集初始化失败: %s", e)
-            self._mss = None
+        self._effective = "mss" if self._mss is not None else self._effective
+        if self.backend == "dxgi" and self._mss is not None:
+            log.info("已回退到 mss 采集后端")
 
     def set_params(self, backend, monitor, region):
         """参数变更时重建后端；无变更时保持现有实例（避免频繁重建）。"""
@@ -217,31 +231,133 @@ class CaptureManager:
         """是否至少有一个可用采集后端；dxgi 与 mss 均失败时为 False（第 5 条）。"""
         return self._camera is not None or self._mss is not None
 
-    def grab(self):
-        """采集一帧，返回 BGR numpy 数组；失败或无新帧返回 None。"""
+    @property
+    def consecutive_errors(self):
+        """连续采集异常次数（成功一帧即清零）。
+
+        capture-002（2026-09-18）：供 CaptureSource 判活——句柄存在但每帧抛错时
+        `working` 恒 True，自愈判据必须能看到这个计数才能触发重建。
+        """
+        return self._errors
+
+    def _dxgi_region(self):
+        """把配置区域换算成 dxcam 的"显示器内相对坐标"（capture-003，2026-09-18）。
+
+        mss 的 region 是**虚拟桌面绝对坐标**，dxcam 的 region 是**所选输出内**的
+        相对坐标：副屏上的区域直接透传给 dxcam 时越界 → 永久黑屏（dxcam 返回 None）。
+        返回 (region 或 None, 是否越界)：越界（区域跨出所选显示器）时交由调用方回退 mss。
+        """
+        mon = self._monitor_rect(self.monitor)
+        left = int(self.region["left"])
+        top = int(self.region["top"])
+        w = int(self.region["width"])
+        h = int(self.region["height"])
+        if mon is None:
+            # 拿不到显示器几何：不做换算（保持旧行为，避免误截）
+            return (left, top, left + w, top + h), False
+        ml, mt, mw, mh = mon
+        if (left < ml or top < mt or left + w > ml + mw or top + h > mt + mh):
+            return None, True
+        x0 = left - ml
+        y0 = top - mt
+        return (x0, y0, x0 + w, y0 + h), False
+
+    def _monitor_rect(self, idx):
+        """mss 语义的显示器矩形 (left, top, width, height)；不可用时 None。"""
         try:
-            if self._effective == "dxgi" and self._camera is not None:
-                if self.region:
-                    x0 = int(self.region["left"])
-                    y0 = int(self.region["top"])
-                    frame = self._camera.grab(
-                        region=(x0, y0, x0 + int(self.region["width"]),
-                                y0 + int(self.region["height"])))
-                else:
-                    frame = self._camera.grab()
-                return frame  # dxcam 返回 BGR ndarray（已显式 output_color="BGR"）或 None（无新帧）
-            if self._mss is not None:
-                if self.region:
-                    mon = {"left": int(self.region["left"]), "top": int(self.region["top"]),
-                           "width": int(self.region["width"]), "height": int(self.region["height"])}
-                else:
-                    idx = self.monitor if 0 <= self.monitor < len(self._mss.monitors) else 1
-                    mon = self._mss.monitors[idx]
-                img = np.asarray(self._mss.grab(mon))  # BGRA
-                return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        except Exception as e:
-            log.warning("采集错误: %s", e)
-        return None
+            mons = getattr(self._mss, "monitors", None)
+        except Exception:
+            mons = None
+        if not mons or idx < 0 or idx >= len(mons):
+            return None
+        try:
+            m = mons[idx]
+            return int(m["left"]), int(m["top"]), int(m["width"]), int(m["height"])
+        except Exception:
+            return None
+
+    def _pick_output_idx(self):
+        """选择 dxcam 的 output_idx（capture-004，2026-09-18）。
+
+        旧实现直接把配置里的显示器序号当 DXGI 输出序号：配置 0（mss 语义的"全部
+        屏幕"）变成第一屏；混合显卡/多屏按序号枚举不一致时采错屏，越界则
+        IndexError 被静默吞掉回退 mss。这里按**几何矩形**在 dxcam 输出列表里匹配
+        配置的显示器；匹配不到或配置为"全部屏幕"时返回 None（调用方回退 mss）。
+        """
+        if self.monitor <= 0:
+            return None      # 0 = 全部屏幕（虚拟桌面）：单输出无法表达，回退 mss
+        rect = self._monitor_rect(self.monitor)
+        if rect is not None:
+            try:
+                import dxcam
+                factory = getattr(dxcam, "_DXFactory__factory", None) or \
+                    getattr(dxcam, "__factory", None)
+                outputs = getattr(factory, "outputs", None) if factory else None
+                if outputs:
+                    targets = []
+                    for didx, outs in enumerate(outputs):
+                        for oidx, output in enumerate(outs):
+                            desc = getattr(output, "desc", None)
+                            coords = getattr(desc, "DesktopCoordinates", None)
+                            if coords is None:
+                                continue
+                            out_rect = (int(coords.left), int(coords.top),
+                                        int(coords.right - coords.left),
+                                        int(coords.bottom - coords.top))
+                            if out_rect == rect:
+                                targets.append((didx, oidx))
+                    if targets:
+                        if len(targets) > 1:
+                            log.warning("多个 DXGI 输出与显示器 #%d 几何一致，取第一个",
+                                        self.monitor)
+                        return targets[0]
+            except Exception as e:
+                log.debug("dxcam 输出枚举失败，按序号回退: %s", e)
+        # 几何匹配不可用（dxcam 内部结构变化等）：退回"序号-1"的旧口径，
+        # 设备取默认 0（不改变历史行为）
+        return (0, self.monitor - 1)
+
+    def grab(self):
+        """采集一帧，返回 BGR numpy 数组；失败或无新帧返回 None。
+
+        capture-002（2026-09-18）：采集异常**上抛**，不再就地吞成 None——
+        `CaptureSource.grab` 的"连续异常→重建采集器"自愈依赖异常计数，旧实现把
+        所有异常吞掉后 `_errors` 恒 0，该恢复逻辑是死代码：RDP 断连/锁屏唤醒/
+        GPU 重置/分辨率变化后对方永久黑屏，且每帧一条 WARNING（最高约 100 条/秒）
+        刷爆 5MB 滚动日志、冲掉真实病因。
+        """
+        try:
+            frame = self._grab_once()
+        except Exception:
+            self._errors += 1
+            raise
+        self._errors = 0
+        return frame
+
+    def _grab_once(self):
+        if self._effective == "dxgi" and self._camera is not None:
+            if self.region:
+                # capture-003：mss 语义的绝对坐标 → dxcam 需要的显示器内相对坐标；
+                # 区域跨出所选显示器时本帧回退 mss（dxcam 会返回永久黑屏）
+                reg, out_of_range = self._dxgi_region()
+                if out_of_range:
+                    return self._grab_mss()
+                return self._camera.grab(region=reg)
+            return self._camera.grab()  # 返回 BGR ndarray 或 None（无新帧）
+        return self._grab_mss()
+
+    def _grab_mss(self):
+        """mss 抓帧（区域为虚拟桌面绝对坐标；也是 dxgi 区域越界时的回退路径）。"""
+        if self._mss is None:
+            return None
+        if self.region:
+            mon = {"left": int(self.region["left"]), "top": int(self.region["top"]),
+                   "width": int(self.region["width"]), "height": int(self.region["height"])}
+        else:
+            idx = self.monitor if 0 <= self.monitor < len(self._mss.monitors) else 1
+            mon = self._mss.monitors[idx]
+        img = np.asarray(self._mss.grab(mon))  # BGRA
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     def close(self):
         if self._mss is not None:

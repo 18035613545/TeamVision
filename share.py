@@ -103,10 +103,14 @@ class ScreenShareSession:
         self._stop.set()
 
     def stop(self):
-        """停止上传线程并释放采集/编码资源（幂等，最多等 2 秒）。"""
+        """停止上传线程并释放采集/编码资源（幂等，最多等 2 秒）。
+
+        codec-009（2026-09-18）：join 超时（线程仍活着）时**保留** `_thread` 引用——
+        旧实现先抹引用再 join，提前返回后 `start()` 的"已有活线程直接复用"承诺失效：
+        可再起一条上传线程与旧线程共用同一个非线程安全 FrameEncoder。
+        """
         self.signal_stop()
         th = self._thread
-        self._thread = None
         if th is not None:
             th.join(timeout=2.0)
             if th.is_alive():
@@ -114,6 +118,7 @@ class ScreenShareSession:
                 # 采集/编码资源，避免在运行中的线程脚下抽掉 cap/encoder；
                 # 资源由线程自身 finally（_run 末尾）释放。
                 return
+        self._thread = None
         self._close_resources()
 
     def request_keyframe(self):
@@ -165,8 +170,9 @@ class ScreenShareSession:
                 if bgr is None:
                     # 采集空帧（dxgi 无新帧）：响应关键帧请求后短等再巡；成功才清事件
                     if key_wanted and last_packed is not None:
-                        self._send_key_response(last_frame, last_packed, last_is_video)
-                        self._key_evt.clear()
+                        if self._send_key_response(last_frame, last_packed,
+                                                   last_is_video):
+                            self._key_evt.clear()   # codec-008：仅在真送出后消费
                     continue
                 changed = gate.check(bgr) if gate is not None else True
                 if changed:
@@ -181,8 +187,8 @@ class ScreenShareSession:
                     continue
                 # 无有效变化：静止时按探测间隔巡检；请求关键帧则补帧响应（成功才清事件）
                 if key_wanted and last_packed is not None:
-                    self._send_key_response(last_frame, last_packed, last_is_video)
-                    self._key_evt.clear()
+                    if self._send_key_response(last_frame, last_packed, last_is_video):
+                        self._key_evt.clear()   # codec-008：仅在真送出后消费
                 wait = self._probe_interval if gate.in_still else interval
                 elapsed = time.perf_counter() - t0
                 if wait - elapsed > 0:
@@ -238,25 +244,32 @@ class ScreenShareSession:
         return ef.frame, msg, ef.is_video
 
     def _send_key_response(self, last_frame, last_packed, last_is_video):
-        """静止/空闲期关键帧请求响应：视频=强制 IDR；JPEG=重发缓存帧。"""
+        """静止/空闲期关键帧请求响应：视频=强制 IDR；JPEG=重发缓存帧。
+
+        返回是否**真的送出了**关键帧/缓存帧（codec-008，2026-09-18）：旧实现四条
+        失败路径（无缓存帧 / 强制 IDR 异常 / 无输出 / 发送失败）不给调用方任何信号，
+        而调用方无条件清除 key_evt——第 3 条"请求只在成功后消费"被回退成"发失败也丢"。
+        """
         if last_packed is None:
-            return
+            return False
         if last_is_video and last_frame is not None:
             res, err = self._fe.force_idr(last_frame)
             if err is not None:
                 log.warning("频道[%s] 静止期强制 IDR 失败: %s", self._name, err)
-                return
+                return False
             if res is None:
-                return
+                return False
             nal, is_key, _ms, out_ts = res
             if not is_key:
-                return
+                # codec-004 同款：强制 IDR 未生效（编码器返回 P 帧）时不发，保留请求重试
+                return False
             if self._send_msg(pack_video(nal, out_ts, True,
                                          codec=self._fe.encoder.codec_id)):
                 log.info("频道[%s] 静止期响应关键帧请求（%d 字节）",
                          self._name, len(nal))
-            return
-        self._send_msg(last_packed)  # JPEG：重发自包含缓存帧
+                return True
+            return False
+        return bool(self._send_msg(last_packed))  # JPEG：重发自包含缓存帧
 
     def _send_msg(self, msg):
         """经共享写锁发送完整消息；失败置停止位（连接已断由 Channel 层善后）。
