@@ -25,11 +25,17 @@ HTTP_TIMEOUT_S = 5.0
 
 
 def enabled(cfg):
-    """配置开关：update_check.enabled，默认 True（缺键/缺段/坏值都按开启处理）。"""
+    """配置开关：update_check.enabled，**默认 False**（缺键/缺段/坏值一律视为关闭）。
+
+    dist-004（2026-09-18）：更新检查默认开启时，每 24 小时都会向 api.github.com
+    暴露使用者 IP 与"正在使用本程序"这一事实——与第 131 条默认安全口径相悖，
+    且没有任何 UI 开关。改为 opt-in：需要更新提示的用户在共享端控制台勾选，
+    或手改 config.json 的 update_check.enabled。
+    """
     sec = cfg.get("update_check") if isinstance(cfg, dict) else None
     if not isinstance(sec, dict):
-        return True
-    return bool(sec.get("enabled", True))
+        return False
+    return bool(sec.get("enabled", False))
 
 
 def parse_version(text):
@@ -90,28 +96,42 @@ def check_update(cfg=None, now=None, opener=None, cache_path=None):
     if now is None:
         now = time.time()
     if cache_path is None:
-        cache_path = os.path.join(data_dir(), CACHE_NAME)
+        base = data_dir()
+        if not base:
+            return None          # dist-005：无可写数据目录时不检查（旧实现拼接 None）
+        cache_path = os.path.join(base, CACHE_NAME)
     cached = _read_cache(cache_path)
     tag = cached.get("tag") if cached else None
     checked_at = cached.get("checked_at") if cached else None
-    fresh = (isinstance(tag, str) and isinstance(checked_at, (int, float))
-             and (now - checked_at) < CACHE_TTL_S)
+    # dist-006（2026-09-18）：年龄必须为**非负**才算新鲜——时钟回拨/缓存被写成未来
+    # 时刻时 (now - checked_at) 恒负，旧判据永远"新鲜"→ 该机器永久不再检查更新
+    age = (now - checked_at) if isinstance(checked_at, (int, float)) else None
+    fresh = (isinstance(tag, str) and age is not None and 0 <= age < CACHE_TTL_S)
     if not fresh:
         try:
             fetched = _fetch_tag(opener)
-        except Exception as e:  # 断网/DNS/限流一律静默，降级用旧缓存
-            log.debug("更新检查失败（静默）：%s", e)
+        except Exception as e:  # 断网/DNS/限流一律降级用旧缓存
+            # dist-007（2026-09-18）：失败必须留痕（默认 INFO 级别可见）——
+            # 旧实现只 log.debug，断网/代理/限流在日志里一个字都看不到
+            log.info("更新检查失败（不影响使用）：%s", e)
             fetched = None
         if fetched is not None:
             tag = fetched
             checked_at = now
             try:
-                tmp = cache_path + ".tmp"
+                # dist-005：临时名带 PID+线程号（host/viewer 同机运行时不再互踩）；
+                # replace 失败重试一次（Windows 上撞读即 PermissionError）
+                tmp = "%s.%d.%d.tmp" % (cache_path, os.getpid(),
+                                        threading.get_ident())
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump({"checked_at": checked_at, "tag": tag}, f)
-                os.replace(tmp, cache_path)
+                try:
+                    os.replace(tmp, cache_path)
+                except PermissionError:
+                    time.sleep(0.05)
+                    os.replace(tmp, cache_path)
             except OSError as e:
-                log.debug("更新检查缓存写入失败（忽略）：%s", e)
+                log.info("更新检查缓存写入失败（忽略）：%s", e)
         elif not (isinstance(tag, str) and is_newer(tag)):
             return None
     return ("有新版 %s 可下载（GitHub Releases）" % tag) if is_newer(tag) else None
@@ -129,7 +149,7 @@ def start_background_check(cfg, post_msg):
         try:
             msg = check_update(cfg)
         except Exception as e:
-            log.debug("更新检查线程异常（静默）：%s", e)
+            log.info("更新检查线程异常（不影响使用）：%s", e)
             return
         if msg:
             try:

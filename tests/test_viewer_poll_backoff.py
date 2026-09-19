@@ -42,6 +42,8 @@ def _app(status="receiving", with_channel=True):
     app.active_idx = 0
     app._last_channel_idx = 0
     app._last_frame_serial = 0
+    # ui-002（2026-09-18）：poll 判据新增状态维度，桩需同步簿记（与真实 _show_* 一致）
+    app._last_channel_status = status
     app._drain_ui_queue = lambda: None
     app._sync_hotkey_notice_once = lambda: None
     app._process_cred_requests = lambda: None

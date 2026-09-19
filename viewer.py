@@ -84,6 +84,11 @@ from common import (
     PROTOCOL_VERSION,
     # D1（实现方案 §10）：挑战-应答认证公共件（口令不再过网）
     PBKDF2_ITERATIONS, derive_dk, challenge_mac, b64e, b64d,
+    # auth-002（2026-09-18）：挑战参数校验（salt 形态/长度）
+    _is_hex_str, KDF_SALT_HEX_LEN,
+    # auth-002/auth-003（2026-09-18，协议 v2.3）：proof 绑定用户名；仅与支持该版本的
+    # 共享端走挑战-应答（旧版明确拒绝，不再降级明文口令）
+    PROTO_CHAL_MIN_MINOR,
 )
 
 #: 模块级日志（logger.setup_logger(cfg) 幂等初始化后生效）
@@ -287,6 +292,10 @@ class Channel:
         self._decoder = codec_mod.VideoDecoder()
         self._dec_lock_obj = None  # 惰性创建，见 _dec_lock()
         self._got_key = False          # 是否已收到关键帧（视频解码起点）
+        #: net-017（2026-09-18）：积压追新标志——延迟/批次超阈值时置位，只喂关键帧
+        #: 并请求 IDR，直到关键帧到位（否则积压永远消化不完、延迟只增不减）
+        self._resync = False
+        self._resync_at = 0.0
         # 第 105 条（B6）：解码"代数"。切源/重连时 +1，_decode_video_batch 进入时
         # 快照并逐帧校验——主线程切源会重置解码器，而接收线程可能正在用**旧源**的
         # NAL 循环，若不校验就会把旧源帧喂进新解码器（或把旧源画面贴到新源标签下），
@@ -345,6 +354,20 @@ class Channel:
             self.__dict__["_dec_lock_obj"] = lock
         return lock
 
+    def _invalidate_media(self):
+        """作废帧缓存并强制主界面重绘（接收线程状态跃迁时调用）。
+
+        ui-002（2026-09-18）：poll 的"无变化"判据只看 frame_serial，而状态跃迁
+        （连接中/需登录/已断开）既不递增 serial 也不清 last_frame——曾出过一帧后
+        "已断开，正在重连…"分支永不可达，用户面对静止的最后一帧直到重连成功；
+        第 12 条的 fps 衰减同样在"泵退出"路径上失效。三处跃迁点统一经此收口。
+        """
+        with self.lock:
+            self.frame_serial += 1
+            self.last_frame = None
+        self._reset_stats()   # ui-010：断线/重连即作废旧路径的帧率与延迟样本
+        self._note_no_media()
+
     def _receiver_loop(self):
         """接收线程主循环：解析地址 → 连接 → 握手 → 实时收帧；异常时指数退避重连。
 
@@ -353,7 +376,9 @@ class Channel:
         天然丢弃突发积压的中间帧（防止解码积压放大端到端延迟）。
         """
         while self._running:
+            # ui-002：进入新一轮连接即作废旧帧缓存，断线期间悬浮窗不得定格最后一帧
             self.status = "connecting"
+            self._invalidate_media()
             sock = None
             try:
                 host, port = parse_addr(self.addr)
@@ -385,6 +410,7 @@ class Channel:
                 if not self._authenticate(sock):
                     self.status = "auth"
                     self.auth_msg = "需要登录后观看"
+                    self._invalidate_media()   # ui-002：不得让旧画面盖住"需要登录"提示
                     log.warning("频道[%s] 未通过认证（%s）", self.name, self.auth_msg)
                     raise ConnectionError("认证未通过")
                 # 认证阶段设置的 socket 超时（connect 10s / 认证 5s）在进入接收循环前复位：
@@ -497,6 +523,7 @@ class Channel:
                     nonlocal last_media_rx
                     if video_batch:
                         last_media_rx = time.monotonic()  # 收到画面帧（第 2/12 条）
+                        self._check_backlog(sock, video_batch)
                         self._decode_video_batch(sock, video_batch)
                     elif latest_jpeg is not None:
                         last_media_rx = time.monotonic()  # 收到画面帧（第 2/12 条）
@@ -523,6 +550,9 @@ class Channel:
                 if self.status != "auth":
                     self.status = "disconnected"
                 self._active_sock = None
+                # ui-002：断线即作废旧帧缓存并衰减 fps——否则"已断开，正在重连…"
+                # 永不可达，用户面对定格画面把断线误当成"画面卡住"
+                self._invalidate_media()
                 # 断线瞬间停止共享上传（复用新连接时按开关自动重启）
                 self._stop_share()
                 if sock is not None:
@@ -576,6 +606,28 @@ class Channel:
                     except Exception:
                         pass
 
+    def _send_ctrl_async(self, obj, timeout=2.0):
+        """fire-and-forget 控制消息：丢给短生命周期工作线程发送（ui-009，2026-09-18）。
+
+        Tk 主线程直接同步 `_send_locked`（锁内 sendall 最长 5s）时，对端停读会让
+        整个界面冻结 5–10 秒；UNSHARE 这类不需要回执的消息经此发送，主线程只付
+        一次线程启动成本。发送失败由接收循环的重连逻辑自然兜底。
+        """
+        sock = self._active_sock
+        if sock is None:
+            return False
+        threading.Thread(
+            target=self._send_ctrl_worker, args=(sock, obj, timeout),
+            name="channel-ctrl-send", daemon=True,
+        ).start()
+        return True
+
+    def _send_ctrl_worker(self, sock, obj, timeout):
+        try:
+            self._send_locked(sock, obj, timeout=timeout)
+        except (OSError, ValueError):
+            pass
+
     def _control_ping_loop(self, sock):
         """心跳/测 RTT 控制线程：周期发送 ping 到服务端，pong 由接收循环解析。
 
@@ -593,8 +645,13 @@ class Channel:
                 return  # 连接已断/发送超时，接收循环会负责重连
 
     def _request_keyframe(self, sock):
-        """向服务端请求关键帧（带 0.5s 冷却），用于首连/丢关键帧/花屏快速恢复。"""
-        now = time.time()
+        """向服务端请求关键帧（带 0.5s 冷却），用于首连/丢关键帧/花屏快速恢复。
+
+        ui-011（2026-09-18）：冷却用**单调钟**——墙钟后跳会让
+        `now - _key_requested_at < 0.5` 长期为真，关键帧自救被永久静默（画面
+        花屏后只能等下一个自然 GOP）。
+        """
+        now = time.monotonic()
         if now - self._key_requested_at < 0.5:
             return
         self._key_requested_at = now
@@ -602,6 +659,41 @@ class Channel:
             self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()})
         except (OSError, ValueError):
             pass
+
+    #: net-017（2026-09-18）：判定"积压"的两个信号——单批帧数（一次 recv 排空
+    #: 掉大批帧 = 明显落后）与端到端延迟（采集时刻到现在的差，秒级即不可接受）
+    _BACKLOG_BATCH_FRAMES = 12
+    _BACKLOG_LAG_US = 2_500_000
+    _BACKLOG_COOLDOWN_S = 10.0
+
+    def _check_backlog(self, sock, batch):
+        """积压检测（net-017）：落后明显时进入追新模式。
+
+        docstring 声称"天然丢弃突发积压的中间帧"，但实现为保参考帧链必须逐帧解码
+        ——解码慢于到达时积压只能在 socket 缓冲里越堆越多，延迟爬升且永不回落。
+        这里检测到积压即重置解码器、请求关键帧，并让后续批次只喂关键帧直到 IDR
+        到位（参考链反正已断，跳过 P 帧可瞬间消化积压）。
+        """
+        now_m = time.monotonic()
+        if now_m - getattr(self, "_resync_at", 0.0) < self._BACKLOG_COOLDOWN_S:
+            return
+        lag_us = time.time_ns() // 1000 - int(batch[-1][0])
+        # 延迟窗口取 (0, 10s]：负数/超大值是跨机时钟偏差或脏数据（同 _store_frame 口径）
+        lagged = 0 <= lag_us <= 10_000_000 and lag_us > self._BACKLOG_LAG_US
+        if not lagged and len(batch) < self._BACKLOG_BATCH_FRAMES:
+            return
+        self._resync_at = now_m
+        self._resync = True
+        try:
+            with self._dec_lock():
+                self._decoder.reset()
+        except Exception:
+            pass
+        self._got_key = False
+        self._request_keyframe(sock)
+        log.warning("频道[%s] 检测到解码积压（本批 %d 帧，延迟 %.1f 秒），"
+                    "进入追新模式：只收关键帧直到恢复",
+                    self.name, len(batch), max(0.0, lag_us) / 1e6)
 
     def _decode_video_batch(self, sock, batch):
         """按到达顺序解码一批 H.264/HEVC 帧（第 7 条）。
@@ -642,9 +734,12 @@ class Channel:
                 self.cur_codec = codec
                 self._got_key = False
                 self._request_keyframe(sock)
+            if getattr(self, "_resync", False) and not (flags & VIDEO_FLAG_KEY):
+                continue   # net-017：追新模式丢弃中间 P 帧（参考链已断，等 IDR）
             if flags & VIDEO_FLAG_KEY:
                 self._got_key = True
                 self.video_mode = True
+                self._resync = False   # net-017：关键帧到位，退出追新模式
             with self._dec_lock():
                 frames = self._decoder.decode(nal)
             if getattr(self._decoder, "needs_keyframe", False):
@@ -746,8 +841,17 @@ class Channel:
                     action, user, password = Act.PROBE, "", ""
                 else:
                     result = self._ask_credentials()
-                    if result is None:  # 用户取消
-                        self._prompt_blocked_until = time.time() + 30
+                    if result is None:
+                        if getattr(self, "_cred_timeout", False):
+                            # ui-003：等待超时/被中断 ≠ 用户取消——不设冷却、不谎报
+                            # "用户取消登录"，如实记账后按重连节奏重试
+                            self._cred_timeout = False
+                            self.auth_msg = "登录等待超时（120 秒），稍后自动重试"
+                            self._retry_delay = 0.0
+                            log.warning("频道[%s] 登录框等待超时（120 秒），"
+                                        "不按用户取消处理（不设冷却）", self.name)
+                            return False
+                        self._prompt_blocked_until = time.monotonic() + 30
                         self.auth_msg = "用户取消登录"
                         return False
                     action, user, password = result
@@ -760,25 +864,40 @@ class Channel:
                 sock.settimeout(5.0)
                 if action in (Act.LOGIN, Act.REGISTER) and self._chal_capable is None:
                     # D1 能力探测：先发一次 probe 读取服务端回包中的 proto（新版必带；
-                    # 旧版无该字段 → False，保留旧版直发口令路径）。probe 若命中准入
-                    # 关闭会直接 ok=True，本轮即出结果。
+                    # 旧版无该字段 → False）。probe 若命中准入关闭会直接 ok=True，本轮即出结果。
                     send_msg(sock, {"action": Act.PROBE, "user": "", "pass": "",
                                     "proto": list(PROTOCOL_VERSION)})
                     probe = recv_msg(sock)
                     proto = probe.get("proto")
                     self._chal_capable = bool(
                         isinstance(proto, (list, tuple)) and len(proto) >= 2
-                        and proto[0] == PROTOCOL_VERSION[0] and proto[1] >= 2)
+                        and proto[0] == PROTOCOL_VERSION[0]
+                        and proto[1] >= PROTO_CHAL_MIN_MINOR)
                     if probe.get("ok"):
                         reply = probe
                     elif self._chal_capable:
                         reply = self._auth_via_challenge(sock, action, user, password)
                     else:
-                        send_msg(sock, {"action": action, "user": user, "pass": password,
-                                        "proto": list(PROTOCOL_VERSION)})
-                        reply = recv_msg(sock)
+                        # auth-003（2026-09-18）：不再回退到"明文口令过网"——中间人
+                        # 剥掉 probe 的 proto 字段即可把新版观看端降级到旧直发路径，
+                        # 明文口令连同账号被链路/隧道嗅探。服务端不支持挑战-应答
+                        # （或探测被篡改）时明确拒绝并提示升级共享端。
+                        self.auth_msg = ("共享端不支持安全登录（挑战-应答），"
+                                         "为避免口令明文过网已拒绝；请更新共享端后重试")
+                        log.warning("频道[%s] 服务端 proto=%r 无挑战-应答能力，"
+                                    "已拒绝明文口令登录（auth-003）",
+                                    self.name, proto)
+                        return False
                 elif action in (Act.LOGIN, Act.REGISTER) and self._chal_capable:
                     reply = self._auth_via_challenge(sock, action, user, password)
+                elif action in (Act.LOGIN, Act.REGISTER):
+                    # 能力缓存已判定服务端不支持挑战-应答（如上次探测后重连）——
+                    # 同样拒绝明文口令（auth-003：不留降级路径）
+                    self.auth_msg = ("共享端不支持安全登录（挑战-应答），"
+                                     "为避免口令明文过网已拒绝；请更新共享端后重试")
+                    log.warning("频道[%s] 服务端无挑战-应答能力（缓存），已拒绝明文口令登录",
+                                self.name)
+                    return False
                 else:
                     send_msg(sock, {"action": action, "user": user, "pass": password,
                                     "proto": list(PROTOCOL_VERSION)})
@@ -893,17 +1012,34 @@ class Channel:
             iter_ = int(chal.get("iter") or PBKDF2_ITERATIONS)
         except (ValueError, TypeError):
             return {"ok": False, "msg": "挑战消息格式非法"}
+        # auth-002（2026-09-18）：挑战参数由对端提供，使用前强校验——
+        #  · iter 与本地常量不一致即判服务端异常拒登：防中间人回 {iter:1, salt:自选}
+        #    得到"一次迭代"的离线口令爆破 oracle，或回超大 iter 让本端挂死；
+        #  · nonce 必须非空且足够长：空 nonce 会让 proof 退化为常量 HMAC(dk,"")，
+        #    可永久重放。
+        if iter_ != PBKDF2_ITERATIONS:
+            log.warning("频道[%s] 服务端挑战 iter=%r 与本地常量（%d）不一致，拒绝登录",
+                        self.name, iter_, PBKDF2_ITERATIONS)
+            return {"ok": False, "msg": "服务端挑战参数异常（iter），已拒绝登录"}
+        if len(nonce) < 16:
+            log.warning("频道[%s] 服务端挑战 nonce 过短（%d 字节），拒绝登录",
+                        self.name, len(nonce))
+            return {"ok": False, "msg": "服务端挑战参数异常（nonce），已拒绝登录"}
         if action == Act.REGISTER:
             salt = secrets.token_hex(16)  # 注册路径：服务端还没有该账户记录，salt 本端生成
         else:
             salt = chal.get("salt") or ""
         if not salt:
             return {"ok": False, "msg": "挑战消息缺少 salt"}
+        if not _is_hex_str(salt, KDF_SALT_HEX_LEN):
+            log.warning("频道[%s] 服务端挑战 salt 格式非法（%r），拒绝登录",
+                        self.name, salt)
+            return {"ok": False, "msg": "挑战消息格式非法（salt 须为 32 位十六进制）"}
         try:
             dk = derive_dk(password, salt, iter_)
         except ValueError:
             return {"ok": False, "msg": "挑战消息格式非法（salt 非十六进制）"}
-        proof = b64e(challenge_mac(dk, nonce))
+        proof = b64e(challenge_mac(dk, nonce, user))   # auth-002：proof 绑定用户名
         if action == Act.REGISTER:
             reply_msg = {"action": Act.REG_PROOF, "user": user, "salt": salt,
                          "dk": dk.hex(), "proof": proof,
@@ -917,6 +1053,18 @@ class Channel:
             return {"ok": False, "msg": "服务端响应异常"}
         return result
 
+    def _abandon_cred_request(self, box, done):
+        """放弃本次登录请求（ui-003，2026-09-18）：标记超时并置位 done。
+
+        旧实现超时直接 `return None`，队列里的请求仍"待弹"——用户几小时后回来时
+        主线程把它当成新请求再弹一个**幽灵登录框**（第 108/B15 的 `done.is_set()`
+        判据依赖 done 置位，超时分支恰恰不置位）；调用方还把 None 当"用户取消"
+        记 30 秒静默冷却，明明没人点过取消。
+        """
+        self._cred_timeout = True
+        box["result"] = {"error": TimeoutError("登录等待超时，请求已作废")}
+        done.set()
+
     def _ask_credentials(self):
         """请求主线程弹出登录/注册对话框；返回 ("login"|"register", user, password) 或 None。
 
@@ -924,11 +1072,14 @@ class Channel:
         与首启向导同款标准模态窗口。跨线程 root.after 派生的对话框在 Windows 上存在
         键盘输入无法到达的问题（焦点上下文与 Tk 内部状态不同步）。
         """
-        if time.time() < self._prompt_blocked_until:
+        # ui-011（2026-09-18）：冷却用单调钟——墙钟后跳（对时/NTP）会让
+        # `time.time() < blocked_until` 长期为真，登录框"永久静默"
+        if time.monotonic() < self._prompt_blocked_until:
             # 第 133 条：冷却必须留痕——原来这里静默 return None，用户与日志都无从知道
             # "登录框被压住了"，只能看到"没有登录页面"。
             log.info("频道[%s] 登录框处于冷却中（%.0f 秒后可再次弹出；上次为手动取消）",
-                     self.name, max(0.0, self._prompt_blocked_until - time.time()))
+                     self.name,
+                     max(0.0, self._prompt_blocked_until - time.monotonic()))
             return None
         owner = self.owner
         if owner is None:
@@ -960,6 +1111,8 @@ class Channel:
         # 超时返回后用户才提交时，结果只写进这个已被放弃的 box，绝不会串给下一次请求。
         box = {}
         done = threading.Event()
+        #: ui-003（2026-09-18）：本次等待是否超时/被中断（而非用户取消）
+        self._cred_timeout = False
         # 第 108 条（B15）：队列限长——接收线程 done.wait(120) 超时后会重连并再次入队，
         # 用户几小时后回来关掉第一个框，主线程会接着弹出积压的第二、第三个"幽灵登录框"。
         # 超过 4 个就丢掉最旧的。
@@ -987,11 +1140,14 @@ class Channel:
             if done.wait(0.5):
                 break
             if stop_evt is not None and stop_evt.is_set():
+                self._abandon_cred_request(box, done)
                 return None
             if not getattr(self, "_running", True):
+                self._abandon_cred_request(box, done)
                 return None
             waited += 0.5
             if waited >= 120.0:
+                self._abandon_cred_request(box, done)
                 return None
         result = box.get("result")
         if result is None or "error" in result or "value" not in result:
@@ -1068,6 +1224,39 @@ class Channel:
                 self._fps_times.pop(0)
             self.fps = float(len(self._fps_times))
 
+    def _reset_stats(self):
+        """清空帧率/延迟样本（ui-010，2026-09-18）。
+
+        切源/断线重连时旧样本必须作废：`_fps_times` 混入两条路径会虚报（新旧源
+        各半 → fps 近 2 倍），`_latency_samples`/`_latency_ring` 混入两个源/两条
+        路径的 P50/P95 不再代表当前链路。属性访问走 getattr——测试常经 __new__
+        构造 Channel，未必跑过 __init__。
+
+        调用方已持 `self.lock` 时必须走 `_reset_stats_locked()`——`threading.Lock`
+        不可重入（switch_source 内部即持锁调用）。
+        """
+        with self.lock:
+            self._reset_stats_locked()
+
+    def _reset_stats_locked(self):
+        """`_reset_stats` 的锁内实现体（调用方持 self.lock）。"""
+        for name in ("_fps_times", "_latency_samples"):
+            seq = getattr(self, name, None)
+            if seq is not None:
+                try:
+                    seq.clear()
+                except Exception:
+                    pass
+        ring = getattr(self, "_latency_ring", None)
+        if ring is not None:
+            try:
+                ring.clear()
+            except Exception:
+                pass
+        self._p_stats_cache = None
+        self.latency_ms = 0.0
+        self.fps = 0.0
+
     # ---------- MultiView：共享开关 / 观看源切换 ----------
 
     def request_keyframe(self):
@@ -1096,12 +1285,8 @@ class Channel:
             self._stop_share()          # 锁外 join（最多 2 秒）
             # 通知 host 注销本成员的共享登记（连接保留）：host 广播 roster，
             # 其他观看端据此从源列表移除本端并回落 local
-            sock = self._active_sock
-            if sock is not None:
-                try:
-                    self._send_locked(sock, {"action": Act.UNSHARE})
-                except (OSError, ValueError):
-                    pass
+            # ui-009：UNSHARE 不需要回执，异步发送（主线程不得同步等 5 秒超时）
+            self._send_ctrl_async({"action": Act.UNSHARE})
             log.info("频道[%s] 共享已关闭", self.name)
             return True, ""
         with self._share_lock:
@@ -1156,16 +1341,24 @@ class Channel:
             # 第 8 条：清 last_frame 的同时递增 frame_serial，强制 poll 重绘，
             # 否则「有无新帧」判据认为没变化，画面会停留在上一个人至少一个 GOP。
             self.frame_serial += 1
+            # ui-010：切源后旧源的帧率/延迟样本立即作废（避免混入两个源的统计）；
+            # 此处已持 self.lock，必须走 *_locked 版本（Lock 不可重入）
+            self._reset_stats_locked()
+            self._resync = False
         sock = self._active_sock
         if sock is None:
             self._revert_source(prev_source)  # 第 9 条：未发包，回滚避免谎报
             return False
         try:
             # 第 100 条：有界发送；超时抛 socket.timeout（OSError 子类）→ 回滚
-            self._send_locked(sock, {"action": Act.WATCH, "source": source})
+            # ui-009：本方法由 Tk 主线程调用（源列表/热键），超时从 5s 收紧到 1.2s
+            # ——对端停读时界面最多卡 1.2s，失败仍走既有的回滚分支
+            self._send_locked(sock, {"action": Act.WATCH, "source": source},
+                              timeout=1.2)
             if source == "local":
                 # 本地源由 host 编码线程消费 force_key；看 peer 由 host 转达
-                self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()})
+                self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()},
+                                  timeout=1.2)
         except (OSError, ValueError):
             self._revert_source(prev_source)  # 第 9 条：发包失败，回滚避免谎报
             return False
@@ -1193,10 +1386,21 @@ class Channel:
             try:
                 if self._share.alive:
                     return True, ""
-                self._share.stop()  # 旧会话已死：清理后重建
             except Exception:
                 pass
-            self._share = None
+            # ui-013（2026-09-18）：旧会话的清理（stop() 内含 join 最长 2 秒）不得
+            # 在持 _share_lock 的调用路径上做——交给后台线程（第 106 条同款要求）；
+            # 本方法调用方持锁，若在此 join，接收线程处理 cap/peers 会等锁不读 socket。
+            old, self._share = self._share, None
+
+            def _cleanup(session=old):
+                try:
+                    session.stop()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_cleanup, name="share-cleanup",
+                             daemon=True).start()
         try:
             cfg = self.owner.cfg if self.owner is not None else {}
             session = share_mod.ScreenShareSession(
@@ -1283,12 +1487,8 @@ class Channel:
         with self._share_lock:
             self.share_enabled = False
         self._stop_share()
-        sock = self._active_sock
-        if sock is not None:
-            try:
-                self._send_locked(sock, {"action": Act.UNSHARE})
-            except (OSError, ValueError):
-                pass
+        # ui-009：本方法由主线程 poll 调用，UNSHARE 异步发送
+        self._send_ctrl_async({"action": Act.UNSHARE})
         log.warning("频道[%s] 共享已停止：%s", self.name, reason)
         self._notify_share_error("共享已停止：%s" % reason)
 
@@ -1408,6 +1608,7 @@ class ViewerApp:
         self._photo = None
         self._last_frame_serial = -1
         self._last_channel_idx = -1
+        self._last_channel_status = None  # ui-002：poll 判据含状态维度
         # A4 §3.2：poll 空闲退避的当前间隔（毫秒）。收到新帧或任何"需要灵敏响应"
         # 的状态即重置 15；仅在已连上（receiving）且画面静止时沿 15→33→50 退避。
         self._poll_idle_ms = 15
@@ -1415,6 +1616,9 @@ class ViewerApp:
         # 每帧的 update_idletasks + winfo 查询 + geometry 下发；状态文本未变时跳过 reconfigure。
         self._last_pos_size = None    # 上次定位所用的 (display_width, new_h)
         self._last_status_text = None  # 上次写入状态叠加的文本
+        # ui-012：绘制失败计数与最近一次告警时刻（限流用）
+        self._draw_fails = 0
+        self._draw_fail_warn_at = 0.0
         self.drag_offset = None
         self._drag_start_root = None
         self.user_moved = False
@@ -1819,7 +2023,9 @@ class ViewerApp:
 
         # ---------- 深色主题（第 136 条 C3：配置块收拢至 ui_common.build_style，
         # 逐行照搬，Panel.* 命名与原内联块完全一致） ----------
-        ui_common.build_style(panel)
+        # ui-018：viewer 面板不套用 host 的基础 Treeview/TCombobox 基础样式，
+        # 保持收拢前的外观（§8 逐字节不变）
+        ui_common.build_style(panel, include_base=False)
 
         # ---------- 顶部：标题 + 快捷键提示 ----------
         header = ttk.Frame(panel, style="Panel.TFrame")
@@ -2860,7 +3066,8 @@ class ViewerApp:
             # 计划 §4.2.2：zip 统一落到 logs 目录，便于与支持者沟通固定路径
             path = diag.build_report_zip(logs_dir, config=self.cfg,
                                          logs_dir=logs_dir,
-                                         extra_text=report_text)
+                                         extra_text=report_text,
+                                         pid=os.getpid())
             try:
                 self.panel.clipboard_clear()
                 self.panel.clipboard_append(report_text)
@@ -2907,7 +3114,15 @@ class ViewerApp:
     def _position_top_right(self):
         """将窗口定位到屏幕右上角（留 10 像素边距）。"""
         self.root.update_idletasks()
-        w = self.root.winfo_width() or self.label.winfo_reqwidth()
+        # ui-014（2026-09-18）：宽度要包含状态叠加行（长队名/P95 会把叠加行撑宽）——
+        # 旧实现只看 root 当前宽度或画面 label，叠加行变宽时悬浮窗被推出屏幕右缘
+        # 且不再修正。
+        overlay = getattr(self, "status_overlay", None)
+        w = max(self.root.winfo_width() or 0,
+                self.label.winfo_reqwidth() if self.label is not None else 0,
+                overlay.winfo_reqwidth() if overlay is not None else 0)
+        if w <= 0:
+            w = self.label.winfo_reqwidth() if self.label is not None else 320
         # C9（2026-09-11）：原实现还算了 `h = winfo_height()...` 但从未使用（只用 w），
         # 属于死代码，删掉以免误导。
         x = self.root.winfo_screenwidth() - w - 10
@@ -3013,12 +3228,17 @@ class ViewerApp:
         channel = self.channels[self.active_idx]
         with channel.lock:
             serial = channel.frame_serial
-        if self._last_channel_idx == self.active_idx and self._last_frame_serial == serial:
+        status = channel.status
+        # ui-002：判据加入状态维度——状态跃迁（断开/重连/认证）即使序列号未变
+        # 也必须重绘，否则"已断开，正在重连…"永不可达
+        if (self._last_channel_idx == self.active_idx
+                and self._last_frame_serial == serial
+                and getattr(self, "_last_channel_status", None) == status):
             # 没有新帧：只更新叠加状态，避免反复复制/缩放/绘制同一画面
             self._update_status_overlay()
             # A4 §3.2：仅"已连上且画面静止"才退避；连接中/重连/认证等状态下一拍
             # 可能出现文本或画面变化，保持 15ms 不放大。
-            if channel.status == "receiving":
+            if status == "receiving":
                 try:
                     i = self._POLL_BACKOFF_MS.index(self._poll_idle_ms)
                 except ValueError:
@@ -3037,7 +3257,10 @@ class ViewerApp:
                 # 而下方 cvtColor/Image.fromarray 都只读；1080p 下每帧省 ~6MB 拷贝，
                 # 也缩短了持锁时间（接收线程 _store_frame 等的是同一把锁）。
                 frame = channel.last_frame
-        if frame is not None:
+        self._last_channel_status = status
+        # ui-002：仅连接态才贴帧。断开/认证/连接中的旧缓存帧（如新路径未作废）
+        # 一律让位给状态文字，避免把断线显示成"画面卡住"
+        if frame is not None and status == "receiving":
             self._show_frame(frame, serial)
         else:
             self.has_frame = False
@@ -3057,6 +3280,7 @@ class ViewerApp:
         # 切换后强制重绘一次，避免沿用上一频道的帧缓存判断
         self._last_channel_idx = -1
         self._last_frame_serial = -1
+        self._last_channel_status = None
         self._poll_idle_ms = 15  # A4 §3.2：切源后恢复灵敏轮询
         channel = self.channels[self.active_idx]
         frame = None
@@ -3135,8 +3359,19 @@ class ViewerApp:
                 if size_key != self._last_pos_size:
                     self._position_top_right()
                     self._last_pos_size = size_key
-        except Exception:
-            log.warning("画面绘制失败，跳过该帧", exc_info=True)
+        except Exception as e:
+            # ui-012（2026-09-18）：首帧全量 traceback、之后每 10 秒汇总一条——旧实现
+            # 每帧打整段 traceback 且主线程同步写盘，绘制持续失败时 UI 卡 + 日志爆量
+            now_f = time.monotonic()
+            self._draw_fails += 1
+            if self._draw_fails == 1:
+                log.warning("画面绘制失败，跳过该帧: %s", e, exc_info=True)
+                self._draw_fail_warn_at = now_f
+            elif now_f - self._draw_fail_warn_at >= 10.0:
+                log.warning("画面绘制持续失败（近 10 秒 %d 次），最近错误: %s",
+                            self._draw_fails - 1, e)
+                self._draw_fail_warn_at = now_f
+                self._draw_fails = 1
 
     def _show_text(self, text):
         """显示占位文字（前缀产品名）；文字与画面状态均未变化时跳过，避免重复刷新。"""
@@ -3275,14 +3510,13 @@ class ViewerApp:
             except Exception:
                 log.debug("PostThreadMessageW(WM_QUIT) 失败", exc_info=True)
         else:
-            # C6（2026-09-11）：_hotkey_tid 在线程注册阶段结束才回填，启动期退出时它是
-            # None，原实现直接 return → 已注册成功的 Ctrl+Alt+X / Alt+1..9 不再注销。
-            # 这里对"已注册集合"做一次尽力注销（注册线程自己仍会在 finally 里注销）。
-            for hid in list(getattr(self, "_hotkey_registered", ()) or ()):
-                try:
-                    ctypes.windll.user32.UnregisterHotKey(None, int(hid))
-                except Exception:
-                    pass
+            # ui-015（2026-09-18）：_hotkey_tid 在线程注册阶段结束才回填，启动期退出
+            # 时它为 None。旧实现在这里用 UnregisterHotKey(None, hid) "尽力注销"——
+            # 热键是**线程私有**的，主线程调用（hWnd=None）只会注销本线程自己的热键，
+            # 是空操作（注释与实现漂移）。真正有效的路径是 quit() 置 running=False 后
+            # 注册线程在 finally 里自行注销；这里只留一条日志便于排查。
+            log.debug("退出时热键线程尚未回填 tid，注销交由注册线程 finally 完成（已注册 %d 个）",
+                      len(getattr(self, "_hotkey_registered", ()) or ()))
 
     def _notify_hotkey_result(self, registered, failed):
         """主线程：把热键注册结果反映到面板提示与状态栏。

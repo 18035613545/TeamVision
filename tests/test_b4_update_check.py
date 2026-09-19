@@ -61,8 +61,11 @@ class TestCheckUpdate(_TmpCache):
 
     NOW = 1_800_000_000.0
 
+    #: dist-004（2026-09-18）后更新检查默认关闭——测试统一显式开启
+    _ON = {"update_check": {"enabled": True}}
+
     def _check(self, payload, calls=None, cfg=None):
-        return update_check.check_update(cfg if cfg is not None else {},
+        return update_check.check_update(cfg if cfg is not None else self._ON,
                                          now=self.NOW,
                                          opener=_opener(payload, calls),
                                          cache_path=self.cache)
@@ -85,14 +88,14 @@ class TestCheckUpdate(_TmpCache):
     def test_cache_fresh_for_24h_no_second_request(self):
         self._check({"tag_name": "v99.0.0"})
         boom = _opener(AssertionError("不该再打网络"))
-        msg = update_check.check_update({}, now=self.NOW + 3600,
+        msg = update_check.check_update(self._ON, now=self.NOW + 3600,
                                         opener=boom, cache_path=self.cache)
         self.assertIn("v99.0.0", msg)
 
     def test_cache_expires_after_24h(self):
         self._check({"tag_name": "v0.1.0"})
         calls = []
-        msg = update_check.check_update({}, now=self.NOW + 25 * 3600,
+        msg = update_check.check_update(self._ON, now=self.NOW + 25 * 3600,
                                         opener=_opener({"tag_name": "v99.0.0"},
                                                         calls),
                                         cache_path=self.cache)
@@ -104,7 +107,7 @@ class TestCheckUpdate(_TmpCache):
 
     def test_failure_falls_back_to_stale_cache(self):
         self._check({"tag_name": "v99.0.0"})
-        msg = update_check.check_update({}, now=self.NOW + 100 * 86400,
+        msg = update_check.check_update(self._ON, now=self.NOW + 100 * 86400,
                                         opener=_opener(OSError("timeout")),
                                         cache_path=self.cache)
         self.assertIn("v99.0.0", msg)  # 旧缓存继续顶，而不是报错或误判无更新
@@ -129,17 +132,19 @@ class TestCheckUpdate(_TmpCache):
 
 class TestEnabledAndWiring(unittest.TestCase):
 
-    def test_enabled_defaults_true(self):
-        self.assertTrue(update_check.enabled({}))
-        self.assertTrue(update_check.enabled({"update_check": {}}))
-        self.assertTrue(update_check.enabled(None))
-        self.assertTrue(update_check.enabled({"update_check": "坏值"}))
-        self.assertFalse(update_check.enabled({"update_check": {"enabled": False}}))
-        self.assertFalse(update_check.enabled({"update_check": {"enabled": 0}}))
+    def test_enabled_defaults_false(self):
+        # dist-004（2026-09-18）：默认关闭——开启会周期性向 api.github.com 暴露
+        # 使用者 IP 与"在用本程序"的事实，按第 131 条口径应为 opt-in
+        self.assertFalse(update_check.enabled({}))
+        self.assertFalse(update_check.enabled({"update_check": {}}))
+        self.assertFalse(update_check.enabled(None))
+        self.assertFalse(update_check.enabled({"update_check": "坏值"}))
+        self.assertTrue(update_check.enabled({"update_check": {"enabled": True}}))
+        self.assertTrue(update_check.enabled({"update_check": {"enabled": 1}}))
 
     def test_default_config_ships_switch(self):
         self.assertEqual(
-            common.DEFAULT_CONFIG["update_check"], {"enabled": True})
+            common.DEFAULT_CONFIG["update_check"], {"enabled": False})
 
     def test_start_background_check_skips_when_disabled(self):
         self.assertIsNone(update_check.start_background_check(
@@ -156,7 +161,8 @@ class TestEnabledAndWiring(unittest.TestCase):
 
         with mock.patch.object(update_check, "check_update",
                                return_value="有新版 v99.0.0 可下载（GitHub Releases）"):
-            t = update_check.start_background_check({}, post)
+            t = update_check.start_background_check(
+                {"update_check": {"enabled": True}}, post)
         self.assertIsNotNone(t)
         self.assertTrue(done.wait(5))
         self.assertEqual(len(got), 1)

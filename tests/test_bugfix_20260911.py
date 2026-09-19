@@ -893,7 +893,10 @@ class TestB13CredentialRetryUX(unittest.TestCase):
         ch.auth = {}
         ch._anon_ok = False
         ch._auth_probed = True          # 已探测过：下一轮直接弹框
-        ch._chal_capable = False        # D1：本文件锁定的是旧直发口令路径的回包映射
+        # auth-003（2026-09-18）：明文口令直发路径已废除；本组锁定的是"服务端回包 →
+        # 观看端状态映射"，走挑战流即可（recv_msg 替身回 auth_result 而非 chal，
+        # _auth_via_challenge 对非 chal 回包原样返回）
+        ch._chal_capable = True
         ch._prompt_blocked_until = 0.0
         ch._retry_delay = 12.5          # 假装退避已涨到 12.5 秒
         ch._auth_error_text = ""
@@ -932,7 +935,8 @@ class TestB13CredentialRetryUX(unittest.TestCase):
         self.assertEqual(ch._auth_error_text, "")
 
     def test_ask_credentials_logs_when_cooling_down(self):
-        ch = self._channel(_prompt_blocked_until=time.time() + 30)
+        # ui-011（2026-09-18）：冷却比较已改单调钟，测试同步
+        ch = self._channel(_prompt_blocked_until=time.monotonic() + 30)
         with mock.patch.object(viewer.log, "info") as info:
             self.assertIsNone(ch._ask_credentials())
         text = " ".join(str(a) for c in info.call_args_list for a in c.args)

@@ -101,7 +101,12 @@ def install_excepthooks(app_name, get_root=None):
 
 
 def post_to_ui(root, fn):
-    """把回调调度回 Tk 主线程执行；投递失败（窗口已销毁等）则就地兜底执行。
+    """把回调调度回 Tk 主线程执行；投递失败（窗口已销毁等）只记一条告警。
+
+    ui-004（2026-09-18）：旧实现在 root.after 失败时**就在调用线程（工作线程）里
+    直接执行 fn**——fn 是控件操作，工作线程碰 Tk 属未定义行为；且 docstring 宣称的
+    "主线程执行"前提不成立，退出竞态下真正的失败还会被静默吞掉。Tk 的 after 在
+    mainloop 启动前也能排队，失败只代表窗口已销毁——此时不该碰控件。
 
     注意：**viewer._post_ui 刻意不走本函数**——第 108 条要求 viewer 工作线程只入队、
     由 poll 在主线程排空（退出瞬间 root.after 投递会撞正在销毁的 Tcl 解释器，是
@@ -109,9 +114,10 @@ def post_to_ui(root, fn):
     """
     try:
         root.after(0, fn)
-    except Exception:
+    except Exception as e:
         try:
-            fn()
+            import logger
+            logger.get_logger().debug("UI 回调投递失败（窗口可能已销毁），已丢弃: %s", e)
         except Exception:
             pass
 
@@ -119,12 +125,16 @@ def post_to_ui(root, fn):
 # ------------------------------ ttk 深色风格 ------------------------------
 
 
-def build_style(root, palette=None):
+def build_style(root, palette=None, include_base=True):
     """按深色主题配置 ttk 全局风格（host 基础控件 + viewer Panel.* 的并集）。
 
     palette 为 PALETTE 的可选覆盖字典（键同名）；未覆盖项使用本模块常量。
     同名色两端历史取值完全一致，因此默认路径下两端外观逐字节不变（§8 验收：
     外观截图比对无回归）。
+
+    ui-018（2026-09-18）：`include_base=False` 时只应用 Panel.* 命名风格——viewer
+    面板收拢前没有基础 Treeview/TCombobox 配置，收拢后被动继承 host 的
+    lightcolor/darkcolor，与 §8"外观逐字节不变"不符。
     """
     from tkinter import ttk
 
@@ -135,7 +145,16 @@ def build_style(root, palette=None):
     style = ttk.Style(root)
     style.theme_use("clam")
 
-    # ---- 基础控件深色（原 host_ui._build_style）----
+    # ---- 基础控件深色（原 host_ui._build_style；ui-018 起可关闭）----
+    if include_base:
+        _apply_base_style(style, p)
+
+    # ---- Panel.* 命名风格（原 viewer._build_panel 内联块，逐行照搬）----
+    _apply_panel_style(style, p)
+    return style
+
+
+def _apply_base_style(style, p):
     style.configure("Treeview",
                     background=p["ctrl"], foreground=p["fg"], fieldbackground=p["ctrl"],
                     bordercolor=p["card"], lightcolor=p["card"], darkcolor=p["card"])
@@ -149,7 +168,8 @@ def build_style(root, palette=None):
                     darkcolor=p["card"], selectbackground=p["ctrl"],
                     selectforeground=p["fg"])
 
-    # ---- Panel.* 命名风格（原 viewer._build_panel 内联块，逐行照搬）----
+
+def _apply_panel_style(style, p):
     style.configure("Panel.TFrame", background=p["bg"])
     style.configure("Card.TFrame", background=p["card"])
     style.configure("Panel.TLabel", background=p["bg"], foreground=p["fg"])

@@ -104,13 +104,14 @@ class TestPostToUi(unittest.TestCase):
         ui_common.post_to_ui(_Root(), fn)
         self.assertEqual(calls, [(0, fn)])
 
-    def test_fallback_executes_inline_on_failure(self):
+    def test_no_inline_execution_on_failure(self):
+        """ui-004（2026-09-18）：投递失败**不得**在工作线程就地执行控件回调。"""
         class _DeadRoot:
             def after(self, delay, fn):
                 raise RuntimeError("Tcl 解释器已销毁")
         hit = []
-        ui_common.post_to_ui(_DeadRoot(), lambda: hit.append(1))
-        self.assertEqual(hit, [1])
+        ui_common.post_to_ui(_DeadRoot(), lambda: hit.append(1))   # 不得抛异常
+        self.assertEqual(hit, [], "窗口已销毁时回调被就地执行（工作线程碰 Tk）")
 
 
 class TestPaletteSingleSource(unittest.TestCase):

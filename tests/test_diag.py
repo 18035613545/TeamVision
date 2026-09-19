@@ -143,13 +143,21 @@ class TestNetStatusPlumbing(unittest.TestCase):
         console.root = None
         captured = {}
 
-        def fake_zip(dest, *, config, logs_dir=None, extra_text=""):
+        def fake_zip(dest, *, config, logs_dir=None, extra_text="", pid=None):
             captured["extra_text"] = extra_text
             return os.path.join(str(dest), "fake.zip")
 
+        # ui-008 后导出在工作线程执行：_post_ui 直通 + 轮询等 showinfo
+        console._post_ui = lambda fn: fn()
         with mock.patch.object(host_ui.diag, "build_report_zip", fake_zip), \
+                mock.patch.object(host_ui, "data_dir",
+                                  return_value=tempfile.gettempdir()), \
                 mock.patch.object(host_ui.messagebox, "showinfo") as info:
             console._on_export_diag()
+            for _ in range(200):
+                if info.called:
+                    break
+                time.sleep(0.02)
         self.assertIn("在线观众数: 1", captured["extra_text"])
         self.assertIn("失败（隧道本地地址未指向监听端口）", captured["extra_text"])
         info.assert_called_once()
@@ -163,13 +171,20 @@ class TestNetStatusPlumbing(unittest.TestCase):
         console.root = None
         captured = {}
 
-        def fake_zip(dest, *, config, logs_dir=None, extra_text=""):
+        def fake_zip(dest, *, config, logs_dir=None, extra_text="", pid=None):
             captured["extra_text"] = extra_text
             return os.path.join(str(dest), "fake.zip")
 
+        console._post_ui = lambda fn: fn()
         with mock.patch.object(host_ui.diag, "build_report_zip", fake_zip), \
-                mock.patch.object(host_ui.messagebox, "showinfo"):
+                mock.patch.object(host_ui, "data_dir",
+                                  return_value=tempfile.gettempdir()), \
+                mock.patch.object(host_ui.messagebox, "showinfo") as info:
             console._on_export_diag()
+            for _ in range(200):
+                if captured:
+                    break
+                time.sleep(0.02)
         self.assertIn("最近公网自检: 未运行", captured["extra_text"])
 
 

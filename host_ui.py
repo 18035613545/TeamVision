@@ -20,8 +20,12 @@ import diag
 import ui_common
 import update_check
 from common import (
-    APP_NAME, APP_VERSION, data_dir, save_config, register_policy, REGISTER_POLICIES,
+    APP_NAME, APP_VERSION, DEFAULT_CONFIG, data_dir, save_config, register_policy,
+    REGISTER_POLICIES,
 )
+
+#: ui-007：监听地址非法值兜底——与 DEFAULT_CONFIG/配置迁移/界面文案同源，避免漂移
+DEFAULT_LISTEN_HOST = DEFAULT_CONFIG["host"]["listen_host"]
 
 log = logger_mod.get_logger()
 
@@ -45,7 +49,8 @@ class _LogQueueHandler(logging.Handler):
 
     def __init__(self):
         super().__init__()
-        self.queue = queue.Queue()
+        # ui-017：队列有界（UI 退出/卡顿时丢弃最旧日志，不再无限堆积）
+        self.queue = queue.Queue(maxsize=2000)
         self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 
     def emit(self, record):
@@ -98,8 +103,14 @@ class HostConsole:
         self._build_style()
         self._build_ui()
         # 日志转发：把全局 logger 输出接入 GUI 日志区（线程安全队列 + 轮询）
+        # ui-017（2026-09-18）：先摘掉可能残留的同类 handler（二次构造面板会双份
+        # 挂载 → 日志区重复行）
+        _root_logger = logging.getLogger(logger_mod.LOGGER_NAME)
+        for _h in list(_root_logger.handlers):
+            if isinstance(_h, _LogQueueHandler):
+                _root_logger.removeHandler(_h)
         self._log_handler = _LogQueueHandler()
-        logging.getLogger(logger_mod.LOGGER_NAME).addHandler(self._log_handler)
+        _root_logger.addHandler(self._log_handler)
         self.root.after(250, self._drain_log)
         # 第 37 条：_poll() 自身会 after(500) 重排，这里不再额外排一次，避免双刷新链
         # （旧实现客户端表格每 500ms 被全删全建两次 → 可见闪烁 + 与推流线程抢锁翻倍）。
@@ -109,12 +120,22 @@ class HostConsole:
             getattr(self.runtime, "cfg", None), self._show_update_hint)
 
     def _show_update_hint(self, msg):
-        try:
-            self.root.after(0, lambda: self._set_status(msg))
-        except Exception:
-            pass
+        # ui-019（2026-09-18）：与其余跨线程回调统一走 _post_ui 收口——旧实现直接
+        # root.after 从更新检查线程投递，退出瞬间可能撞正在销毁的 Tcl 解释器
+        self._post_ui(lambda: self._set_status(msg))
 
     # ---------- 界面搭建 ----------
+
+    @staticmethod
+    def _section(host_cfg, name):
+        """取 host 配置里的子节；非 dict（手改成标量）时返回空 dict。
+
+        ui-006（2026-09-18）：旧写法 `host_cfg.get("perf", {}).get(...)` 在
+        `"perf": 1` 时抛 AttributeError → GUI 构造失败静默回落命令行模式、
+        设置不保存、面板冻结。所有子节读取经此收口。
+        """
+        value = host_cfg.get(name) if isinstance(host_cfg, dict) else None
+        return value if isinstance(value, dict) else {}
 
     def _build_style(self):
         # 第 136 条（C3）：风格配置收拢至 ui_common.build_style（含原基础控件
@@ -205,13 +226,16 @@ class HostConsole:
         self._quality_var = tk.StringVar(value=str(host_cfg.get("jpeg_quality", 80)))
         self._scale_var = tk.StringVar(value=str(host_cfg.get("scale", 1.0)))
         self._adaptive_var = tk.BooleanVar(
-            value=bool(host_cfg.get("perf", {}).get("adaptive", True)))
+            value=bool(self._section(host_cfg, "perf").get("adaptive", True)))
         self._auth_var = tk.BooleanVar(
-            value=bool(host_cfg.get("auth", {}).get("enabled", False)))
+            value=bool(self._section(host_cfg, "auth").get("enabled", False)))
         # 监听地址：空/0.0.0.0/:: 同为「全网卡」；默认 127.0.0.1 只允许本机与 frp 隧道
+        # ui-007：非法值兜底必须先与 DEFAULT_CONFIG / 配置迁移 / 界面文案（127.0.0.1=默认）
+        # 一致——旧实现回退 "0.0.0.0"，用户一点"应用"就把全网卡监听固化进配置，
+        # 与"默认只监听本机"的安全口径相反
         raw_listen = host_cfg.get("listen_host")
         if not isinstance(raw_listen, str) or not raw_listen.strip():
-            raw_listen = "0.0.0.0"
+            raw_listen = DEFAULT_LISTEN_HOST
         self._listen_var = tk.StringVar(value=raw_listen.strip())
         self._reg_var = tk.StringVar(
             value=REGISTER_LABELS[register_policy(host_cfg.get("auth", {}))])
@@ -517,8 +541,17 @@ class HostConsole:
         host["jpeg_quality"] = quality
         host["scale"] = scale
         host["listen_host"] = listen
-        host.setdefault("perf", {})["adaptive"] = bool(self._adaptive_var.get())
-        auth = host.setdefault("auth", {})
+        # ui-006：setdefault 在键存在但为标量时会把标量原样返回（赋值即 TypeError），
+        # 这里显式判型重建
+        perf = host.get("perf")
+        if not isinstance(perf, dict):
+            perf = {}
+            host["perf"] = perf
+        perf["adaptive"] = bool(self._adaptive_var.get())
+        auth = host.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+            host["auth"] = auth
         auth["enabled"] = bool(self._auth_var.get())
         auth["allow_register"] = policy
         save_config(self.runtime.cfg, "host")
@@ -545,15 +578,31 @@ class HostConsole:
         数据来自共享端进程内的 AccountManager（与观看端注册同一份 accounts.json），
         因此 closed/bootstrap 策略下也能加账户；PBKDF2 在本地一次性计算（约 0.2s），
         期间面板短暂卡顿可接受。
+
+        ui-005（2026-09-18）：单例守卫——连点会叠多个 Toplevel，旧窗列表陈旧、两边
+        操作互相覆盖；已开着则前置聚焦并直接返回。
         """
+        win = getattr(self, "_accounts_win", None)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+                    win.lift()
+                    win.focus_force()
+                    return
+            except Exception:
+                pass
+            self._accounts_win = None
         accounts = getattr(self.runtime, "accounts", None)
         if accounts is None:
             messagebox.showwarning(APP_NAME, "共享端尚未初始化账户表，稍后再试")
             return
         win = tk.Toplevel(self.root)
+        self._accounts_win = win   # ui-005：单例引用（关闭后自动失效）
         win.title("账户管理")
         win.configure(bg=COL_BG)
         win.geometry("460x300")
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
         tree = ttk.Treeview(win, columns=("created", "last"),
                             show="tree headings", height=10)
         tree.heading("#0", text="用户名")
@@ -575,6 +624,10 @@ class HostConsole:
                             values=(created or "-", last or "-"))
             if not rows:
                 hint.configure(text="（无账户；准入开启时观看端将无法登录）")
+            else:
+                # ui-016（2026-09-18）：加回账户后必须擦掉"无账户"提示——
+                # 旧实现只写不擦，提示与列表相互矛盾
+                hint.configure(text="")
             return rows
 
         def selected_user():
@@ -609,10 +662,19 @@ class HostConsole:
                 return
             if accounts.count() <= 1:
                 # 防自锁：删掉唯一账户后若准入开着，没人能再登录
+                # auth-010（2026-09-18）：旧文案与实际后果相反——bootstrap 策略下旧
+                # 实现会静默重开"任意人可注册"窗口。现在删除不再重开窗口，文案补一句
+                # 说明（策略读取失败时仅显示原提示）。
+                extra = ""
+                try:
+                    if register_policy(self._host_cfg().get("auth", {})) == "bootstrap":
+                        extra = "\n（bootstrap 策略下自助注册窗口不会重开，之后需在共享端添加账户）"
+                except Exception:
+                    extra = ""
                 if not messagebox.askyesno(
                         "删除账户",
                         "这是当前唯一账户。删除后若「账户准入」开启，"
-                        "所有观看端都将无法登录。确定删除？", parent=win):
+                        "所有观看端都将无法登录。确定删除？%s" % extra, parent=win):
                     return
                 if not messagebox.askyesno(
                         "删除账户", "再次确认：真的要删除账户 %s 吗？" % user,
@@ -655,49 +717,87 @@ class HostConsole:
         refresh()
 
     def _on_export_diag(self):
-        """B2（第 134 条）：一键导出诊断包（脱敏 config + 近两日日志 + 运行时概况）。"""
+        """B2（第 134 条）：一键导出诊断包（脱敏 config + 近两日日志 + 运行时概况）。
+
+        ui-008（2026-09-18）：压缩（最多 ~60MB 日志）改到工作线程——旧实现在 Tk
+        主线程同步压缩，界面冻结数秒；`data_dir()` 为 None（无可写数据目录）时旧
+        实现拼接路径抛 TypeError，这里给明确提示；加可重入守卫防连点叠导出。
+        """
+        if getattr(self, "_diag_exporting", False):
+            messagebox.showinfo(APP_NAME, "上一次诊断包仍在导出中，请稍候", parent=self.root)
+            return
+        extra = []
         try:
-            extra = []
+            snap = self.runtime.get_snapshot()
+        except Exception:
+            snap = {}
+        clients = snap.get("clients")
+        if clients is not None:
+            extra.append("在线观众数: %d" % len(clients))
+        ns = snap.get("net_status") or {}
+        state = ns.get("state", "unknown")
+        if state == "ok":
+            extra.append("最近公网自检: 通过（%s）" % ns.get("detail", ""))
+        elif state == "fail":
+            extra.append("最近公网自检: 失败（%s）" % ns.get("detail", ""))
+        else:
+            extra.append("最近公网自检: 未运行")
+        base_dir = data_dir()
+        if not base_dir:
+            messagebox.showwarning(APP_NAME, "找不到可写的数据目录，无法导出诊断包",
+                                   parent=self.root)
+            return
+        logs_dir = os.path.join(base_dir, "logs")
+        cfg = self.runtime.cfg
+        extra_text = "\n".join(extra)
+        self._diag_exporting = True
+        try:
+            self._set_status("正在导出诊断包…")
+        except Exception:
+            pass
+
+        def _work():
             try:
-                snap = self.runtime.get_snapshot()
-            except Exception:
-                snap = {}
-            clients = snap.get("clients")
-            if clients is not None:
-                extra.append("在线观众数: %d" % len(clients))
-            ns = snap.get("net_status") or {}
-            state = ns.get("state", "unknown")
-            if state == "ok":
-                extra.append("最近公网自检: 通过（%s）" % ns.get("detail", ""))
-            elif state == "fail":
-                extra.append("最近公网自检: 失败（%s）" % ns.get("detail", ""))
-            else:
-                extra.append("最近公网自检: 未运行")
-            logs_dir = os.path.join(data_dir(), "logs")
-            # 计划 §4.2.2：zip 落到 %LOCALAPPDATA%\TeamVision\logs\，
-            # 并把 report 文本复制到剪贴板（messagebox 只能展示不能复制）。
-            path = diag.build_report_zip(logs_dir, config=self.runtime.cfg,
-                                         logs_dir=logs_dir,
-                                         extra_text="\n".join(extra))
-            try:
-                self.root.clipboard_clear()
-                self.root.clipboard_append(
-                    diag.build_report_text(self.runtime.cfg,
-                                           extra_text="\n".join(extra)))
-                copied = "\n\n报告文本已同时复制到剪贴板。"
-            except Exception:
-                copied = ""
-            messagebox.showinfo(
-                "导出成功",
-                "诊断包已保存到：\n%s%s\n\n配置中的 token/密码已自动脱敏；"
-                "日志仍可能包含 IP、地址等信息，请只发给信任的支持者。"
-                % (path, copied), parent=self.root)
-        except Exception as e:
-            log.warning("诊断包导出失败: %s", e)
-            messagebox.showerror("导出失败", "诊断包导出失败：%s" % e,
+                report = diag.build_report_text(cfg, extra_text=extra_text)
+                # 计划 §4.2.2：zip 落到 %LOCALAPPDATA%\TeamVision\logs\
+                path = diag.build_report_zip(logs_dir, config=cfg,
+                                             logs_dir=logs_dir,
+                                             extra_text=extra_text,
+                                             pid=os.getpid())
+                self._post_ui(lambda: self._finish_export(path, report, None))
+            except Exception as e:      # 工作线程异常也必须回到主线程反馈
+                self._post_ui(lambda: self._finish_export(None, "", e))
+
+        threading.Thread(target=_work, name="diag-export", daemon=True).start()
+
+    def _finish_export(self, path, report, error):
+        """diag 导出完成（主线程）：弹结果并把报告文本复制到剪贴板。"""
+        self._diag_exporting = False
+        if error is not None:
+            log.warning("诊断包导出失败: %s", error)
+            messagebox.showerror("导出失败", "诊断包导出失败：%s" % error,
                                  parent=self.root)
+            return
+        copied = ""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(report)
+            copied = "\n\n报告文本已同时复制到剪贴板。"
+        except Exception:
+            pass
+        messagebox.showinfo(
+            "导出成功",
+            "诊断包已保存到：\n%s%s\n\n配置中的凭据/用户名已自动脱敏；"
+            "日志仍可能包含 IP、地址等信息，请只发给信任的支持者。"
+            % (path, copied), parent=self.root)
 
     def _on_quit(self):
+        # ui-017：退出时摘除日志 handler（并关闭队列），避免全局 logger 长期持有
+        try:
+            logging.getLogger(logger_mod.LOGGER_NAME).removeHandler(self._log_handler)
+            self._log_handler.close()
+        except Exception:
+            pass
         self._set_status("正在退出…")
         try:
             self.root.destroy()
@@ -776,10 +876,15 @@ class HostConsole:
         # （未配置 public_addr 或 frpc 未启动时 _start_tunnel_selfcheck 直接跳过）。
         ns = snap.get("net_status") or {}
         ts = ns.get("ts") or 0.0
+        # net-023（2026-09-18）：结论带时效——隧道重启/掉线后旧结论不可信；
+        # 自检每 10 分钟自动复检，超过 15 分钟的结论额外标注
+        _stale = bool(ts) and (time.time() - float(ts)) > 900
         if ts and ns.get("state") == "ok":
             self._net_status_label.configure(
-                text="公网自检：通过 ✅ %s" % time.strftime(
-                    "%H:%M", time.localtime(ts)), fg=COL_ONLINE)
+                text="公网自检：通过 ✅ %s%s" % (
+                    time.strftime("%H:%M", time.localtime(ts)),
+                    "（结论已超 15 分钟，隧道可能已变化）" if _stale else ""),
+                fg=COL_ONLINE)
         elif ts:
             self._net_status_label.configure(
                 text="公网自检：失败 — %s（详见运行日志）" % ns.get("detail", ""),
