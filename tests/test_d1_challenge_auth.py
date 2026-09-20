@@ -197,10 +197,23 @@ class D1HostStateMachine(unittest.TestCase):
         c.send({"action": Act.LOGIN, "user": "ghost", "pass": "",
                 "proto": list(common.PROTOCOL_VERSION)})
         chal = c.recv()
-        # auth-008（2026-09-18）：账号不存在也照常下发挑战（确定性伪盐），
-        # 响应形态与真实账号一致——不能据此枚举用户名
+        # auth-008（2026-09-18）：账号不存在也照常下发挑战，响应形态与真实账号一致
+        # ——不能据此枚举用户名
         self.assertEqual(chal.get("action"), Act.CHAL)
         self.assertRegex(chal.get("salt") or "", r"^[0-9a-f]{32}$")
+        # auth-014 / T-04（2026-09-20）：旧实现下发 hmac(b"tv-nouser", user) 的
+        # **确定性**伪盐，密钥硬编码在源码里 → 对端本地重算即可离线批量枚举用户名。
+        # 形态合规不等于不可预测，所以这里钉的是"同一用户名两次挑战的盐必须不同"
+        # （把实现改回确定性伪盐，这一条必须转红）。
+        salt1 = chal.get("salt")
+        c2 = _Client(rt, self._cfg())
+        self.addCleanup(c2.close)
+        c2.send({"action": Act.LOGIN, "user": "ghost", "pass": "",
+                 "proto": list(common.PROTOCOL_VERSION)})
+        chal2 = c2.recv()
+        self.assertEqual(chal2.get("action"), Act.CHAL)
+        self.assertNotEqual(salt1, chal2.get("salt"),
+                            "不存在账号的挑战盐可复现 → 可离线枚举用户名（auth-014）")
         res = _answer_challenge(c, "ghost", PW, Act.AUTH_PROOF, chal=chal)
         self.assertFalse(res.get("ok"))
         self.assertEqual(res.get("msg"), "用户名或密码错误")
@@ -404,7 +417,10 @@ class D1AccountManagerApi(unittest.TestCase):
     def test_corrupt_record_rejected_gracefully(self):
         # 第 27 条口径的延续：记录损坏 → 明确拒绝而不是异常
         self.mgr._users["broken"] = {"salt": "zz", "hash": "yy"}
-        self.assertIsNotNone(self.mgr.challenge_for("broken"))  # 字段在，格式后验
+        # auth-019（2026-09-20）：旧实现只判 isinstance(salt, str)，把 "zz" 原样下发，
+        # 观看端用 `_is_hex_str(salt, 32)` 拒收 → 该账户永久登不进且零提示。
+        # 这条断言旧口径（assertIsNotNone「字段在，格式后验」）把缺陷钉成了期望值。
+        self.assertIsNone(self.mgr.challenge_for("broken"))
         ok, msg = self.mgr.verify_login_proof("broken", os.urandom(16), b"x" * 32)
         self.assertFalse(ok)
         # auth-008：记录损坏/不存在与口令错误统一文案（不可枚举）

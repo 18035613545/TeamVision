@@ -407,9 +407,22 @@ class Channel:
                         "指向共享端的监听端口（樱花 frpc 日志会写「连接映射目标 "
                         "[tcp://localhost:PORT] 失败」），也可能共享端未启动、或只监听了"
                         "另一地址族（如 IPv4 回环而 frpc 走 ::1）" % e)
+                # auth-017（2026-09-20）：探测标记必须**按连接**复位。旧实现它是频道级
+                # 且只置一次，于是"上一次输错口令"之后的重连把 `_ask_credentials()`
+                # 当成该连接的**首条消息**——而 host 的首消息档只有 30 秒
+                # （AUTH_FIRST_MSG_S），从握手完成就开始计时，把用户输入口令的时间也算进
+                # 去（观看端内部最长 60s 等界面就绪 + 120s 等输入）。用户超过 30 秒才
+                # 按确定 → sendall 仍成功但 host 的 recv 已超时 → "认证通信失败"、弹框
+                # 作废、循环往复。先探测可让 host 走 150 秒的"等凭据输入"档。
+                # ui-026（2026-09-20）：本轮认证前清空 auth_msg，认证失败时**保留**
+                # _authenticate 写入的具体原因（旧实现在下面无条件覆写成套话，
+                # 10 条分支里的"服务端版本过旧""挑战参数异常""认证通信失败"等真因
+                # 在面板/poll/日志三处全部不可见）。
+                self._auth_probed = False
+                self.auth_msg = ""
                 if not self._authenticate(sock):
                     self.status = "auth"
-                    self.auth_msg = "需要登录后观看"
+                    self.auth_msg = self.auth_msg or "需要登录后观看"
                     self._invalidate_media()   # ui-002：不得让旧画面盖住"需要登录"提示
                     log.warning("频道[%s] 未通过认证（%s）", self.name, self.auth_msg)
                     raise ConnectionError("认证未通过")
@@ -860,6 +873,15 @@ class Channel:
                 else:
                     result = self._ask_credentials()
                     if result is None:
+                        if getattr(self, "_cred_evicted", False):
+                            # ui-024：请求被更新的请求顶掉 ≠ 用户取消——不设 30 秒
+                            # 静默窗口，如实报原因并按重连节奏重试
+                            self._cred_evicted = False
+                            self.auth_msg = "登录请求被更新的请求替换，稍后自动重试"
+                            self._retry_delay = 0.0
+                            log.warning("频道[%s] 登录请求被更新的请求顶掉，"
+                                        "不按用户取消处理（不设 30 秒静默）", self.name)
+                            return False
                         if getattr(self, "_cred_timeout", False):
                             # ui-003：等待超时/被中断 ≠ 用户取消——不设冷却、不谎报
                             # "用户取消登录"，如实记账后按重连节奏重试
@@ -1131,6 +1153,8 @@ class Channel:
         done = threading.Event()
         #: ui-003（2026-09-18）：本次等待是否超时/被中断（而非用户取消）
         self._cred_timeout = False
+        #: ui-024（2026-09-20）：本次等待是否被"更新的登录请求"从队列里淘汰
+        self._cred_evicted = False
         # 第 108 条（B15）：队列限长——接收线程 done.wait(120) 超时后会重连并再次入队，
         # 用户几小时后回来关掉第一个框，主线程会接着弹出积压的第二、第三个"幽灵登录框"。
         # 超过 4 个就丢掉最旧的。
@@ -1168,7 +1192,15 @@ class Channel:
                 self._abandon_cred_request(box, done)
                 return None
         result = box.get("result")
-        if result is None or "error" in result or "value" not in result:
+        if isinstance(result, dict) and "error" in result:
+            # ui-024（2026-09-20）：被"更新的登录请求"从队列里淘汰 ≠ 用户取消。
+            # 旧实现在这里只 return None，`_cred_timeout` 保持 False，于是
+            # `_authenticate` 走"用户取消"分支：给这个从未被用户取消的频道设了
+            # `_prompt_blocked_until = +30s`（无辜频道半分钟不再弹框），
+            # 并把真因连日志一起写成"用户取消登录"。
+            self._cred_evicted = True
+            return None
+        if result is None or "value" not in result:
             return None
         return result.get("value")
 
@@ -1373,13 +1405,23 @@ class Channel:
             # ——对端停读时界面最多卡 1.2s，失败仍走既有的回滚分支
             self._send_locked(sock, {"action": Act.WATCH, "source": source},
                               timeout=1.2)
-            if source == "local":
-                # 本地源由 host 编码线程消费 force_key；看 peer 由 host 转达
-                self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()},
-                                  timeout=1.2)
         except (OSError, ValueError):
             self._revert_source(prev_source)  # 第 9 条：发包失败，回滚避免谎报
             return False
+        if source == "local":
+            # ui-025（2026-09-20）：WATCH 与 REQ_KEYFRAME 旧写法在同一个 try 内，
+            # 于是"第一条已成功（host 真的切源了）、第二条超时"会去回滚本地
+            # watch_source 却不补发 WATCH —— host 持续转发新源、状态栏显示旧源，
+            # 用户再点回该源又被 `watch_source == source` 短路、不发包，
+            # 错位只能等一次断线重连才收敛。关键帧请求是**尽力而为**的加速手段，
+            # 失败不该推翻已经生效的订阅；这里把两次发包的失败处理分开。
+            try:
+                self._send_locked(sock, {"action": Act.REQ_KEYFRAME, "t": time.time_ns()},
+                                  timeout=1.2)
+            except (OSError, ValueError) as e:
+                log.info("频道[%s] 已切到 %s，但关键帧请求未送达（%s）——"
+                         "等该源下一个关键帧起解，不因此回滚订阅",
+                         self.name, source, e)
         log.info("频道[%s] 观看源切换为 %s", self.name, source)
         return True
 

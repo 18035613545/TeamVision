@@ -25,18 +25,29 @@ import viewer
 
 
 class _FakeAccounts:
-    def __init__(self, count=0):
+    """auth-015 / T-04（2026-09-20）：必须显式提供 bootstrap_used()。
+
+    旧替身只实现 count()，于是生产代码里专为它保留的
+    `except AttributeError: bootstrap_open = count() == 0` 退化分支永远命中——
+    测试反向要求实现保留"标记接口缺失即当作没消耗过"这个漏洞。
+    """
+
+    def __init__(self, count=0, used=False):
         self._count = count
+        self._used = used
 
     def count(self):
         return self._count
 
+    def bootstrap_used(self):
+        return self._used
+
 
 class _FakeRuntime:
-    """只提供注册策略判定需要的 accounts.count()。"""
+    """只提供注册策略判定需要的 accounts.count() / accounts.bootstrap_used()。"""
 
-    def __init__(self, count=0):
-        self.accounts = _FakeAccounts(count)
+    def __init__(self, count=0, used=False):
+        self.accounts = _FakeAccounts(count, used)
 
 
 class TestSecureDefaults(unittest.TestCase):
@@ -112,6 +123,14 @@ class TestRegisterAllowed(unittest.TestCase):
         allowed, why = host._register_allowed(used, {"allow_register": "bootstrap"}, "a:1")
         self.assertFalse(allowed)
         self.assertIn("已有账户", why)
+
+    def test_bootstrap_window_stays_closed_after_deleting_all(self):
+        # auth-015 / auth-010 的真实判据：**账户删空但标记已存在**时窗口不得重开。
+        # 旧实现有 `except AttributeError` 退化分支，替身只要少一个方法就测不到这条。
+        rt = _FakeRuntime(count=0, used=True)
+        allowed, why = host._register_allowed(rt, {"allow_register": "bootstrap"}, "a:1")
+        self.assertFalse(allowed)
+        self.assertIn("关闭", why)
 
     def test_account_manager_count_reflects_registrations(self):
         tmp = tempfile.mkdtemp(prefix="tv_count_")

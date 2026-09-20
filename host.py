@@ -73,6 +73,8 @@ from common import (  # noqa: F401
     Act,
     # C2 §7 第 3 步：握手版本字段（先只加不启用）
     PROTOCOL_VERSION, PROTO_ENFORCE, proto_compatible,
+    # auth-016（2026-09-20）：host 侧也要看次版本
+    PROTO_CHAL_MIN_MINOR,
     # D1（实现方案 §10）：挑战-应答认证公共件（PBKDF2/HMAC/base64 单一真源）
     PBKDF2_ITERATIONS, derive_dk, challenge_mac, b64e, b64d,
     # auth-002/auth-006（2026-09-18）：KDF 参数与凭据长度的校验口径
@@ -172,6 +174,14 @@ class AccountManager:
             if not isinstance(users, dict):
                 raise ValueError("users 字段不是对象")
             self._users = users
+            # auth-015（2026-09-20）：bootstrap 标记只在 register / register_derived
+            # 成功后写，`_load()` 读到非空账户表时不回填——于是所有在引入该标记之前
+            # 生成的 accounts.json 都没有标记文件：升级到本版后只要把账户删空
+            # （团队解散、清理测试账号），"第一个账户可自助注册"的窗口就静默重开，
+            # 已按建议加固过的配置退回加固前，而面板的删除确认文案承诺"窗口不会重开"。
+            # 见到非空账户表即补写标记（幂等）。
+            if users and not self.bootstrap_used():
+                self._mark_bootstrap_used()
         except (OSError, ValueError) as e:
             # 第 27 条：accounts.json 损坏时不再静默置空（否则下次注册/登录会把空
             # 字典回写覆盖原文件 → 全体账号蒸发且无日志）。把损坏文件改名留存以便
@@ -337,8 +347,11 @@ class AccountManager:
         try:
             with open(self._bootstrap_marker, "w", encoding="utf-8") as f:
                 f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
-        except OSError:
-            pass
+        except OSError as e:
+            # auth-015：旧实现是 `except OSError: pass`，零日志——标记写不出去意味着
+            # "删空账户即重开注册窗口"的保护实际没生效，却没有任何线索能查到。
+            log.warning("bootstrap 已消耗标记写入失败（%s）：删空账户后自助注册窗口"
+                        "可能重新打开", e)
 
     def register(self, user, password):
         """注册新账户，返回 (ok: bool, 提示语)。"""
@@ -425,6 +438,16 @@ class AccountManager:
             iter_ = record.get("iter", PBKDF2_ITERATIONS)
         if not isinstance(iter_, int) or iter_ <= 0:
             iter_ = PBKDF2_ITERATIONS
+        # auth-019（2026-09-20）：旧实现只判 `isinstance(salt, str)`，把形态不合规的
+        # salt（手改配置、或旧版本落盘的非 32 位 hex）原样下发。观看端在
+        # viewer.py:1034 用 `_is_hex_str(salt, KDF_SALT_HEX_LEN)` 拒收，返回的提示
+        # 不匹配 `_authenticate` 任何已知分支 → 该账户永久登不进且界面零提示。
+        # 这里按"记录损坏"处理（返回 None → 走与账号不存在同一条伪盐路径），
+        # 与 auth-006 的凭据长度校验口径一致。
+        if not _is_hex_str(salt, KDF_SALT_HEX_LEN):
+            log.warning("账户 %s 的 salt 形态不合规（应为 %d 位十六进制），"
+                        "按记录损坏处理、不下发挑战", user, KDF_SALT_HEX_LEN)
+            return None
         # auth-002（2026-09-18）：记录里的 iter 必须有界——手改/损坏的记录若含
         # 1（弱化 KDF）或 10^9（让观看端挂死）都会被原样下发
         if not (KDF_ITER_MIN <= iter_ <= KDF_ITER_MAX):
@@ -1676,11 +1699,11 @@ def _register_allowed(runtime, auth_cfg, addr):
     # 不能让人人都能自建账号，那样准入形同虚设。
     # auth-010（2026-09-18）：以"曾注册过"的持久标记判定是否消耗过该窗口，而不是
     # 只看当前账户数——否则删掉唯一账户（或清空账户文件）会静默重开"任意人可注册"。
-    try:
-        bootstrap_open = (runtime.accounts.count() == 0
-                          and not runtime.accounts.bootstrap_used())
-    except AttributeError:
-        bootstrap_open = runtime.accounts.count() == 0   # 测试替身无标记接口
+    # auth-015（2026-09-20）：删掉旧实现为测试替身保留的 `except AttributeError`
+    # 退化分支（它把"没有标记接口"直接当成"没有消耗过"，正在被测试依赖，见 T-04）；
+    # 替身改为显式提供 bootstrap_used()。
+    bootstrap_open = (runtime.accounts.count() == 0
+                      and not runtime.accounts.bootstrap_used())
     if bootstrap_open:
         return True, ""
     log.warning("客户端 %s 尝试注册，但 bootstrap 注册窗口已关闭，已拒绝", addr)
@@ -1851,6 +1874,19 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
 
             # ---------- 应答阶段：auth_proof / reg_proof ----------
             if action in (Act.AUTH_PROOF, Act.REG_PROOF):
+                # auth-016（2026-09-20）：次版本门控旧实现只做在观看端
+                # （viewer.py 要求 proto[1] >= PROTO_CHAL_MIN_MINOR），host 侧
+                # common.proto_compatible 只判主版本 ==2，于是 v2.2 的观看端按
+                # "主版本相同即兼容"发来旧口径 proof（只签 nonce，不绑 user），
+                # host 校验必然失败 → 命中观看端"口令错误"分支，**清空已存凭据并写回
+                # config**：老客户端既登不上、又丢了保存的口令，界面还只显示套话。
+                pr = msg.get("proto")
+                if (isinstance(pr, (list, tuple)) and len(pr) >= 2
+                        and isinstance(pr[1], int) and pr[1] < PROTO_CHAL_MIN_MINOR):
+                    return _reject_and_close(
+                        "观看端版本过旧，请更新后重试",
+                        "%s 来自次版本过旧的观看端（proto=%r，服务端=%s），已拒绝且"
+                        "不动其对账凭据" % (action, pr, PROTOCOL_VERSION))
                 kind = "login" if action == Act.AUTH_PROOF else "register"
                 if pending is None or pending["kind"] != kind or user != pending["user"]:
                     return _reject_and_close("没有进行中的挑战，请重新登录",
