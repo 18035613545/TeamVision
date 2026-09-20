@@ -1100,7 +1100,14 @@ class Channel:
         try:
             nonce = b64d(chal.get("nonce") or "")
             iter_ = int(chal.get("iter") or PBKDF2_ITERATIONS)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError, AttributeError):
+            # auth-020（2026-09-20）：捕获口径漏两类——`{"iter": Infinity}` 是合法
+            # JSON，`int(inf)` 抛 **OverflowError**；`{"nonce": 123}` 在 b64d 里
+            # `123.encode` 抛 **AttributeError**（common.py:169）。两处都发生在
+            # 真正调用 derive_dk **之前**，所以补在 derive_dk 的捕获上修不好本条。
+            # 逃逸出去的后果：auth-002 精心准备的三条明确文案（iter 不符 / nonce
+            # 过短 / salt 非 hex）全部被绕过，落到 `_authenticate` 的兜底变成
+            # "认证通信失败"+ 无限重连。
             return {"ok": False, "msg": "挑战消息格式非法"}
         # auth-002（2026-09-18）：挑战参数由对端提供，使用前强校验——
         #  · iter 与本地常量不一致即判服务端异常拒登：防中间人回 {iter:1, salt:自选}

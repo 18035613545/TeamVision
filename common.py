@@ -139,10 +139,14 @@ def derive_dk(password, salt_hex, iterations=PBKDF2_ITERATIONS):
     （调用方按协议错误处理）而非静默钳制——静默钳制会与对端算出不同 dk，
     表现为"密码正确却登录失败"，比明确拒绝更难排查。
     salt 限 16~64 位偶数长度十六进制（服务端约定 32 位）。
+
+    auth-020（2026-09-20）：本函数只承诺抛 ValueError，所以 OverflowError 也必须归一
+    ——`Infinity` 是合法 JSON，`int(float('inf'))` 抛 OverflowError，旧写法会让它逃出
+    去（调用方按 docstring 只准备了 ValueError）。
     """
     try:
         it = int(iterations)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError("KDF 迭代次数非法: %r" % (iterations,))
     if not (KDF_ITER_MIN <= it <= KDF_ITER_MAX):
         raise ValueError("KDF 迭代次数越界: %d（允许 %d~%d）" % (it, KDF_ITER_MIN, KDF_ITER_MAX))
