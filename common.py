@@ -265,7 +265,7 @@ DEFAULT_CONFIG = {
         },
         "codec": {
             "encoder": "auto",       # auto|nvenc|x264|jpeg；auto=NVENC 硬件优先，x264 回退
-            "bitrate_kbps": 2500,    # H.264 目标码率基线（CBR，Kbps）
+            "bitrate_kbps": 2500,    # H.264 目标码率基线（VBR，峰值 1.5×；Kbps）
             "keyint": 60,            # 关键帧间隔（帧数）
             "min_bitrate_kbps": 400,  # 码率自适应下限
             "max_bitrate_kbps": 6000,  # 码率自适应上限
@@ -463,7 +463,8 @@ def parse_message_raw(buf):
 
 def message_pump(sock, *, should_stop, on_idle, on_message,
                  on_rx=None, on_recv_error=None, on_eof=None,
-                 on_chunk=None, on_batch=None, on_buf=None, raw_kinds=()):
+                 on_chunk=None, on_batch=None, on_buf=None, on_tick=None,
+                 raw_kinds=()):
     """C2（实现方案 §7 第 2 步）：两端共用的 socket 接收泵。
 
     骨架 = select(1s) → recv → bytearray 累积 → parse_message(_raw) 逐条排空。
@@ -493,6 +494,10 @@ def message_pump(sock, *, should_stop, on_idle, on_message,
                                "单条消息总时限"起点——旧实现无条件重置，攻击者发
                                `长度=32MB-1` 的头上限后每 <15s 滴 1 字节即可把
                                计时起点无限后移（第 103 条 slowloris 防线被绕过）。
+
+    on_tick(now, buf)          每轮**收到数据**之后（与 on_idle 互补，二者不重叠）；
+                               返回非 None 原因串结束泵。net-030/net-036：只放超时
+                               判定，不要放"每秒至多一次"的副作用（那些属 on_idle）。
 
     返回结束原因（str）或 None（should_stop 置位）。
     """
@@ -543,6 +548,17 @@ def message_pump(sock, *, should_stop, on_idle, on_message,
             on_batch(buf)
         if on_buf is not None:
             on_buf("post", buf, time.monotonic(), n_msgs)
+        # net-030 / net-036（2026-09-20）：停滞判据必须也在**有数据**的轮次上评估。
+        # 旧实现只在 select 空转满 1 秒时调 on_idle，于是"每 0.4~0.9 秒投 1 字节"的
+        # 对端让 `not r` 永不成立 → 单条消息总时限与半开/停滞判定一次都不执行
+        # （实测 12 秒内 on_idle 调用 0 次）。记账口径（net-015 只在完整消息时刷新）
+        # 是对的，缺的是评估时机；这里在每轮 recv 之后补一次。
+        # 与 on_idle 分开一个钩子：on_idle 还带 fps 衰减、请求关键帧等副作用，
+        # 那些应当保持"每秒至多一次"，只有超时判定需要在数据路径上加密。
+        if on_tick is not None:
+            reason = on_tick(time.monotonic(), buf)
+            if reason is not None:
+                return reason
     return None
 
 
@@ -673,9 +689,16 @@ def client_handshake(sock):
         raise ConnectionError("服务端握手响应无效：%r" % response)
 
 
-def server_handshake(sock):
-    """服务端握手：校验客户端发来的 MAGIC_CLIENT，校验通过后回复 MAGIC_SERVER。"""
-    magic = recv_exact(sock, len(MAGIC_CLIENT))
+def server_handshake(sock, deadline=None):
+    """服务端握手：校验客户端发来的 MAGIC_CLIENT，校验通过后回复 MAGIC_SERVER。
+
+    net-031（2026-09-20）：deadline 给定时整次握手（4 字节魔数）受**总时限**约束，
+    与同族认证路径（net-022）同口径。旧实现不传 deadline，只靠 `settimeout(10)` 的
+    每次 recv 超时——每 (timeout−1) 秒喂 1 字节的对端可把单条连接的最坏时长拉到
+    `4 × 10s = 40s`，以"每约 5 秒新建一条连接"的速率即可长期占满 max_pending_auth
+    名额（速率型 DoS；攻击停止后 ≤40 秒自愈）。
+    """
+    magic = recv_exact(sock, len(MAGIC_CLIENT), deadline)
     if magic != MAGIC_CLIENT:
         raise ConnectionError("客户端握手请求无效：%r" % magic)
     sock.sendall(MAGIC_SERVER)

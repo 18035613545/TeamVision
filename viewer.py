@@ -487,8 +487,25 @@ class Channel:
                     return None
 
                 def _on_rx(now):
+                    # net-036（2026-09-20）：旧实现由泵在**每个 recv 分块**上调这里，
+                    # 于是 last_rx 按字节刷新——对端（含被劫持的隧道中转）每 5 秒内
+                    # 滴 1 字节即可让停滞判定永不成立，频道被钉在 status="receiving"
+                    # + 画面定格。改由 _on_buf 在"消费掉完整消息"时刷新（与 host 侧
+                    # net-015 同口径）。
                     nonlocal last_rx
                     last_rx = now
+
+                def _on_buf(event, buf, now, n_msgs=0):
+                    if event == "post" and n_msgs > 0:
+                        _on_rx(now)
+
+                def _on_tick(now, buf):
+                    # net-036 + net-030：停滞判定旧实现只在 select 空转满 1 秒时评估，
+                    # 持续滴字节的对端让 `not r` 永不成立 → 判据一次都不跑。
+                    if now - last_rx > self._read_idle_s:
+                        raise ConnectionError(
+                            "%.0f 秒未收到完整消息，判定连接停滞" % self._read_idle_s)
+                    return None
 
                 def _on_eof():
                     raise ConnectionError("连接关闭")
@@ -540,7 +557,8 @@ class Channel:
 
                 message_pump(sock,
                              should_stop=lambda: not self._running,
-                             on_idle=_on_idle, on_rx=_on_rx, on_eof=_on_eof,
+                             on_idle=_on_idle, on_rx=None, on_eof=_on_eof,
+                             on_buf=_on_buf, on_tick=_on_tick,
                              on_chunk=_on_chunk, on_message=_on_message,
                              on_batch=_on_batch)
             except Exception as exc:

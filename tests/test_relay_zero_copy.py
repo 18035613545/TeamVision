@@ -10,6 +10,7 @@ CPU 收益 <0.1%，不单测性能，只锁正确性。
 import os
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -154,6 +155,10 @@ class TestRecvLoopEndToEnd(unittest.TestCase):
         sock = _Sock([wire])
         info = mock.MagicMock()
         info.share_id = None
+        # net-030（2026-09-20）：超时判据现在也在**有数据**的轮次上评估（on_tick），
+        # 替身必须像真实 ClientInfo 那样给出数值型 last_rx_at，否则 `now - MagicMock`
+        # 抛 TypeError——真实对象不存在该问题，是替身欠拟合。
+        info.last_rx_at = time.monotonic()
         info.allow_upstream.return_value = True
         rt = _mk_runtime()
         registered = []

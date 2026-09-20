@@ -105,8 +105,9 @@ class TestHandshakeTimeout(unittest.TestCase):
     def test_timeout_is_set_before_handshake(self):
         seen = {}
 
-        def fake_handshake(sock):
+        def fake_handshake(sock, deadline=None):
             seen["timeout"] = sock.gettimeout()
+            seen["deadline"] = deadline
             raise ConnectionError("模拟对端不发魔数")
 
         a, b = socket.socketpair()
@@ -117,12 +118,18 @@ class TestHandshakeTimeout(unittest.TestCase):
             b.close()
         self.assertEqual(seen["timeout"], host.HANDSHAKE_TIMEOUT_S,
                          "握手前未把 socket 超时收紧到 HANDSHAKE_TIMEOUT_S")
+        # net-031（2026-09-20）：握手还必须有**总时限**——只有 per-recv 超时时，
+        # 每 (timeout−1) 秒喂 1 字节的对端能把一次握手拖到 4×10=40 秒。
+        self.assertIsInstance(seen.get("deadline"), float,
+                              "握手未传总时限 deadline（net-031）")
+        self.assertGreater(seen["deadline"], time.monotonic())
+        self.assertLessEqual(seen["deadline"], time.monotonic() + host.HANDSHAKE_TIMEOUT_S)
 
     def test_keepalive_is_enabled_before_handshake(self):
         """握手阶段就该有 SO_KEEPALIVE：否则半开连接连内核都不会回收。"""
         seen = {}
 
-        def fake_handshake(sock):
+        def fake_handshake(sock, deadline=None):
             seen["keepalive"] = sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
             raise ConnectionError("stop")
 

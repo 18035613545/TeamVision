@@ -6,7 +6,7 @@
   encoder_sel 决定候选链：auto 自动优先硬件（HEVC→H.264），无硬件回退软件，
   hevc 显式优先 HEVC，nvenc/x264 保持 H.264 语义
 - 低延迟参数：无 B 帧、NVENC tune=ull/zerolatency + delay=0（每帧输入立即出包，
-  消除恒定 2 帧编码缓冲）、码率控制（默认 VBR，可配 CBR）
+  消除恒定 2 帧编码缓冲）、码率控制为 **VBR**（峰值 1.5×bitrate）
 - 码率自适应（ABR）：set_bitrate() 变化超阈值时重建编码器，重建后首帧强制关键帧
   （顺带重置参考帧，避免解码端花屏）
 - 强制关键帧（关键帧请求）：frame.pict_type = I
@@ -113,7 +113,14 @@ class VideoEncoder:
         return usable
 
     def _build_options(self, name, bitrate):
-        """按编码器生成低延迟 + 码率控制选项（NVENC 默认 VBR，可配 CBR）。"""
+        """按编码器生成低延迟 + 码率控制选项（**实际恒为 VBR**，见下）。
+
+        codec-010（2026-09-20）：`rate_control` 是从不传入的内部形参——唯一构造点
+        pipeline.FrameEncoder 不带该参数，`DEFAULT_CONFIG["host"]["codec"]` 也没有
+        对应键，所以"可配 CBR"的说法与实现不符（cbr 分支是留着未接线的实现）。
+        本文件与 common.py / host.py 的注释统一改为"VBR、峰值 1.5×码率"，
+        排障时按 VBR 估上行占用（默认 upstream_max_kbps = 2 × codec.bitrate_kbps）。
+        """
         b = max(64, int(bitrate))
         bufsize = max(128, int(b * 0.5))
         if name in ("h264_nvenc", "hevc_nvenc"):

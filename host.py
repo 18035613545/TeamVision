@@ -5,7 +5,7 @@ TCP 广播 + 樱花 frpc 集成 + 图形控制台。
 第七轮优化（pro-video-codec）：
 - 用 PyAV/FFmpeg 做 H.264 视频编码替代逐帧 JPEG：NVENC 硬件（GPU）优先、libx264 软件回退，
   带宽相比 JPEG 降低 5-20 倍；编码器不可用自动回退逐帧 JPEG
-- 低延迟编码参数：无 B 帧、NVENC tune=ull/zerolatency 或 x264 tune=zerolatency、CBR 码率
+- 低延迟编码参数：无 B 帧、NVENC tune=ull/zerolatency 或 x264 tune=zerolatency、VBR 码率
 - 码率自适应（ABR）：按发送耗时/积压动态调节编码码率（超出预设范围后回落原有的
   缩放→帧率降级），带宽恢复自动回升
 - 关键帧请求：观看端请求时强制出 IDR 快速恢复（含 ABR 重建后的参考帧重置）
@@ -1645,7 +1645,9 @@ def _do_handshake(sock, addr, net_cfg):
     except OSError:
         pass
     try:
-        server_handshake(sock)
+        # net-031（2026-09-20）：握手阶段补**总时限**（此前只有每次 recv 的 10 秒超时，
+        # 滴字节的对端最坏可把一次握手拖到 4×10=40 秒），与认证阶段 net-022 同口径。
+        server_handshake(sock, time.monotonic() + HANDSHAKE_TIMEOUT_S)
     except Exception as e:
         log.warning("客户端 %s 握手失败（%.0f 秒内未完成）: %s",
                     addr, HANDSHAKE_TIMEOUT_S, e)
@@ -1704,6 +1706,17 @@ def _str_field(msg, key, default=""):
     if isinstance(value, str):
         return value, True
     return default, False
+
+
+def _clip(text, n=200):
+    """把**对端可控**的字符串截到 n 个字符再进日志（auth-018 / auth-021 的统一出口）。
+
+    logger 不截断、滚动 5MB×5，一条未认证报文就能把真实日志整段冲掉；凡是准备
+    `%s` / `%r` 进日志的对端字段，一律先过这里。
+    """
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return text if len(text) <= n else text[:n] + "…(共 %d 字符)" % len(text)
 
 
 CHALLENGE_TTL_S = 60.0  # D1（实现方案 §10.1）：挑战 nonce 有效期，超时须重新发起登录
@@ -1822,6 +1835,18 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                                          "认证消息 pass 类型非法（%s），已拒绝"
                                          % type(msg.get("pass")).__name__)
             user = (raw_user or "").strip()
+            # auth-018（2026-09-20）：MAX_USERNAME_LEN 旧实现只加在 register /
+            # register_derived 的**落库处**，LOGIN / AUTH_PROOF 的 user 字段没有校验，
+            # 而 recv_msg 允许 MAX_PAYLOAD=32MB、_str_field 不截断——未认证对端发一条
+            # 32MB user 的 LOGIN 即可在 1853/1866/1871/1893/1900 与 _auth_optional_phase
+            # 的日志行里产出 32MB 日志（recv 缓冲 + str + 格式化峰值约 130MB），
+            # 把真实日志整体冲掉。限制加在读取处，所有下游回显点一次性收口。
+            # 文案与"口令错误"统一，不因长度新增枚举面。
+            if len(user) > MAX_USERNAME_LEN:
+                return _reject_and_close(
+                    "用户名或密码错误",
+                    "登录用户名超长（%d 字符，上限 %d），已拒绝"
+                    % (len(user), MAX_USERNAME_LEN))
             password = raw_pass or ""
 
             # ---------- 应答阶段：auth_proof / reg_proof ----------
@@ -1842,8 +1867,15 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                     except ValueError:
                         proof = None
                 if proof is None:
-                    return _reject_and_close("挑战应答格式非法",
-                                             "auth proof 格式非法（%r），已断开" % raw_proof)
+                    # auth-021（2026-09-20）：整段 %r 会把最长 32MB 的 proof 原样写进
+                    # 日志（`%r` 还会连引号与转义一起展开，体积略增）。raw_proof 与
+                    # auth-018 的 user 一样来自**未认证**对端可控的报文，触发只需三步：
+                    # LOGIN → 收挑战 → 乱填 proof，比 auth-018 还少一步前提。
+                    # 凭据类字段一律只记长度 + 前 8 位。
+                    return _reject_and_close(
+                        "挑战应答格式非法",
+                        "auth proof 格式非法（长度 %d，前缀 %r），已断开"
+                        % (len(raw_proof or ""), _clip(raw_proof, 8)))
                 if kind == "login":
                     ok, text = runtime.accounts.verify_login_proof(user, p["nonce"], proof)
                 else:
@@ -1987,6 +2019,9 @@ def _auth_optional_phase(sock, addr):
                         addr, type(msg.get("user") if isinstance(msg, dict) else None).__name__)
             user = ""
         user = (user or "").strip()
+        # auth-018（2026-09-20）：这条路径在未认证前读取对端可控的 user，且无长度
+        # 校验（准入关闭时任何人都能走到这里）——进日志前先截断。
+        user = _clip(user, MAX_USERNAME_LEN)
         send_msg(sock, {"action": Act.AUTH_RESULT, "ok": True,
                         "msg": "账户准入已关闭，无需登录",
                         "proto": list(PROTOCOL_VERSION)})
@@ -2073,10 +2108,26 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
         # （逐个客户端上 _write_lock 同步写），且不经过上行帧限速——廉价控制消息
         # 即可把 CPU 与目标观众的 _write_lock 打满。这里加一道独立限速。
         if not info.allow_ctrl_broadcast():
+            # net-029（2026-09-20）：net-020 加了配额却对被限流的请求**不回话**——
+            # 观看端 switch_source 是"先本地提交、再发包"，只有收到 WATCH_REJECT 才
+            # 回滚，于是被丢弃的那条让状态栏显示「队友·X」而实际是本地画面；若被丢的
+            # 是"切回 local"那条，host 仍按已失效的 peer 源路由 → 永久黑屏且无自愈路径。
+            # 触发面不窄：burst=3/10s 且 WATCH 与 UNSHARE 共用同一桶，重连自动补发
+            # WATCH、队友离线自动切回 local、面板双击切源都能在 10 秒内叠到 4 条。
+            log.debug("客户端 %s watch 被限速，回 WATCH_REJECT 让对端回滚", addr)
+            if not _reply_ctrl(sock, info, {"action": Act.WATCH_REJECT,
+                                            "source": msg.get("source"),
+                                            "reason": "throttled"}, addr):
+                return "控制消息写入失败（连接已损坏）"
             return None
         return _ctrl_watch(sock, info, runtime, msg, addr)
     elif action == Act.UNSHARE:
         if not info.allow_ctrl_broadcast():
+            # net-029：停共享被限流时同样要给对端一个回话。这里不能复用 WATCH_REJECT
+            # （观看端会据此切回 local，而语义上共享并未停止），改为回一条明确的
+            # 错误控制消息，并把该连接的**待处理 unshare 合并**到配额窗口之后由
+            # roster 变化自然收敛——成员仍在 roster 中，观看端不会误切。
+            log.debug("客户端 %s unshare 被限速（合并到下一次广播）", addr)
             return None
         # 成员主动停止共享（连接保留）：注销并广播 roster，
         # 让订阅该 peer 的观看端回落 local（viewer peers 处理）
@@ -2085,15 +2136,18 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
             runtime._unregister_sharer(info)
             log.info("共享成员 %s 注销：%s（%s）", addr, old_id, info.username or "-")
     elif action == Act.REQ_KEYFRAME:
+        # codec-014（2026-09-20）：客户端主动路径旧实现**无合并、无限速**——一条约
+        # 40 字节的消息即可把本机编码器钉成帧帧 IDR（每次 IDR 的码率开销远高于 P 帧），
+        # 而 net-020 的配额只挂在 WATCH/UNSHARE 上、上行令牌桶只管视频帧。
+        # 内部愈合路径 _request_peer_keyframe 本来就带 1 秒冷却，两端口径不一致。
+        # 现在两条路径统一走带冷却的去重。
         if info.watch_source.startswith("peer:"):
-            # 转达成员端：其共享会话强制出一帧关键帧（第 56 条：安全发送）
-            _send_ctrl_safe(runtime, _sharer_sock(runtime, info.watch_source),
-                            {"action": Act.REQ_KEYFRAME})
+            # 转达成员端：其共享会话强制出一帧关键帧（第 56 条：安全发送）。
+            # 复用同一份冷却表，避免每条客户端消息都做一次 clients 全表扫描 + 同步 sendall。
+            _request_peer_keyframe(runtime, info.watch_source)
         else:
-            with runtime.slot_lock:
-                runtime.force_key = True  # 原逻辑：本地下一帧 IDR
-            _wake_raw(runtime)  # C2：唤醒编码线程（静止期也在等 raw_evt）
-            log.debug("客户端 %s 请求关键帧，已置位强制 IDR", addr)
+            if _request_local_keyframe(runtime):
+                log.debug("客户端 %s 请求关键帧，已置位强制 IDR", addr)
     elif action in (Act.PROBE, Act.LOGIN, Act.REGISTER):
         # 第 100 条：迟到超过 2 秒的认证消息。准入关闭时上面的可选 auth 窗口（select 2s）
         # 已把本连接按"旧客户端"放行，此后到达的 probe/login 若无人应答，观看端会把
@@ -2179,6 +2233,11 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
             sock,
             should_stop=runtime.stop_event.is_set,
             on_idle=_on_idle,
+            # net-030（2026-09-20）：同一套超时判定也要在每个收到数据的轮次上评估。
+            # 旧实现只有 select 空转满 1 秒才调 on_idle，于是"每 0.4~0.9 秒投 1 字节
+            # 且仍把下行读干净"的对端让判据一次都不执行（实测 12 秒内 on_idle 调用
+            # 0 次、泵不退出）——net-015 修的是计时起点，评估点仍漏着。
+            on_tick=_on_idle,
             # net-015：note_rx 改由 _on_buf 在"消费完整消息"时刷新——任意字节刷新
             # 会让滴字节攻击同时绕过 60s 半开检测
             on_recv_error=lambda exc: "接收错误",
@@ -2362,6 +2421,30 @@ def _live_share_ids(runtime):
                 if getattr(c, "share_id", None)}
 
 
+def _request_local_keyframe(runtime, cooldown=1.0):
+    """本机共享画面的"强制下一帧 IDR"请求，带**运行级**冷却去重。
+
+    codec-014（2026-09-20）：客户端 `req_keyframe` 旧实现无条件 `force_key = True`
+    + `_wake_raw`，一条约 40 字节的消息即可把编码器钉成帧帧 IDR（IDR 的码率开销
+    远高于 P 帧），而 net-020 的配额只管 WATCH/UNSHARE、上行令牌桶只管视频帧，
+    控制消息整体没有配额。这里按"整个运行每秒至多一次"合并——force_key 本来就是
+    全局单标志，多个观众同时等关键帧时合并成一次 IDR 正是想要的语义；正常观看端
+    的重试间隔远大于 1 秒，不受影响。与内部愈合路径 `_request_peer_keyframe` 同口径。
+    """
+    now = time.monotonic()
+    lock = getattr(runtime, "_peer_key_lock", None)
+    table = getattr(runtime, "_peer_key_at", None)
+    if isinstance(table, dict) and lock is not None:
+        with lock:
+            if now - table.get("*local*", 0.0) < cooldown:
+                return False
+            table["*local*"] = now
+    with runtime.slot_lock:
+        runtime.force_key = True
+    _wake_raw(runtime)  # C2：唤醒编码线程（静止期也在等 raw_evt）
+    return True
+
+
 def _sharer_sock(runtime, share_id):
     """按共享 id 查成员连接 socket；不存在返回 None。
 
@@ -2383,7 +2466,7 @@ def _request_peer_keyframe(runtime, share_id, cooldown=1.0):
     now = time.monotonic()
     lock = getattr(runtime, "_peer_key_lock", None)
     table = getattr(runtime, "_peer_key_at", None)
-    if lock is not None and table is not None:
+    if isinstance(table, dict) and lock is not None:
         with lock:
             if now - table.get(share_id, 0.0) < cooldown:
                 return False
