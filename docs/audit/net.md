@@ -6,7 +6,7 @@
 示例（演示新格式）：
 - `net-001｜协议层单点：Act 常量表 + 共享接收泵 + proto 字段（原第 135 条）｜tests/test_protocol_single_point.py`
 
-net-015｜泵把「本轮消费条数」传给 on_buf，note_rx 按完整消息刷新（滴字节不能再续命慢速攻击）｜tests/test_protocol_single_point.py
+net-015｜泵把「本轮消费条数」传给 on_buf，note_rx 按完整消息刷新（滴字节不能再续命慢速攻击）｜tests/test_protocol_single_point.py（仅泵侧契约）+ tests/test_bugfix_20260920_t02_recvloop.py（真实 _client_recv_loop 记账，补 T-02）
 net-016｜ABR 判据只采信本机源订阅者（含实测吞吐），降级补订阅者门控｜—
 net-017｜解码积压检测 + 追新模式（重置解码器、只喂关键帧直到 IDR），延迟不再只增不减｜—
 net-018｜parse_addr 支持 IPv6（[::1]:5700、裸 ::1 不再被当成端口 1）｜—
@@ -18,6 +18,16 @@ net-023｜公网自检周期化（10 分钟）+ sendall 进 try + 面板结论�
 net-024｜tune_socket 接住 TypeError/ValueError；Windows py<3.13 用 WSAIoctl 补 keepalive 空闲/间隔｜—
 net-025｜safe_int/safe_float/normalize_region 防 Infinity/NaN/1e999（OverflowError 同接）｜—
 net-026｜认证消息非 dict（如 [1,2]）明确按协议错误拒绝，不再误标通信失败｜—
+net-027｜parse_addr(":5700") 的空主机补 raise ValueError（第 94 条地址校验的既有口径缺口，非 net-018 引入）｜tests/test_bugfix_20260920_addr.py
+net-028｜裸 IPv6+端口 `::1:5700` 不再被整串当主机名（末段是合法端口且前缀是合法 IPv6 时才拆，net-018 回归收口）｜tests/test_bugfix_20260920_addr.py
+net-029｜WATCH 被 net-020 配额限流时回 WATCH_REJECT(reason=throttled)，让对端按第 9 条回滚（UNSHARE 侧按设计仍不回话，见修复记录 §8）｜—
+net-030｜message_pump 新增 on_tick：单条消息总时限与半开判定也在「每个 recv 轮次」上评估（滴字节不再绕过）｜tests/test_bugfix_20260920_t02_recvloop.py
+net-031｜server_handshake 增 deadline 形参：握手阶段补总时限，一次握手最坏时长由 4×10=40 秒收到 10 秒｜tests/test_item100_fixes.py
+net-032｜_probe() 的 delay 缺 nonlocal → 自检线程首次迭代即 UnboundLocalError；改自有 next_delay + 线程体 try/except 记日志｜—
+net-033｜公网自检循环内复核 frp.is_running()，隧道停掉后不再每 10 分钟对外拨号（与 net-032 同批落地）｜—
+net-034｜追新判据去两端墙钟差：改用「时延相对历史最优基线的增量」，固定钟差在差值里抵消，跨机时钟偏差不再周期性黑屏｜—
+net-035｜去掉积压判据的 10 秒上界与「单次 recv 装得下 12 帧」的恒不可达档，改批内跨度比；补「追新 5 秒未等到关键帧即重连」兜底｜—
+net-036｜观看端 last_rx 改按完整消息刷新（接 on_buf）并接 on_tick 做停滞判定，滴字节不再把频道钉在「接收中」｜—
 
 ## 历史（旧编号，冻结）
 

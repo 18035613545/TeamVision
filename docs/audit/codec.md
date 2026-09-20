@@ -8,12 +8,17 @@
 
 codec-002｜set_fps 改「锁外构造、锁内切换」，失败保留旧编码器（第 112 条口径补齐）｜—
 codec-003｜一次 encode 多包合并输出（不再只取 pkts[-1]），空包跳过｜—
-codec-004｜静止期强制 IDR 校验 is_key 与缓存帧尺寸，未生效不发且保留请求｜—
+codec-004｜静止期强制 IDR 校验 is_key（未生效则不发且保留请求）；「校验缓存帧尺寸」那半边两侧均未落地，尺寸不一致由 codec.py 的自动重建吸收（第 6 轮 codec-013 实测更正）｜—
 codec-005｜解码器释放与编码侧同口径（PyAV 17 无 close 时 flush + 解引用）｜—
 codec-006｜FrameEncoder.encode(bitrate=) 对已存在编码器生效（带 ±15% 迟滞）｜—
 codec-007｜候选编码器不可用原因按名字记一次（INFO 可见）｜—
 codec-008｜_send_key_response 返回是否真送出，失败不再消费 key_evt（第 3 条口径恢复）｜—
-codec-009｜stop() join 超时保留 _thread 引用，幂等 start() 不再可能双线程共用编码器｜—
+codec-009｜stop() join 超时保留 _thread 引用，幂等 start() 不再可能双线程共用编码器｜tests/test_item97_stop_race.py（cfg-009 更正：原记「—」系反向漏记，:61-142 为行为 + AST + 旧逻辑负向对照三段式）
+codec-010｜rate_control 是从不传入的死参数：三处 CBR/VBR 口径统一为 VBR（峰值 1.5×码率），按 VBR 估上行占用｜—
+codec-011｜静止期 force_idr 返回 (None,None) 且缓存帧在手时改走 JPEG 回退出帧（新观众不再永等 IDR）｜—
+codec-012｜set_fps 失败回滚 self._fps 并返回是否生效，pipeline 按返回值落账（注释与实现不再相反）｜—
+codec-013｜host 侧静止期强制 IDR 补 is_key 门禁、回了 P 帧时保留 force_key 不消费（codec-004 此前只改了 share 侧）｜—
+codec-014｜客户端 REQ_KEYFRAME 走带 1 秒冷却的去重（本地 _request_local_keyframe / peer 复用 _request_peer_keyframe），帧帧 IDR 的廉价放大堵死｜—
 
 ## 历史（旧编号，冻结）
 

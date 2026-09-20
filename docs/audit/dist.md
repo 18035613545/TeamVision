@@ -13,6 +13,13 @@ dist-005｜更新检查缓存临时名带 PID+线程号、data_dir 缺失时不�
 dist-006｜checked_at 为未来时不再判新鲜（时钟回拨不再永久停检）｜tests/test_b4_update_check.py
 dist-007｜更新检查失败提升到 INFO 留痕｜tests/test_b4_update_check.py
 dist-008｜诊断报告「注册策略」打印归一后取值（与运行时实际策略一致）｜tests/test_diag.py
+dist-009｜共享端控制台补「检查更新」复选框并即时落盘生效（dist-004 改 opt-in 后，注释承诺的勾选入口此前并不存在）｜—
+dist-010｜安装包守卫补查 _internal 目录 / pythonXX.dll / av.libs，并按验收标准加体积带（<90MiB 硬失败、目标约 111MiB 的 ±10% 之外告警）｜—
+dist-011｜日志清理改按「距今 N 天」筛日期组（旧实现保留「现存的后 5 组」）+ 补总文件数 120 / 总字节 64MiB 绝对上界｜tests/test_bugfix_20260911.py
+dist-012｜签名清单去硬编码版本号（安装包条目改通配、bat 从 installer.iss 反解 OutputBaseFilename）；「应签文件不存在」由跳过+exit 0 改为失败；UnknownError 仅自签放行｜—
+dist-013｜setup.bat 默认走官方源，国内镜像改 --mirror / TV_USE_MIRROR=1 显式开关，并去掉对 HTTPS 源无收益的 --trusted-host｜—
+dist-014｜诊断包在本进程一条日志都没有时（崩溃重启后 PID 已变，正是使用场景）退化为按 mtime 取最近 6 份，并在 report.txt 显式写明收集了什么｜—（tests/test_diag.py 全篇不传 pid=，该分支仍零覆盖，见 T-08）
+dist-015｜四支 .bat 改存 ANSI/GBK 并把 chcp 65001 改为 936（UTF-8 无 BOM + 65001 实测会破坏命令边界，可把一条命令静默并进上一条 echo）｜—
 
 ## 历史（旧编号，冻结）
 

@@ -6,7 +6,7 @@
 示例（演示新格式）：
 - `ui-001｜UI 基建（excepthook/色板/ttk 风格）收拢 ui_common.py｜tests/test_ui_common.py`
 
-ui-002｜断线/重连状态跃迁作废帧缓存并递增序号，poll 判据含状态——「已断开，正在重连…」可达｜tests/test_viewer_poll_backoff.py
+ui-002｜断线/重连状态跃迁作废帧缓存并递增序号，poll 判据含状态维度——「已断开，正在重连…」可达｜tests/test_viewer_poll_backoff.py（仅桩侧）+ tests/test_bugfix_20260920_t05_viewer.py（真实 Channel 三处跃迁 + poll 判据，补 T-05）
 ui-003｜登录等待超时/中断标记请求作废（done 置位）并与「用户取消」区分，不再幽灵框复活/谎报取消/30s 静默冷却｜—
 ui-004｜post_to_ui 投递失败只留痕，不再在工作线程就地执行控件操作｜—
 ui-005｜账户管理窗单例守卫（连点不再叠 Toplevel）｜—
@@ -25,6 +25,17 @@ ui-017｜日志 handler 单份挂载 + 队列有界 + 退出摘除｜—
 ui-018｜viewer 面板不再继承 host 基础 Treeview/Combobox 样式（§8 外观口径）｜—
 ui-019｜B4 更新提示改走 _post_ui 收口（不再绕开跨线程 UI 调度）｜—
 ui-020｜DPI 感知声明提到建 splash 之前（第 36 条回退修复，返回值记日志）｜tests/test_startup_order.py
+ui-021｜观看端导出诊断包改走 diag-export 工作线程 + _diag_exporting 重入守卫 + data_dir 缺失明确提示（ui-008 此前只做在共享端）｜—
+ui-022｜配置子节判型收口到 cfg_section()/load_config 出口校验：get_snapshot 等六处不再因标量节抛 AttributeError 让控制台永久陈旧｜—
+ui-023｜_store_frame 对 fps/延迟列表的裁剪收进 self.lock，与 _reset_stats_locked 的 clear 不再竞争（IndexError 不再被误判断线重连）｜—
+ui-024｜凭据队列淘汰改独立 _cred_evicted 标志：不再谎报「用户取消登录」、不再给无辜频道设 30 秒静默｜—
+ui-025｜switch_source 把 WATCH 与 REQ_KEYFRAME 的失败处理分开：关键帧请求超时不再回滚已生效的订阅（标签与画面不再长期错位）｜—
+ui-026｜认证失败不再无条件把 auth_msg 覆写成「需要登录后观看」，_authenticate 的具体真因在面板/poll/日志可见｜—
+ui-027｜_reset_stats_locked 一并清 round_trip_ms（第 12 条补齐 RTT 半边，断开态不再显示上一条连接的 RTT）｜tests/test_bugfix_20260920_t05_viewer.py
+ui-028｜热键切鼠标穿透后回写面板 _click_var，勾选框与实态一致、再点不再是空操作｜—
+ui-029｜poll 纯文字分支也落账 serial/idx/status，断线态下 15→33→50ms 空闲退避恢复生效｜tests/test_bugfix_20260920_t05_viewer.py
+ui-030｜字符串 capture.monitor 经 safe_int：图形控制台不再构造失败并静默回落到无窗口（console=False）｜—
+ui-031｜叠加文本变长后重新定位悬浮窗（ui-014 只改宽度来源、未改触发条件）｜—
 
 ## 历史（旧编号，冻结）
 

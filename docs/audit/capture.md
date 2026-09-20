@@ -6,9 +6,11 @@
 示例（演示新格式）：
 - `capture-001｜采集/静止门控统一到 pipeline.CaptureSource / StillGate（原第 111 条）｜tests/test_optimize_stage2.py`
 
-capture-002｜采集异常上抛给自愈链（连续异常重建可达）、告警 10s 冷却，故障后不再永久黑屏刷日志｜tests/test_optimize_stage2.py
+capture-002｜采集异常上抛给自愈链（连续异常重建可达）、告警 10s 冷却，故障后不再永久黑屏刷日志｜tests/test_bugfix_20260920_t01_capture.py（真实 CaptureManager.grab：上抛 + 计数 + 后果链 + 旧逻辑负向对照）。原登记 tests/test_optimize_stage2.py 为**假绿**——该用例把 pipeline.CaptureManager 整体替换掉，screen.py 的 except→计数→上抛从未执行（cfg-009/T-01）
 capture-003｜dxcam 区域按「显示器内相对坐标」换算（mss 绝对坐标 → 相对），越界回退 mss｜—
 capture-004｜显示器序号按几何矩形匹配 DXGI 输出（0=全部屏幕回退 mss），不再错屏/IndexError 静默回退｜—
+capture-005｜--console 也声明 DPI 感知（不再与「是否有窗口」绑定），mss 逻辑像素与 dxcam 物理像素不再混用｜—
+capture-006｜ensure_vendor_on_path() 提到 _open() 开头：源码运行首个采集会话的 DXGI 几何匹配不再恒失败；该 except 由 debug 提为一次性 warning｜—
 
 ## 历史（旧编号，冻结）
 
