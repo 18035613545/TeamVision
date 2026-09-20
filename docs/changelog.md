@@ -9,7 +9,9 @@
 - 修复公网共享整体不可用：默认回环改为 **IPv4/IPv6 双栈**（frpc 以 `localhost` 回连走 `::1` 曾被拒），并新增启动后**公网回连自检**，结论直显共享端面板与日志（net/auth 系列，见 audit）。
 - **D1 挑战-应答认证（协议 v2.2）**：登录/注册的口令不再过网——观看端就 nonce 提交
   `HMAC-SHA256(dk, nonce)`（dk=PBKDF2 派生，与服务端账户表同一把密钥），一次性 nonce、
-  60 秒过期、绑定连接。默认 `auth.chal_response="require"`：1.3.x 及更早观看端会被拒
+  60 秒过期、绑定连接（**注**：这是 D1 落地当时 v2.2 的输入串；同日 auth-002 改为
+  `HMAC-SHA256(dk, "tv-auth-v2|" + user + "|" + nonce)` 并把协议升到 v2.3，见下方协议条目；
+  本条保留原表述以记当时变更）。默认 `auth.chal_response="require"`：1.3.x 及更早观看端会被拒
   （提示更新）；过渡期可临时设 `allow_legacy`（直发口令记 WARNING，一个版本周期后移除）。
   已有账户无需重建。详见 install.md §5.1/§5.2。
 - 反作弊误报收敛 + 默认安全加固：关 UPX、onedir 化收尾、`auth_timeout` 提到 240s 下界（旧配置自动迁移）。

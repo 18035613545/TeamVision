@@ -29,6 +29,13 @@
      `test_no_thread_without_tunnel_or_frp` 红（会白起线程、白做外连）。
 `TestOldThreadBodyShape` 另把 net-032 的线程体复刻成本地函数，实证它必抛
 UnboundLocalError——即 (1) 的红不是编排出来的。
+
+本文件另含 `TestDpiDeclaredBeforeFirstWindow`：报告第十四章第 7 条点名的第四类
+"真实现"用例——`enable_dpi_awareness()` 先于首个 `tk.Tk()` 的顺序锁（报告把这条
+登记为 T-06 的正文，"全仓 tests 无任何 enable_dpi_awareness 引用"实测为真）。
+用真实 main() 的 AST 行号判序 + 判"无条件直挂 main 顶层" + 判"失败必须留痕"，
+四个缺陷形态变异体（挪到 tk.Tk() 之后 / 丢弃返回值 / 塞回 `if not args.console:`
+/ 整块删除）已实测各自转红。
 """
 import ast
 import inspect
