@@ -32,3 +32,6 @@ _tmp_*.py
 
 # ---- 本地工具记忆目录（含公网地址、隧道 ID、排查记录等，禁止入库）----
 .workbuddy/
+
+# auth-015（2026-09-20）：bootstrap 已消耗标记（与 accounts.json 同目录的数据产物，不入库）
+accounts.json.bootstrap-used

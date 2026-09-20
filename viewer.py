@@ -484,6 +484,15 @@ class Channel:
                 video_batch = []         # [(ts, codec, flags, nal)]，按到达顺序
 
                 def _on_idle(now, buf):
+                    # net-034/035 的兜底：追新靠对端回 IDR，若对端迟迟不回（编码器
+                    # 半死、need_key 门控互锁），追新模式会把画面无限期钉在黑屏上。
+                    # 追新 5 秒仍没等到关键帧 → 判定这条链路救不回来，重连。
+                    if (getattr(self, "_resync", False)
+                            and now - getattr(self, "_resync_at", 0.0)
+                            > self._BACKLOG_RESYNC_GIVEUP_S):
+                        raise ConnectionError(
+                            "追新后 %.0f 秒未收到关键帧，重连恢复画面"
+                            % self._BACKLOG_RESYNC_GIVEUP_S)
                     # 第 12 条：超过 1 秒无画面帧则衰减 fps，避免死频道锁存旧帧率
                     if now - last_media_rx > 1.0:
                         self._note_no_media()
@@ -527,6 +536,8 @@ class Channel:
                     nonlocal latest_jpeg
                     latest_jpeg = None
                     del video_batch[:]
+                    # net-035：批内跨度比判据需要"本批第一帧的到达时刻"（本端单调钟）
+                    self._batch_first_at = time.monotonic()
 
                 def _on_message(kind, payload, raw):
                     nonlocal latest_jpeg
@@ -691,16 +702,57 @@ class Channel:
         except (OSError, ValueError):
             pass
 
-    #: net-017（2026-09-18）：判定"积压"的两个信号——单批帧数（一次 recv 排空
-    #: 掉大批帧 = 明显落后）与端到端延迟（采集时刻到现在的差，秒级即不可接受）
-    _BACKLOG_BATCH_FRAMES = 12
+    #: net-017（2026-09-18）：判定"积压"的两个信号。
+    #: net-034 / net-035（2026-09-20）重做：两个判据原来都建立在**两端墙钟差**上——
+    #:   ① `lag_us = 本机墙钟 − 共享端采集时刻`，全仓没有时钟同步，共享端时钟只要比
+    #:      观看端**慢** ≥2.5 秒，每轮 recv 都判成积压 → 重置解码器 + 丢 P 帧，
+    #:      10 秒冷却只是把现象变成"每 10 秒黑一次"，永不解除（误触发）；
+    #:   ② `len(batch) >= 12` 受单次 `recv(65536)` 上限制约，默认 2500kbps@30fps
+    #:      约 10417 B/帧 → 一次 recv 只装得下约 6 帧，判据在默认档**恒不可达**；
+    #:      而延迟窗上界 10s 又让"真的积压超过 10 秒"这一最严重区间被当脏数据排除
+    #:      （漏触发）。net-017 登记的原症状"延迟可爬升至秒级且永不回落"因此仍在。
+    #: 现在两条判据都改成**只含本端单调钟与对端时钟的差值**（时钟偏移互相抵消）：
+    #:   ① 时延增量：观测值 d = 本端到达(单调钟) − 帧采集时刻(对端钟)。对端钟的固定
+    #:      偏移在 d−d_min 中抵消，d 相对"历史最优"的增量就是排队积压；无上下界。
+    #:   ② 批内跨度比：批次首末帧的**采集时刻差**（对端钟的差，偏移抵消）若明显大于
+    #:      它们的**到达时刻差**（本端钟），说明这一批是积压后一次性涌到的。
     _BACKLOG_LAG_US = 2_500_000
     _BACKLOG_COOLDOWN_S = 10.0
+    _LAG_BASELINE_RENEW_S = 60.0
+    _BACKLOG_RESYNC_GIVEUP_S = 5.0
+
+    def _backlog_exceeded(self, now_m, batch):
+        """返回 (是否判定积压, 说明串)。只使用本端单调钟与"钟差/钟差之差"。"""
+        ts_last = int(batch[-1][0])
+        d = now_m - ts_last / 1e6          # 含固定钟差，但下面只用它的**差值**
+        base = getattr(self, "_lag_base_d", None)
+        if base is None:
+            self._lag_base_d = d
+            self._lag_base_at = now_m
+            return False, ""
+        if (now_m - getattr(self, "_lag_base_at", 0.0) > self._LAG_BASELINE_RENEW_S
+                or d < base):
+            # 时延变小 = 新的"最优链路"，作为基线；另外周期性重估，防对端钟被 NTP
+            # 往回校导致基线永久偏低。
+            self._lag_base_d = d
+            self._lag_base_at = now_m
+            return False, ""
+        extra_s = d - base
+        if extra_s > self._BACKLOG_LAG_US / 1e6:
+            return True, "时延比基线多 %.1f 秒" % extra_s
+        if len(batch) >= 2:
+            # 批内跨度比：采集时刻差 vs 到达时刻差（两个都是"差"，与绝对钟无关）
+            sender_span = (ts_last - int(batch[0][0])) / 1e6
+            local_span = now_m - getattr(self, "_batch_first_at", now_m)
+            if sender_span - local_span > self._BACKLOG_LAG_US / 1e6:
+                return True, ("本批 %d 帧覆盖采集侧 %.1f 秒、却只在 %.2f 秒内到达"
+                              % (len(batch), sender_span, max(0.0, local_span)))
+        return False, ""
 
     def _check_backlog(self, sock, batch):
-        """积压检测（net-017）：落后明显时进入追新模式。
+        """积压检测（net-017，net-034/035 重做）：落后明显时进入追新模式。
 
-        docstring 声称"天然丢弃突发积压的中间帧"，但实现为保参考帧链必须逐帧解码
+        docstring 曾声称"天然丢弃突发积压的中间帧"，但实现为保参考帧链必须逐帧解码
         ——解码慢于到达时积压只能在 socket 缓冲里越堆越多，延迟爬升且永不回落。
         这里检测到积压即重置解码器、请求关键帧，并让后续批次只喂关键帧直到 IDR
         到位（参考链反正已断，跳过 P 帧可瞬间消化积压）。
@@ -708,10 +760,8 @@ class Channel:
         now_m = time.monotonic()
         if now_m - getattr(self, "_resync_at", 0.0) < self._BACKLOG_COOLDOWN_S:
             return
-        lag_us = time.time_ns() // 1000 - int(batch[-1][0])
-        # 延迟窗口取 (0, 10s]：负数/超大值是跨机时钟偏差或脏数据（同 _store_frame 口径）
-        lagged = 0 <= lag_us <= 10_000_000 and lag_us > self._BACKLOG_LAG_US
-        if not lagged and len(batch) < self._BACKLOG_BATCH_FRAMES:
+        lagged, why = self._backlog_exceeded(now_m, batch)
+        if not lagged:
             return
         self._resync_at = now_m
         self._resync = True
@@ -722,9 +772,9 @@ class Channel:
             pass
         self._got_key = False
         self._request_keyframe(sock)
-        log.warning("频道[%s] 检测到解码积压（本批 %d 帧，延迟 %.1f 秒），"
+        log.warning("频道[%s] 检测到解码积压（本批 %d 帧，%s），"
                     "进入追新模式：只收关键帧直到恢复",
-                    self.name, len(batch), max(0.0, lag_us) / 1e6)
+                    self.name, len(batch), why)
 
     def _decode_video_batch(self, sock, batch):
         """按到达顺序解码一批 H.264/HEVC 帧（第 7 条）。
@@ -1210,20 +1260,29 @@ class Channel:
         仅对解码成功的有效帧调用；无效帧/解码失败不计入延迟统计。
         """
         now = time.monotonic()
-        self._fps_times.append(now)
-        cutoff = now - 1.0
-        while self._fps_times and self._fps_times[0] <= cutoff:
-            self._fps_times.pop(0)
+        latency_us = time.time_ns() // 1000 - ts_us
         # 端到端估算延迟 = 到达时刻（微秒）− 采集时间戳（时钟近似同步假设）。
         # 时钟不同步时会出现异常值：负数与超过 10 秒的值一律丢弃（不进入统计），
         # 避免跨机器时钟偏差导致面板/悬浮窗显示巨大的虚假延迟
-        latency_us = time.time_ns() // 1000 - ts_us
         fresh = 0 <= latency_us <= 10_000_000
-        if fresh:
-            self._latency_samples.append(latency_us)
-            if len(self._latency_samples) > 5:
-                self._latency_samples.pop(0)
+        # ui-023（2026-09-20）：两个统计列表的**裁剪**旧实现写在 self.lock 之外
+        # （`while self._fps_times and self._fps_times[0] <= cutoff: pop(0)`、
+        # `if len(self._latency_samples) > 5: pop(0)`），而 ui-010 新增的
+        # `_reset_stats_locked()` 在主线程 switch_source 持锁时 clear() 同样两个列表。
+        # 判空与 pop 之间被 clear → IndexError: pop from empty list，沿 message_pump
+        # 冒到 _receiver_loop 的 except，被误判为断线并整条重连（画面闪断）。
+        # 真正的跨线程点是 viewer.py 的 `_handle_ctrl`（收到队友离线时切回 local）
+        # 与 host 转达路径，它们与 _store_frame 分属两线程。
+        # 现在列表的增删清全部收进同一把锁；纯计算留在锁外。
         with self.lock:
+            self._fps_times.append(now)
+            cutoff = now - 1.0
+            while self._fps_times and self._fps_times[0] <= cutoff:
+                self._fps_times.pop(0)
+            if fresh:
+                self._latency_samples.append(latency_us)
+                if len(self._latency_samples) > 5:
+                    self._latency_samples.pop(0)
             self.frame_serial += 1
             self.last_frame = frame
             self.fps = float(len(self._fps_times))
@@ -1290,6 +1349,13 @@ class Channel:
 
     def _reset_stats_locked(self):
         """`_reset_stats` 的锁内实现体（调用方持 self.lock）。"""
+        # net-034/035：积压基线是"本端钟 − 对端钟"的观测最小值，切源/重连后对端可能
+        # 换人（钟差完全不同），必须作废，否则新源一上来就被判成积压。
+        self._lag_base_d = None
+        # ui-027（2026-09-20）：`round_trip_ms` 旧实现漏清——第 12 条"断流后数值锁存"
+        # 修了 fps 半边、漏了 RTT 半边，而 effective_latency_ms() 优先取 RTT/2，
+        # 共享端关闭后 pong 不再到达，断开态会持续显示上一条连接的 RTT。
+        self.round_trip_ms = 0.0
         for name in ("_fps_times", "_latency_samples"):
             seq = getattr(self, name, None)
             if seq is not None:
@@ -3120,28 +3186,67 @@ class ViewerApp:
                   padx=14, pady=4, command=win.destroy).pack(side="right", padx=(0, 8))
 
     def _export_diag_zip(self, report_text):
-        """B2（第 134 条）：把脱敏配置 + 近两日日志 + 本报告打成 zip。"""
-        try:
-            logs_dir = os.path.join(data_dir(), "logs")
-            # 计划 §4.2.2：zip 统一落到 logs 目录，便于与支持者沟通固定路径
-            path = diag.build_report_zip(logs_dir, config=self.cfg,
-                                         logs_dir=logs_dir,
-                                         extra_text=report_text,
-                                         pid=os.getpid())
+        """B2（第 134 条）：把脱敏配置 + 近两日日志 + 本报告打成 zip。
+
+        ui-021（2026-09-20）：ui-008 的修复只做在共享端——`host_ui.py` 已把压缩放进
+        `diag-export` 工作线程并加了 `_diag_exporting` 重入守卫，该函数自己的注释就
+        写着理由（"主线程同步压缩，界面冻结数秒"）。观看端同一条链路旧写法仍由
+        Toplevel 按钮 command= 直接调用：`build_report_zip()` 在 Tk 主线程内读完
+        recent_log_files()（默认近 2 天）并整体 DEFLATE，期间 poll、面板刷新、
+        `_drain_ui_queue` 全停；症状是"点了没反应、界面卡几秒"而非报错。
+        另外 `data_dir()` 为 None 时旧写法会把 TypeError 转成"导出失败：expected str…"
+        这种无法排查的文案。
+        """
+        if getattr(self, "_diag_exporting", False):
+            messagebox.showinfo(APP_TITLE, "上一次诊断包仍在导出中，请稍候",
+                                parent=self.panel)
+            return
+        base_dir = data_dir()
+        if not base_dir:
+            messagebox.showwarning(APP_TITLE, "找不到可写的数据目录，无法导出诊断包",
+                                   parent=self.panel)
+            return
+        logs_dir = os.path.join(base_dir, "logs")
+        self._diag_exporting = True
+
+        def _done(path, err):
+            # 工作线程不得直接调 Tk：结果统一投回主线程（第 108 条口径）
+            def _apply():
+                self._diag_exporting = False
+                try:
+                    if err is not None:
+                        raise err
+                    try:
+                        self.panel.clipboard_clear()
+                        self.panel.clipboard_append(report_text)
+                    except Exception:
+                        pass
+                    messagebox.showinfo(
+                        "导出成功",
+                        "诊断包已保存到：\n%s\n\n配置中的 token/密码已自动脱敏；"
+                        "日志仍可能包含 IP、地址等信息，请只发给信任的支持者。" % path,
+                        parent=self.panel)
+                except Exception as e:
+                    log.warning("诊断包导出失败: %s", e)
+                    messagebox.showerror("导出失败", "诊断包导出失败：%s" % e,
+                                         parent=self.panel)
             try:
-                self.panel.clipboard_clear()
-                self.panel.clipboard_append(report_text)
+                self._post_ui(_apply)
             except Exception:
-                pass
-            messagebox.showinfo(
-                "导出成功",
-                "诊断包已保存到：\n%s\n\n配置中的 token/密码已自动脱敏；"
-                "日志仍可能包含 IP、地址等信息，请只发给信任的支持者。" % path,
-                parent=self.panel)
-        except Exception as e:
-            log.warning("诊断包导出失败: %s", e)
-            messagebox.showerror("导出失败", "诊断包导出失败：%s" % e,
-                                 parent=self.panel)
+                self._diag_exporting = False
+
+        def _work():
+            try:
+                path = diag.build_report_zip(logs_dir, config=self.cfg,
+                                             logs_dir=logs_dir,
+                                             extra_text=report_text,
+                                             pid=os.getpid())
+            except Exception as e:
+                _done(None, e)
+                return
+            _done(path, None)
+
+        threading.Thread(target=_work, name="diag-export", daemon=True).start()
 
     # ---------- 面板：设置项回调 ----------
 
@@ -3332,6 +3437,15 @@ class ViewerApp:
                 self._show_text(channel.auth_msg or "需要登录")
             else:
                 self._show_text("连接中…")
+            # ui-029（2026-09-20）：纯文字分支也要落账本轮看到的 serial。
+            # 旧实现只在 `_show_frame` 成功贴图时写 `_last_frame_serial`，而
+            # `_invalidate_media` 每次状态跃迁都额外 bump 一次 serial → 断线态下
+            # "序列号未变"早退条件恒不成立，A4 §3.2 设计的 15→33→50ms 空闲退避在
+            # "host 离线/正在重连"这一常态下完全失效，每 15ms 做两次
+            # `_update_status_overlay` 加多次跨线程取锁（host 关机后长期挂机可观测）。
+            self._last_frame_serial = serial
+            self._last_channel_idx = self.active_idx
+            self._last_channel_status = status
 
     def _refresh_overlay(self):
         """切换频道后立即刷新悬浮窗（不等待下一个 poll 周期）。"""
@@ -3382,6 +3496,12 @@ class ViewerApp:
             return
         self._last_status_text = text
         self.status_overlay.configure(text=text)
+        # ui-031（2026-09-20）：ui-014 只把宽度来源改成"含叠加行"，没改**触发条件**——
+        # 收帧态下这里改了文本却不调 _position_top_right，而 _show_frame 里的重排仍被
+        # size_key 缓存挡死（只有纯文字态才重排）。于是 display_width 拖到 160、
+        # 队友名或 P95 变长使叠加行宽于画面时，悬浮窗照旧被推出右缘且不再修正。
+        if not self.user_moved:
+            self._position_top_right()
 
     def _show_frame(self, frame_bgr, serial=None):
         """显示一帧 BGR 画面：转 RGB、等比缩放到 display_width。
@@ -3488,6 +3608,18 @@ class ViewerApp:
     def toggle_click_through(self):
         self.click_through = not self.click_through
         self.apply_click_through()
+        # ui-028（2026-09-20）：热键路径只改标志位与 win32 样式、从不回写面板的
+        # `_click_var`，于是勾选框停留在旧值——`_on_click_through` 以该 var 为准，
+        # 用户再点一次时 ttk 认为"值没变"，成为空操作。默认穿透为开启，按一次
+        # Ctrl+Alt+X 即可到达"界面显示已勾选、实际不穿透"的状态，而勾选框是唯一
+        # 可见的 GUI 入口。本方法两个调用点（右键菜单 / _post_ui 投递的热键）都在
+        # Tk 主线程，直接 set 即可。
+        var = getattr(self, "_click_var", None)
+        if var is not None:
+            try:
+                var.set(self.click_through)
+            except Exception:
+                pass          # 面板尚未建好/正在销毁
         self.cfg["viewer"]["click_through"] = self.click_through
         self._schedule_save()  # 第 64 条：去抖落盘，穿透切换的 win32 效果仍即时
         if self.click_through:

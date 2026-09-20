@@ -3251,6 +3251,15 @@ def _encode_static_keyframe(runtime, fe, last_frame, error_cooldown_until):
             runtime.force_key = True
         return error_cooldown_until
     nal, is_key, encode_ms, out_ts = res
+    if not is_key:
+        # codec-013（2026-09-20）：codec-004 给 share.py 加的这道门（强制 IDR 未生效、
+        # 编码器回了 P 帧时不发）host 侧一直缺——旧实现把 P 帧当作关键帧写进 slot 并
+        # 消费 force_key，等关键帧的订阅者收到的是 P 帧、门控不被满足，请求却已被消费。
+        # 《修复记录》第 4 节写的是"host.py、share.py 两处都改"，实际只改了 share 侧。
+        # 另注：两侧都从未校验缓存帧尺寸（尺寸不一致由 codec.py 的自动重建吸收）。
+        with runtime.slot_lock:
+            runtime.force_key = True      # 保留请求，下一帧再试（不消费）
+        return error_cooldown_until
     with runtime.slot_lock:
         runtime.slot["video"] = nal
         runtime.slot["video_ts"] = out_ts

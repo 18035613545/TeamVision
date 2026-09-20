@@ -258,7 +258,18 @@ class ScreenShareSession:
                 log.warning("频道[%s] 静止期强制 IDR 失败: %s", self._name, err)
                 return False
             if res is None:
-                return False
+                # codec-011（2026-09-20）：这里旧实现直接 `return False`，走不到函数
+                # 末尾"重发缓存帧"的分支。而 `force_idr` 返回 (None, None) 的可达形态
+                # 正是 `not self._encoder.available`（编码器 permafailed，且因为
+                # _encode_send 在采集恒 None 时不再被调用，它永不被丢弃）——默认
+                # dxgi 后端 + 静止检测关闭时画面静止期间 grab() 恒返回 None，就是常态。
+                # 结果：新接入的观众永远等不到 IDR，画面保持黑屏，直到共享端画面发生
+                # 变化；调用方按 codec-008 保留了 key_evt 空转重试，所以不丢请求，
+                # 只是永远等不到响应。缩放后的缓存帧其实在手，交给 JPEG 回退出帧。
+                if last_frame is None:
+                    return False
+                return self._encode_send(
+                    last_frame, int(time.time() * 1_000_000), force_key=False) is not None
             nal, is_key, _ms, out_ts = res
             if not is_key:
                 # codec-004 同款：强制 IDR 未生效（编码器返回 P 帧）时不发，保留请求重试
