@@ -38,8 +38,8 @@
 | `frpc.exe` | 第三方 frp 客户端（**自行从所选隧道服务下载**，放在两个程序目录的上一级；不使用穿透可删除） |
 | `config.json` | 配置文件（`%LOCALAPPDATA%\TeamVision\`，首次运行自动生成；源码运行时在项目目录） |
 | `accounts.json` | 账户表（同目录，PBKDF2 加盐存储，不含明文密码） |
-| `logs\` | 日志目录（`app_YYYYMMDD.log`，5MB 滚动 × 5 份） |
-| `assets\app.ico` / `assets\splash.png` | 图标与启动画面（安装包自带；splash 缺失时降级为纯文字） |
+| `logs\` | 日志目录（`app_YYYYMMDD_pid<N>.log`，host 与 viewer 各带自身 PID 以免争用同一文件；5MB 滚动 × 5 份） |
+| `assets\app.ico` | 程序图标（随安装包写入 `{app}\assets`，供快捷方式与卸载图标用）；启动画面 `splash.png` 由打包内嵌进 exe（`sys._MEIPASS/assets`），安装目录内不再单独出该文件（内嵌缺失时降级为纯文字） |
 
 **系统要求**：Windows 10/11 64 位。观看端无需安装任何环境。
 
@@ -123,7 +123,7 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 | `auth.auth_timeout` | `240` | 认证阶段总时限（秒），代码有 240 秒下界，改小会被自动抬高 |
 | `auth.chal_response` | `require` | 认证方式：`require`=挑战-应答（口令不过网，1.4.0 起默认）/ `allow_legacy`=临时允许旧版观看端直发口令（每条都记 WARNING）。仅建议作为升级过渡，一个版本周期后移除 |
 | `frp.*` | — | 外部 frpc 拉起参数（`auto_start`/`frpc_path`/`token`/`tunnel_ids`/`public_addr`），示例性质、维持现状；token 写日志时自动打码，勿外发 `config.json` |
-| `update_check.enabled` | `true` | 更新提示（共享端与观看端共用）：启动后查一次 GitHub Releases 最新 tag，比当前版本新时在状态栏提示，结果缓存 24h、失败静默；**不做自动更新**，不想外连可置 `false` |
+| `update_check.enabled` | `false` | 更新提示（共享端与观看端共用）：启动后查一次 GitHub Releases 最新 tag，比当前版本新时在状态栏提示，结果缓存 24h、失败静默；**不做自动更新**。**默认关闭**（dist-004：开启即每 24h 向 api.github.com 暴露使用者 IP），需要更新提示时在共享端控制台勾选或手改本键为 `true` |
 | `config_version` | `2` | 配置结构版本（程序维护，请勿手改） |
 
 > GUI「传输参数」区可直接改 `listen_host`、`auth.enabled`、`auth.allow_register`、`fps`、
@@ -133,7 +133,7 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 
 ### 5.2 从 1.3.0 及更早版本升级
 
-旧配置里如果显式写着 `listen_host: 0.0.0.0` 且 `auth.enabled: false`，首次启动会**自动**升级为
+旧配置里如果显式写着 `listen_host: 0.0.0.0` **或** `auth.enabled: false`（两者是各自独立判定的条件，任一命中即迁移对应字段），首次启动会**自动**升级为
 `127.0.0.1` + 准入开启，并在日志里逐条列出改动。迁移只做一次（写回 `config_version: 2`），
 只动这两个安全相关字段；`fps`、`capture.*`、`codec.*`、频道列表等原样保留；
 自定义监听地址（如 `192.168.1.5`）不会被改写。想恢复旧行为：「传输参数」里改回并重新应用。
@@ -159,7 +159,7 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 ## 6. 快速排障
 
 > 用户向「现象 → 处理」速查表已下沉到 [`faq.md`](faq.md)；本节保留需要看日志/改配置的深度排障。
-> 排查入口：共享端 `%LOCALAPPDATA%\TeamVision\logs\app_当天日期.log`（GUI「日志区」实时可见）。
+> 排查入口：共享端 `%LOCALAPPDATA%\TeamVision\logs\app_当天日期_pid<进程号>.log`（GUI「日志区」实时可见）。
 
 ### 6.1 连接与画面
 
@@ -193,8 +193,8 @@ https://console.natfrp.com ）。隧道只需满足一条：**远端端口 → �
 
 ## 7. 日志与诊断指引
 
-- **共享端日志**：`%LOCALAPPDATA%\TeamVision\logs\app_YYYYMMDD.log`（源码运行时在项目目录），包含性能统计、客户端接入/断开、带宽与淘汰记录、frpc 输出（token 已打码），以及启动时的暴露面提示（监听全网卡 / 准入关闭 / 自助注册开放都会写 WARNING）。
-- **共享端 GUI**：控制台「性能区」（采集/发送 fps、编码耗时、质量、缩放）与「客户端列表」（每客户端实时 KB/s、累计流量）即为在线诊断面板；「一键诊断」导出诊断包（自动打码 token/密码）。
+- **共享端日志**：`%LOCALAPPDATA%\TeamVision\logs\app_YYYYMMDD_pid<N>.log`（源码运行时在项目目录），包含性能统计、客户端接入/断开、带宽与淘汰记录、frpc 输出（token 已打码），以及启动时的暴露面提示（监听全网卡 / 准入关闭 / 自助注册开放都会写 WARNING）。
+- **共享端 GUI**：控制台「性能区」（采集/发送 fps、编码耗时、质量、缩放）与「客户端列表」（每客户端实时 KB/s、累计流量）即为在线诊断面板；「导出诊断包」按钮导出诊断包（自动打码 token/密码）。
 - **观看端诊断**：面板导出的诊断包含各频道**延迟 P50/P95**（30 秒窗口，E4 埋点）；跨机墙钟不完全同步，延迟读数**以相对趋势为主**，绝对值参考 RTT/2。
 - **快速验证链路**：
   1. 局域网内观看端连 `共享端IP:5700` —— 不通则检查防火墙/服务状态。
