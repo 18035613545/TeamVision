@@ -756,7 +756,12 @@ def parse_addr(addr_str, default_port=5700):
         # 惰性导入：ipaddress 是纯 Python 标准库，只在多冒号分支才需要。
         host_part, sep, port_part = addr_str.rpartition(":")
         if sep and port_part.isdigit() and _is_ipv6_literal(host_part):
-            return host_part, int(port_part)
+            port = int(port_part)
+            # 与其余分支同一口径校验范围：漏掉这步会让 `::1:0` / `::1:99999` 静默
+            # 返回一个不可能连通的端口（其它形态同样输入都会抛 ValueError）。
+            if not (1 <= port <= 65535):
+                raise ValueError("端口超出范围 1~65535: %d" % port)
+            return host_part, port
         return addr_str, default_port
     if ":" in addr_str:
         host, port_str = addr_str.rsplit(":", 1)
