@@ -726,18 +726,20 @@ class Channel:
         ts_last = int(batch[-1][0])
         d = now_m - ts_last / 1e6          # 含固定钟差，但下面只用它的**差值**
         base = getattr(self, "_lag_base_d", None)
-        if base is None:
-            self._lag_base_d = d
-            self._lag_base_at = now_m
-            return False, ""
-        if (now_m - getattr(self, "_lag_base_at", 0.0) > self._LAG_BASELINE_RENEW_S
+        # 基线更新：时延变小 = 出现了"最优链路"；另外周期性重估，防对端钟被 NTP
+        # 往回校导致基线永久偏低。
+        # 注意（本函数最初的实现过错）：**不能**在更新基线后直接 return —— 积压突发
+        # 时采集侧时间戳一口气追上来，d 恰恰会**骤降**，于是"变小即返回"把判据②
+        # 整条遮住，等于又造了一个 net-035 式的死区。这里只把 extra_s 归零，
+        # 让两条判据每次都评估。
+        if (base is None
+                or now_m - getattr(self, "_lag_base_at", 0.0) > self._LAG_BASELINE_RENEW_S
                 or d < base):
-            # 时延变小 = 新的"最优链路"，作为基线；另外周期性重估，防对端钟被 NTP
-            # 往回校导致基线永久偏低。
             self._lag_base_d = d
             self._lag_base_at = now_m
-            return False, ""
-        extra_s = d - base
+            extra_s = 0.0
+        else:
+            extra_s = d - base
         if extra_s > self._BACKLOG_LAG_US / 1e6:
             return True, "时延比基线多 %.1f 秒" % extra_s
         if len(batch) >= 2:
