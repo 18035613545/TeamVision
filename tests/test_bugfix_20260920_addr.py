@@ -20,13 +20,15 @@ mutation 实测（本轮判定标准，纯函数允许在 %TEMP% 上跑变异体
   1) 把 net-028 分支改回 `return addr_str, default_port`（去掉 rpartition 判定）
      → test_bare_ipv6_with_port_splits 期望 ('::1', 5700) 实得 ('::1:5700', 5700) → **红**；
   2) 删掉 net-027 的 `if not host: raise` → test_empty_host_rejected 收到 ('', 5700) → **红**；
-  3) 把 net-018 分支改回无条件 rsplit → test_bare_ipv6_without_port_takes_default
-     期望 ('::1', 5700) 实得 ('::', 1) → **红**。
-三条变异体已在 %TEMP% 用 importlib 实跑复核，结果见本轮报告。
+  3) 把 net-018 分支改回无条件 rsplit（`if addr_str.count(":") >= 2:` → `if False:`）
+     → test_bare_ipv6_without_port_takes_default 期望 ('::1', 5700) 实得 (':', 1) → **红**；
+  4) 删掉 net-028 新分支里的端口范围校验（63ae92d 补上的那条）
+     → test_bare_ipv6_port_range_is_validated 收到 ('::1', 99999) → **红**。
+四条变异体已在 %TEMP% 用 importlib 实跑复核（脚本 `tv_mutate_check_20260920.py`，
+不在回归套件内），四条全部转红；未变异的基线同批断言全绿。
 
-附带口径缺口（**不在此断言**，避免把缺陷钉成契约，交第 7 轮处理）：
-`::1:99999` / `::1:0` 经 net-028 新分支时未过 `1 <= port <= 65535` 检查，
-仍返回 ('::1', 99999)；其它分支都会抛 ValueError。
+（第 6 轮补测时曾发现"新分支不校验端口范围"的口径缺口，已由 63ae92d 修掉，
+本文件把修好后的口径一起钉住。）
 """
 import os
 import sys
@@ -72,6 +74,18 @@ class TestBareIpv6Forms(unittest.TestCase):
         （缺一段），必须整体作主机，不能被"末段是数字"这一半条件骗走。
         """
         self.assertEqual(parse_addr("1:2:3:4:5:6:7:8"), ("1:2:3:4:5:6:7:8", P))
+
+    def test_bare_ipv6_port_range_is_validated(self):
+        """net-028 的新分支同样要过 1~65535：否则 `::1:99999` 静默返回不可连通端口。
+
+        这一条由第 6 轮补测发现缺口后在 63ae92d 补上——删掉那句范围校验，本用例即红
+        （实测：变异体返回 ('::1', 99999) 不抛）。
+        """
+        for bad in ("::1:0", "::1:99999", "::1:70000"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    parse_addr(bad)
+        self.assertEqual(parse_addr("::1:65535"), ("::1", 65535))
 
 
 class TestBracketedIpv6Forms(unittest.TestCase):

@@ -109,7 +109,7 @@ class TestMalformedChallengeShapes(unittest.TestCase):
 
     def test_unusable_iter_types_are_rejected_as_malformed(self):
         """类型层面就无法转成 int 的 iter：一律归到"格式非法"，不得逃逸。"""
-        for bad in ("abc", float("nan"), [1, 2], {"x": 1}, 3.5 + 1e308):
+        for bad in ("abc", float("nan"), [1, 2], {"x": 1}, "100000abc"):
             with self.subTest(bad=bad):
                 result = self._answer(_chal(iter=bad))
                 self.assertEqual(result.get("msg"), "挑战消息格式非法",
@@ -227,12 +227,13 @@ class TestDeriveIsNeverReached(unittest.TestCase):
                                  "校验漏在 derive_dk 之后：对端可控参数已进 KDF（爆破 oracle）")
 
     def test_valid_shape_calls_derive_with_local_iterations(self):
-        chal = _chal()
-        out, calls = self._answer_with_spy(chal)
+        out, calls = self._answer_with_spy(
+            _chal(), {"action": common.Act.AUTH_RESULT, "ok": True})
         self.assertEqual(len(calls), 1, "合法挑战应恰好派生一次 dk")
         self.assertEqual(calls[0], (SALT, common.PBKDF2_ITERATIONS),
                          "派生参数不是本地常量（iter 被对端左右的形态回来了）")
         self.assertNotIn("格式非法", str(out.get("msg", "")))
+        self.assertTrue(out.get("ok"))
 
 
 class TestOldCatchShapeEscapes(unittest.TestCase):
