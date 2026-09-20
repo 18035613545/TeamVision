@@ -396,6 +396,7 @@ class D1AccountManagerApi(unittest.TestCase):
             self.assertIn("u3", host.AccountManager()._users)
 
     def test_challenge_for_and_verify_proof(self):
+        started = time.time()
         salt = os.urandom(16).hex()
         dk = derive_dk(PW, salt, PBKDF2_ITERATIONS)
         self.assertTrue(self.mgr.register_derived("alice", salt, dk.hex())[0])
@@ -406,8 +407,13 @@ class D1AccountManagerApi(unittest.TestCase):
         ok, msg = self.mgr.verify_login_proof("alice", nonce,
                                               challenge_mac(dk, nonce, "alice"))
         self.assertTrue(ok, msg)
-        self.assertEqual(self.mgr._users["alice"].get("last_login"),
-                         time.strftime("%Y-%m-%d %H:%M:%S"))
+        # T-13（2026-09-20）：旧断言把 last_login 与 `time.strftime(...)` 做**秒级墙钟
+        # 字符串相等**比较——写入与读取跨秒即偶发红（flaky）。改为解析成时间戳、
+        # 只要求落在本次调用前后的合理窗口内。
+        recorded = self.mgr._users["alice"].get("last_login")
+        parsed = time.mktime(time.strptime(recorded, "%Y-%m-%d %H:%M:%S"))
+        self.assertGreaterEqual(parsed, started - 2.0)
+        self.assertLessEqual(parsed, time.mktime(time.localtime()) + 2.0)
         ok, msg = self.mgr.verify_login_proof("alice", nonce,
                                               challenge_mac(os.urandom(32), nonce,
                                                             "alice"))
