@@ -35,7 +35,7 @@
   把 proof 绑定 user + 域分隔串，协议再升到 **v2.3**（`common.py` `PROTOCOL_VERSION=(2,3)`、
   `PROTO_CHAL_MIN_MINOR=3`，挑战-应答只与次版本 ≥3 的对端互通）。
 - UI 基建收拢到 `ui_common.py`（异常钩子/色板/ttk 风格单一来源，C3）。
-- CI（GitHub Actions 单测回归）+ ruff/mypy 基线（核心三文件），测试 595 项。
+- CI（GitHub Actions 单测回归）+ ruff/mypy 基线（核心三文件），测试 700+ 项（精确项数以 run_tests.bat 输出为准，避免这类计数漂移）。
 - 审计编号体系切换：新条目改用 `模块-序号`（docs/audit/，C5）。
 
 ## [1.3.0] - 2026-09-11（tag v1.3.0 = dab6e5a）

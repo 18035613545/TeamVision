@@ -14,11 +14,11 @@ T-02｜net-015/net-030 只锁了泵侧契约，真实 host._client_recv_loop 的
 T-03｜auth-002 只有常量断言，iter/salt 校验与观看端三条拒登分支无用例（"中间人回 iter=1"从未模拟）｜tests/test_bugfix_20260920_t03_challenge.py
 T-04｜auth-010 的替身只提供 count()，命中生产代码专为替身保留的 except AttributeError——测试反向要求实现保留漏洞｜tests/test_item131_hardening.py（退化分支已删、替身显式提供 bootstrap_used()，并补"删空账户后窗口不重开"用例）
 T-05｜ui-002 的 _invalidate_media 与三处状态跃迁在 tests/ 中零调用，_show_text 被 lambda 吃掉｜tests/test_bugfix_20260920_t05_viewer.py
-T-06｜ui-020 登记的 test_startup_order.py 只锁"顶层不 import 重依赖"，与 DPI 声明顺序无关；全仓 tests 无 enable_dpi_awareness 引用｜—（补测在途）
-T-07｜auth-011 的用例从 challenge_for 取回 iter 再派生，实现若仍继承旧 iter 两侧同值 → 改前改后都绿｜—
-T-08｜auth-012/ui-008 的测试配置只含精确键、test_logs_included 不带 pid 调用、_post_ui 被改成同步执行，绕开被修代码｜—（补测在途）
-T-09｜dist-005/006/007 的用例全部显式传 cache_path，临时名与 data_dir 为 None 分支永不执行；失败留痕只 assertIsNone｜—
-T-10｜codec-002~008 登记为「—」且 set_fps 失败路径/多包合并/is_key 门禁/码率迟滞/键帧回话零回归｜—（codec-009 的登记失真已随 cfg-009 更正为 tests/test_item97_stop_race.py）
-T-11｜auth-009 的跨进程锁与 cfg-001~003、net-016/017、ui-003~019 整体缺覆盖；_file_lock/_read_disk 在 tests/ 内零引用｜—（cfg-004 重做后的双真进程竞争用例在补测批次中，报告明确警告用 mock 替换会再次假绿）
+T-06｜ui-020 登记的 test_startup_order.py 只锁"顶层不 import 重依赖"，与 DPI 声明顺序无关；全仓 tests 无 enable_dpi_awareness 引用｜tests/test_bugfix_20260920_t06_selfcheck.py（含 enable_dpi_awareness 先于首个 tk.Tk() 的 AST 顺序锁 + 自检线程真跑一次）
+T-07｜auth-011 的用例从 challenge_for 取回 iter 再派生，实现若仍继承旧 iter 两侧同值 → 改前改后都绿｜tests/test_bugfix_20260920_t07_t09_t10.py（直接断言改密后落库 iter == PBKDF2_ITERATIONS + 缺陷形态负向对照）
+T-08｜auth-012/ui-008 的测试配置只含精确键、test_logs_included 不带 pid 调用、_post_ui 被改成同步执行，绕开被修代码｜tests/test_bugfix_20260920_dist014.py（替身不再静默吞 pid + 显式钉两个生产调用点传 os.getpid() + 包含式脱敏键断言）
+T-09｜dist-005/006/007 的用例全部显式传 cache_path，临时名与 data_dir 为 None 分支永不执行；失败留痕只 assertIsNone｜tests/test_bugfix_20260920_t07_t09_t10.py（checked_at 在未来仍须重取、data_dir 为 None 不触网、INFO 留痕、写失败不留 .tmp）
+T-10｜codec-002~008 登记为「—」且 set_fps 失败路径/多包合并/is_key 门禁/码率迟滞/键帧回话零回归｜tests/test_bugfix_20260920_t07_t09_t10.py（codec-012 回滚与重试、codec-013 host 侧 is_key 门禁）；codec-009 的登记失真已随 cfg-009 更正为 tests/test_item97_stop_race.py；多包合并/码率迟滞仍属第 5 轮遗留的 —
+T-11｜auth-009 的跨进程锁与 cfg-001~003、net-016/017、ui-003~019 整体缺覆盖；_file_lock/_read_disk 在 tests/ 内零引用｜tests/test_bugfix_20260920_cfg004_lock.py（两个真实进程竞争同一 config.json，按报告要求不用 mock）；net-016/017 与 ui-003~019 的其余部分仍为 —，属元条目、随后续批次补
 T-12｜初稿"ui-011 的桩钉不住修复"方向写反，报告已整条撤销；仅保留成立部分——_prompt_blocked_until 的**赋值侧**用哪个时钟无断言｜—（不计为待修项）
 T-13｜test_d1_challenge_auth.py 的 last_login 与秒级墙钟字符串相等比较，跨秒偶发红（flaky）｜tests/test_d1_challenge_auth.py（已改为把记录值解析成时间戳、只要求落在本次调用前后的合理窗口内）
