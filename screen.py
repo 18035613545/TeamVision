@@ -161,6 +161,15 @@ class CaptureManager:
         self._open()
 
     def _open(self):
+        # capture-006（2026-09-20）：vendor/ 接入 sys.path 必须**早于**任何 dxcam 导入。
+        # 旧实现把 ensure_vendor_on_path() 放在下面的 dxcam.create 之前（182 行），
+        # 而 _pick_output_idx()（174 行）内部就有 `import dxcam`——源码运行环境下
+        # dxcam 只存在于 vendor/，那次导入抛 ModuleNotFoundError 被 314 行的
+        # `except Exception → log.debug` 静默吞掉，capture-004 的"按几何匹配 DXGI 输出"
+        # 在第一个采集会话内等于不存在，直接退回 `(0, monitor-1)` 的旧口径；
+        # 直到发生一次自愈重建（再次 _open，此时 sys.path 已被改过）才生效——
+        # 同一份配置在故障恢复前后采到不同显示器。打包形态不受影响（dxcam 在 _MEIPASS 可直接导入）。
+        ensure_vendor_on_path()   # B7：源码运行时 vendor/ 需显式接入 sys.path
         # capture-003/004（2026-09-18）：mss 句柄在两种后端下都先打开——dxgi 的区域
         # 换算（虚拟桌面绝对坐标 → 显示器内相对坐标）与"全部屏幕/几何不匹配"回退
         # 都需要 mss 的显示器几何；mss 初始化失败只是失去回退能力，不影响 dxgi。
@@ -179,7 +188,6 @@ class CaptureManager:
                 return
             device_idx, output_idx = out
             try:
-                ensure_vendor_on_path()   # B7：源码运行时 vendor/ 需显式接入 sys.path
                 import dxcam  # 延迟导入：可选依赖，未安装时回退 mss
                 # 第 100 条：dxcam 的 output_color 默认是 "RGB"，其处理器做的是
                 # COLOR_BGRA2RGB，即 grab() 返回 RGB 数组；而本程序全链路（JPEG
@@ -312,7 +320,14 @@ class CaptureManager:
                                         self.monitor)
                         return targets[0]
             except Exception as e:
-                log.debug("dxcam 输出枚举失败，按序号回退: %s", e)
+                # capture-006（2026-09-20）：旧口径是 log.debug——默认日志级别下等于
+                # 静默，"按几何匹配显示器"整条路径失效却查不到线索。首次失败提为
+                # WARNING（一次性的，避免每次重建都刷一条）。
+                if not getattr(self, "_pick_warned", False):
+                    self._pick_warned = True
+                    log.warning("dxcam 输出枚举失败，按序号回退（capture-006，只报一次）: %s", e)
+                else:
+                    log.debug("dxcam 输出枚举失败，按序号回退: %s", e)
         # 几何匹配不可用（dxcam 内部结构变化等）：退回"序号-1"的旧口径，
         # 设备取默认 0（不改变历史行为）
         return (0, self.monitor - 1)

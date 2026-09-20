@@ -21,7 +21,7 @@ import ui_common
 import update_check
 from common import (
     APP_NAME, APP_VERSION, DEFAULT_CONFIG, data_dir, save_config, register_policy,
-    REGISTER_POLICIES,
+    REGISTER_POLICIES, safe_int,
 )
 
 #: ui-007：监听地址非法值兜底——与 DEFAULT_CONFIG/配置迁移/界面文案同源，避免漂移
@@ -222,13 +222,21 @@ class HostConsole:
         # ---------- 传输参数区 ----------
         trans_card = self._card(self.root, "传输参数")
         host_cfg = self._host_cfg()
-        self._fps_var = tk.StringVar(value=str(host_cfg.get("fps", 60)))
-        self._quality_var = tk.StringVar(value=str(host_cfg.get("jpeg_quality", 80)))
-        self._scale_var = tk.StringVar(value=str(host_cfg.get("scale", 1.0)))
+        # D-12（2026-09-20）：界面兜底值必须与 DEFAULT_CONFIG 同源，不能各写一份字面量。
+        # 旧写法 fps 兜底 60（默认 30）、auth.enabled 兜底 False（默认 True），
+        # 缺键时面板显示 60fps/准入关，用户点一次"应用传输设置"就把这两个兜底值
+        # 固化写回配置——README.md 承诺的"DEFAULT_CONFIG 为单一真源"在此不成立。
+        _DEF_HOST = DEFAULT_CONFIG["host"]
+        self._fps_var = tk.StringVar(value=str(host_cfg.get("fps", _DEF_HOST.get("fps", 30))))
+        self._quality_var = tk.StringVar(
+            value=str(host_cfg.get("jpeg_quality", _DEF_HOST.get("jpeg_quality", 80))))
+        self._scale_var = tk.StringVar(
+            value=str(host_cfg.get("scale", _DEF_HOST.get("scale", 1.0))))
         self._adaptive_var = tk.BooleanVar(
             value=bool(self._section(host_cfg, "perf").get("adaptive", True)))
+        # auth-022 同族：安全开关的兜底取向 fail-closed（与 host._do_auth 一致）
         self._auth_var = tk.BooleanVar(
-            value=bool(self._section(host_cfg, "auth").get("enabled", False)))
+            value=bool(self._section(host_cfg, "auth").get("enabled", True)))
         # 监听地址：空/0.0.0.0/:: 同为「全网卡」；默认 127.0.0.1 只允许本机与 frp 隧道
         # ui-007：非法值兜底必须先与 DEFAULT_CONFIG / 配置迁移 / 界面文案（127.0.0.1=默认）
         # 一致——旧实现回退 "0.0.0.0"，用户一点"应用"就把全网卡监听固化进配置，
@@ -238,7 +246,7 @@ class HostConsole:
             raw_listen = DEFAULT_LISTEN_HOST
         self._listen_var = tk.StringVar(value=raw_listen.strip())
         self._reg_var = tk.StringVar(
-            value=REGISTER_LABELS[register_policy(host_cfg.get("auth", {}))])
+            value=REGISTER_LABELS[register_policy(self._section(host_cfg, "auth"))])
         self._entry(trans_card, "监听地址", self._listen_var)
         tk.Label(trans_card,
                  text="127.0.0.1=仅本机与 frp 隧道可连（默认）；0.0.0.0=允许局域网直连",
@@ -301,7 +309,15 @@ class HostConsole:
         row.pack(fill="x", padx=10, pady=2)
         tk.Label(row, text="显示器", width=14, bg=COL_CARD, fg=COL_DIM,
                  font=("Microsoft YaHei", 9)).pack(side="left")
-        self._monitor_var = tk.StringVar(value=self._monitor_label(cap.get("monitor", 1)))
+        self._monitor_var = tk.StringVar(
+            value=self._monitor_label(
+                # ui-030（2026-09-20）：`"monitor": "1"` 这类字符串配置真实存在
+                # （share.py 当年就是为它改用 safe_int 的）。旧写法把原值直接传给
+                # _monitor_label，其中 `s.startswith("%d:" % idx)` 对字符串抛
+                # TypeError → HostConsole.__init__ 无兜底 → host.py 的 main 捕获后
+                # gui=None，而 fps-host.spec 是 console=False，回退分支不留任何窗口：
+                # 用户看到"双击 exe 之后完全没有界面、进程在后台静默跑"，真因只在日志里。
+                safe_int(cap.get("monitor", 1), 1, lo=1, warn=False)))
         ttk.Combobox(row, textvariable=self._monitor_var, values=self.monitors,
                      state="readonly", width=34).pack(side="left")
         self._region_var = tk.StringVar(value=self._region_text(cap.get("region")))
@@ -667,7 +683,7 @@ class HostConsole:
                 # 说明（策略读取失败时仅显示原提示）。
                 extra = ""
                 try:
-                    if register_policy(self._host_cfg().get("auth", {})) == "bootstrap":
+                    if register_policy(self._section(self._host_cfg(), "auth")) == "bootstrap":
                         extra = "\n（bootstrap 策略下自助注册窗口不会重开，之后需在共享端添加账户）"
                 except Exception:
                     extra = ""

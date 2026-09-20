@@ -111,8 +111,11 @@ class FrameEncoder:
             self._drop_encoder()   # 编码器失效（如 GPU 驱动错误）：下次重建/回退
         if self._encoder is not None:
             if fps is not None and fps != self._enc_fps:
-                self._encoder.set_fps(fps)   # 帧率档变化重建
-                self._enc_fps = fps
+                # codec-012（2026-09-20）：旧实现无条件 `self._enc_fps = fps`，而
+                # set_fps 构造失败时会回滚自己的 _fps —— 两侧于是各存一份"已生效"的
+                # 假账，这一档再也不被重试。改为按返回值落账。
+                if self._encoder.set_fps(fps):
+                    self._enc_fps = fps   # 帧率档变化重建
             # codec-006（2026-09-18）：码率参数不能静默忽略——旧实现把 bitrate 记进
             # self._bitrate 就完事，已存在的编码器只在"下次重建"时才采用，调用方
             # （配置热更等）以为已生效。带 ±15% 迟滞，重复同值调用只做一次比较。

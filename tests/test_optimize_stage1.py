@@ -258,6 +258,12 @@ def _run_client(host_cfg, client_magic=b"FS02", settle=0.4):
     """
     server_sock, client_sock = socket.socketpair()
     rt = mock.MagicMock()
+    # auth-022（2026-09-20）：`host.auth` 缺失/非字典时的兜底取向已从 fail-open
+    # 改为 fail-closed（准入开启），与本文件其余用例"默认不测准入"的前提不符。
+    # 这里显式声明"本用例关闭准入"，而不是把实现的兜底方向改回去——意图写进夹具，
+    # 不再依赖"缺键时静默不鉴权"这一正是 auth-022 要消灭的行为。
+    if isinstance(host_cfg, dict) and "auth" not in host_cfg:
+        host_cfg = dict(host_cfg, auth={"enabled": False})
     rt.cfg = {"host": host_cfg}
     rt.clients = {}
     rt.clients_lock = threading.RLock()
@@ -305,16 +311,24 @@ class TestHandleClientConfigRobustness(unittest.TestCase):
         th, server_sock, client_sock, rt, reply = _run_client("not-a-dict")
         try:
             self.assertEqual(reply, b"OK02")
-            self.assertEqual(len(rt.clients), 1)
+            # auth-022（2026-09-20）：本用例断言的是"坏 host 节不杀连接"（握手完成、
+            # 不抛异常、socket 不泄漏）。旧实现顺带把客户端放行入账，是因为
+            # `host` 非字典时 auth 兜底成 fail-open；现在兜底方向改为 fail-closed，
+            # 未鉴权的对端**不该**入册——放行才是要修的缺陷。
+            self.assertEqual(len(rt.clients), 0)
         finally:
             _finish(th, server_sock, client_sock, rt)
 
-    def test_auth_not_dict_treated_as_disabled(self):
+    def test_auth_not_dict_fail_closed_requires_login(self):
+        # auth-022（2026-09-20）：旧实现把非字典的 host.auth 归一为 {} 后
+        # `get("enabled", False)` → 一条坏配置就让准入**静默关闭**，而同一份配置下
+        # register_policy 按缺键取默认 "open"，两道安全开关一起失效。
+        # 现按 fail-closed 处理：握手仍完成（不杀连接），但未鉴权的对端不入册。
         th, server_sock, client_sock, rt, reply = _run_client(
             {"net": {}, "auth": "not-a-dict"})
         try:
             self.assertEqual(reply, b"OK02")
-            self.assertEqual(len(rt.clients), 1)
+            self.assertEqual(len(rt.clients), 0)     # 未被静默放行
         finally:
             _finish(th, server_sock, client_sock, rt)
 

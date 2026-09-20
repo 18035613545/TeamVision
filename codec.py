@@ -261,22 +261,33 @@ class VideoEncoder:
         在锁内 `_recreate`（`keep_old_on_failure=False`），编码线程要停等一次 NVENC
         拆装（约 100ms），且新上下文建不出来时连原本可用的旧编码器也一起拆掉
         （自毁后只能回退 JPEG，直到下次成功重建）。
+
+        codec-012（2026-09-20）：codec-002 留的尾巴在失败路径——旧实现先把
+        `self._fps = fps` 提交，再锁外构造；构造失败直接 return，而同一 fps 从此
+        命中开头的 `fps == self._fps` 提前返回，于是 274 行"下次再试"的注释与实现
+        相反：该帧率档**永不重试**。同时调用方 pipeline.py 不看返回值、无条件把
+        新值记进 `_enc_fps`，两侧各自存一份"已生效"的假账。
+        现在失败即回滚 `self._fps`，并返回是否生效供调用方落账。
         """
         fps = max(1, int(fps))
         with self._lock:
             if self._closed or self._permafailed or fps == self._fps:
-                return
+                return fps == self._fps
+            prev_fps = self._fps
             self._fps = fps
             bitrate = self._last_bitrate
             names = self._pick_encoder()
         ctx, name = self._create_ctx_with(names, bitrate)
         if ctx is None:
-            return                      # 保留旧上下文继续出帧；帧率不生效，下次再试
+            with self._lock:
+                self._fps = prev_fps    # codec-012：回滚，让下一帧仍会重试这一档
+            return False                # 保留旧上下文继续出帧；帧率未生效
         with self._lock:
             if self._closed or self._permafailed:
                 self._retire_ctx(ctx)
-                return
+                return False
             self._install_ctx(ctx, name, bitrate)
+            return True
 
     def encode(self, bgr, raw_ts=None, force_key=False):
         """编码一帧 BGR 图像（线程安全：与 set_bitrate/set_fps 串行执行）。

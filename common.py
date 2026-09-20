@@ -712,8 +712,19 @@ def parse_addr(addr_str, default_port=5700):
             raise ValueError("端口超出范围 1~65535: %d" % port)
         return host, port
     if addr_str.count(":") >= 2:
-        # 裸 IPv6（无方括号、无端口）：整串都是主机，用默认端口——
-        # 旧实现 rsplit 后把最后一段当端口（`::1` → 端口 1）
+        # net-018（2026-09-18）的初衷：裸 IPv6（无方括号、无端口）整串都是主机，
+        # 旧实现 rsplit 后把最后一段当端口（`::1` → 端口 1）。
+        # net-028（2026-09-20）：但"整串作主机"无条件下放把另一种原本可用的写法改坏了——
+        # `::1:5700`（裸 IPv6 + 端口，A0 双栈回环下 frpc 回连的常见手写形式）被整串当
+        # 主机名返回 ('::1:5700', 5700)。更隐蔽的是 Windows 的 getaddrinfo 不会报错，
+        # 而是把这串曲解成 `::0.1.87.0` 之类的地址，比"连不上"更难查。
+        # 收口：末段是合法端口、且**去掉末段后剩余部分本身是合法 IPv6** 时按 host:port
+        # 拆分；否则维持 net-018 的"整串作主机"。用 ipaddress 判定而非数冒号，
+        # 才能把 `::1`（末段"1"看着像端口、前缀":"却不合法）与 `::1:5700` 分开。
+        # 惰性导入：ipaddress 是纯 Python 标准库，只在多冒号分支才需要。
+        host_part, sep, port_part = addr_str.rpartition(":")
+        if sep and port_part.isdigit() and _is_ipv6_literal(host_part):
+            return host_part, int(port_part)
         return addr_str, default_port
     if ":" in addr_str:
         host, port_str = addr_str.rsplit(":", 1)
@@ -727,16 +738,67 @@ def parse_addr(addr_str, default_port=5700):
             raise ValueError("端口无效: %s" % port_str) from None
         if not (1 <= port <= 65535):
             raise ValueError("端口超出范围 1~65535: %d" % port)
+        # net-027（2026-09-20）：`:5700` 这类"冒号前为空"的输入旧实现直接返回
+        # ('', 5700)。它是第 94 条地址校验的口径缺口（net-018 之前就存在，实测复刻
+        # 旧实现同样返回空主机），不是 IPv6 改造带进来的。空主机经
+        # socket.create_connection(('',5700)) → getaddrinfo('', …) 会解析到本机链路
+        # IPv6（fe80::…），表现为观看端每轮重连白等 10 秒再进入无限退避。
+        if not host:
+            raise ValueError("地址缺少主机: %s" % addr_str)
         return host, port
     return addr_str, default_port
 
 
-def safe_int(value, default, lo=None, hi=None, warn=True):
-    """把配置值安全转为 int：非法（字符串/None/布尔/超出范围）时回退 default。
+def _is_ipv6_literal(text):
+    """text 是否是一个合法的 IPv6 字面量（用于 parse_addr 的无括号形式判定）。"""
+    if ":" not in text:
+        return False
+    try:
+        import ipaddress
+        ipaddress.IPv6Address(text.strip().split("%")[0])
+        return True
+    except Exception:
+        return False
+
+
+def cfg_section(cfg, key, default=None):
+    """取配置里「应为字典」的节；缺失或值不是字典时回退 default（缺省 {}）并告警。
+
+    ui-022 / ui-030 / auth-022（2026-09-20）同族收口：旧写法一律是
+    `cfg["host"].get("frp", {})`，它只挡了"键不存在"、挡不住"值不是字典"——
+    手改 config.json 把某节写成 `false` / `0` / `""` / `[]` 后，
+    `.get("frp", {}).get("public_addr")` 直接 AttributeError。`_deep_merge` 只在
+    "双方都是字典"时才递归合并，非字典的非 None 值会原样覆盖默认字典（1004 行），
+    所以合并后确实可能不是字典。
+    `load_config` 已加了加载期类型校验（见 _normalize_dict_sections），本函数用于
+    非 load_config 来源（测试、share.py 自造 cfg、面板局部字典）的同一口径兜底，
+    避免每个读取点各写一遍 isinstance。
+    """
+    if default is None:
+        default = {}
+    if not isinstance(cfg, dict):
+        return copy.deepcopy(default)
+    value = cfg.get(key, default)
+    if isinstance(value, dict):
+        return value
+    if value is not None:
+        _log_warning("配置节 %s 不是对象（%r），按默认值处理", key, value)
+    return copy.deepcopy(default)
+
+
+def safe_int(value, default, lo=None, hi=None, warn=True, clamp=True):
+    """把配置值安全转为 int：非法（字符串/None/布尔）时回退 default；越界时按 clamp 决定。
 
     第 100 条：`config.json` 手改成 `"fps": "60"` 时，`slot["fps"]` 是 str，采集线程
     的 `fps_now > 0` 会抛 TypeError 并把线程直接打死（服务仍在 accept、观看端能收
     pong，但一帧都没有）。所有来自配置的数值都经此转换。
+
+    cfg-008（2026-09-20）：docstring 与实现相反——旧首行称"超出范围时回退 default"，
+    实际旧实现的 lo/hi 是**钳制**（`safe_int(0, 5700, lo=1) -> 1`，default 完全不参与）。
+    钳制对 fps/quality/scale 是合适的（第 100 条要的就是这个，clamp=True 保持原行为）；
+    对**端口**这类"越界值根本不该被用上"的键是错的：`"port": 0` 旧实现会把监听端口变成
+    1 且零提示。这类键请传 clamp=False，语义变为"越界同非法 → 回退 default + WARNING"。
+    注意：不改变已有调用点的行为，只把语义写清并补上另一种模式。
 
     warn=False 用于每秒/每帧执行的热路径（避免同一条告警刷满日志）。
     """
@@ -750,10 +812,18 @@ def safe_int(value, default, lo=None, hi=None, warn=True):
         # 旧实现漏防会沿调用线程上抛（配置可写即可打死采集/编码线程）。
         if warn:
             _log_warning("配置值 %r 不是整数，回退默认值 %r", value, default)
-        out = int(default)
+        return int(default)
     if lo is not None and out < lo:
+        if not clamp:
+            if warn:
+                _log_warning("配置值 %r 小于下限 %d，回退默认值 %r", value, lo, default)
+            return int(default)
         out = int(lo)
     if hi is not None and out > hi:
+        if not clamp:
+            if warn:
+                _log_warning("配置值 %r 超出上限 %d，回退默认值 %r", value, hi, default)
+            return int(default)
         out = int(hi)
     return out
 
@@ -1018,8 +1088,14 @@ def _upgrade_config(raw):
     就能在控制台改回去。迁移只发生一次：写回时同时写入 config_version。
     """
     try:
+        # cfg-007（2026-09-20）：`Infinity` / `-Infinity` / `NaN` 是 Python json 默认
+        # 接受的合法 JSON，而 `int(float('inf'))` 抛的是 OverflowError——旧实现只列
+        # (TypeError, ValueError)，异常一路逃到 load_config 的兜底 except，
+        # 触发 _recover_corrupt_config：整份用户配置被改名留存并写回默认值。
+        # 一个数字写错就能让端口、频道列表、frp 配置、码率设置全部"消失"。
+        # net-025 已给 safe_int/safe_float/normalize_region 补过 OverflowError，这处同族漏网。
         version = int(raw.get("config_version") or 1)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         version = 1
     if version >= CONFIG_VERSION:
         # C12（2026-09-11）：结构版本已是最新时没有迁移动作，但这里仍返回 []。
@@ -1101,6 +1177,33 @@ def _persist_upgrade(path, raw, changes, silent=False):
         pass
 
 
+def _normalize_dict_sections(base, out, path=""):
+    """递归校验「默认配置里是字典的节」在合并结果里必须仍是字典（ui-022 / auth-022）。
+
+    在 load_config 出口处做一次，而不是让 host / viewer / 面板 / 诊断包每个读取点
+    各自 isinstance 兜底——auth-022 的危害恰恰来自"兜底取向各写各的"：同一条
+    `"auth": false` 让准入 fail-open、注册策略却按默认 open，两道开关一起失效。
+    非字典的节回退为默认子树（与"用户没写这一节"等价）并记 WARNING。
+
+    cfg-007 之外这里还顺带挡住 `_deep_merge` 的语义空洞：它只对 None 跳过，
+    非字典的非 None 值会原样覆盖默认字典（1004 行）。
+    """
+    fixed = 0
+    for key, bval in base.items():
+        if not isinstance(bval, dict) or not isinstance(out, dict):
+            continue
+        sub = out.get(key)
+        here = "%s.%s" % (path, key) if path else key
+        if not isinstance(sub, dict):
+            if sub is not None:
+                _log_warning("配置节 %s 不是对象（%r），整体回退默认值", here, sub)
+            out[key] = copy.deepcopy(bval)
+            fixed += 1
+            continue
+        fixed += _normalize_dict_sections(bval, sub, here)
+    return fixed
+
+
 def load_config():
     """加载配置：config.json 不存在时先写入 DEFAULT_CONFIG 再返回其深拷贝；
     存在时读取、做一次结构升级（见 _upgrade_config）并与 DEFAULT_CONFIG 深合并后返回。
@@ -1131,6 +1234,10 @@ def load_config():
         before_version = cfg.get("config_version")
         changes = _upgrade_config(cfg)
         merged = _deep_merge(DEFAULT_CONFIG, cfg)
+        # ui-022 / auth-022（2026-09-20）：合并后再统一做一次"应为字典的节"类型校验，
+        # 让所有下游读取点（get_snapshot、面板构造、诊断包、采集热路径）不必各写各的
+        # isinstance，也不会出现"这一处兜成 False、那一处兜成 open"的取向打架。
+        _normalize_dict_sections(DEFAULT_CONFIG, merged)
         if changes:
             _persist_upgrade(path, cfg, changes)
         elif (cfg.get("config_version") == CONFIG_VERSION

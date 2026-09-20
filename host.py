@@ -80,6 +80,8 @@ from common import (  # noqa: F401
     # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
     # 各有一套 clamp），share.py 不再反向 import host。
     normalize_region, safe_float, safe_int,
+    # ui-022 / auth-022 / ui-030（2026-09-20）：配置子节判型的单点收口
+    cfg_section,
 )
 
 # 采集/静止检测公共件（CaptureManager、encode_bgr 等 screen 转发名）由
@@ -995,7 +997,7 @@ class FrpManager:
             if self._sakura_service_running():
                 self._external_running = True
                 return True, "已检测到 SakuraFrpService 正在运行，隧道由樱花启动器管理，无需重复启动"
-            frp = self.cfg.get("host", {}).get("frp", {})
+            frp = cfg_section(cfg_section(self.cfg, "host"), "frp")   # ui-022 同族收口
             frpc_path = frp.get("frpc_path", "frpc.exe")
             token, tunnel_ids = self._resolve_sakura_credentials(
                 frp.get("token", ""), frp.get("tunnel_ids", ""))
@@ -1194,7 +1196,7 @@ class HostRuntime:
             or max(600, 2 * base_kbps)
         self.up_max_fps = safe_int(net_cfg.get("upstream_max_fps", 0), 0, 0) \
             or max(8, 2 * safe_int(host.get("fps", 30), 30, 1, 240))
-        capture = host.get("capture", {})
+        capture = cfg_section(host, "capture")     # ui-022 同族收口
         self.slot = {
             "jpeg": None,
             "ts": 0,
@@ -1225,7 +1227,7 @@ class HostRuntime:
         # 当前 ABR 目标码率（bps）：ABR 调整后更新，编码线程重建编码器时沿用，
         # 避免重建回到基础码率导致码率震荡
         self.target_bitrate = safe_int(
-            host.get("codec", {}).get("bitrate_kbps", 2500), 2500, 64) * 1000
+            cfg_section(host, "codec").get("bitrate_kbps", 2500), 2500, 64) * 1000
         self.stats = {"capture_fps": 0, "encode_fps": 0, "send_fps": 0,
                   "encode_ms": 0.0, "avg_send_ms": 0.0,
                   "codec_name": "", "keyint": 0,
@@ -1429,7 +1431,11 @@ class HostRuntime:
         第 32 条：用 _UNSET 哨兵区分「未提供」与「显式传 None」。region=None 表示
         清空采集区域回到全屏（GUI「恢复全屏」依赖此语义），而非旧实现里的「跳过不改」。
         """
-        capture = self.cfg["host"].setdefault("capture", {})
+        # ui-022（2026-09-20）：setdefault 只挡"键不存在"，`"capture": 1` 这类标量
+        # 会被原样返回，随后的 `capture["monitor"] = …` 抛 TypeError → 采集按钮静默失效。
+        capture = cfg_section(self.cfg["host"], "capture")
+        if self.cfg["host"].get("capture") is not capture:
+            self.cfg["host"]["capture"] = capture
         if monitor is not _UNSET:
             monitor = safe_int(monitor, 1, 0)
             capture["monitor"] = monitor
@@ -1496,8 +1502,13 @@ class HostRuntime:
             }
         return {
             "port": self.cfg["host"]["port"],
-            "public_addr": self.cfg["host"].get("frp", {}).get("public_addr", ""),
-            "auth_enabled": bool(self.cfg["host"].get("auth", {}).get("enabled", False)),
+            # ui-022（2026-09-20）：旧写法 `self.cfg["host"].get("frp", {})` 只挡了
+            # "键不存在"、挡不住"值不是字典"。host.auth 被写成非 None 标量（false/0/""/[]）
+            # 时这里抛 AttributeError——而它在 _poll 的 try 内，异常发生在 snap 取到之前，
+            # 于是 _refresh(snap) 永不执行：控制台从此只显示旧值（在线观众数/fps/码率/
+            # 监听状态全部冻结），并以约 2 条/秒刷"状态刷新失败"。
+            "public_addr": cfg_section(self.cfg["host"], "frp").get("public_addr", ""),
+            "auth_enabled": bool(cfg_section(self.cfg["host"], "auth").get("enabled", True)),
             "clients": clients,
             "perf": perf,
             "capture": capture,
@@ -1712,13 +1723,18 @@ AUTH_CHALLENGE_GRACE_S = 5.0
 
 
 def _fake_login_salt(user):
-    """账号不存在时下发的确定性伪盐（auth-008，2026-09-18）。
+    """账号不存在时下发的盐（auth-008 → auth-014 收口，2026-09-20）。
 
-    32 位十六进制、与真实盐（secrets.token_hex(16)）同形，且对同一用户名稳定——
-    对端无法从"有没有挑战 / 盐长什么样"判断账号是否存在，账号名枚举面被抹平。
+    auth-014：旧实现返回 `hmac(b"tv-nouser", user)`——密钥硬编码在源码里、无任何
+    服务端随机量，对端拿到 CHAL 后用同一个函数本地重算即可 100% 判定账号是否存在，
+    枚举判据从"看文案"退化成"比对本地产物"，且可完全离线批量验证用户名。
+
+    现在直接下发**真随机盐**（与真实账号的 secrets.token_hex(16) 同分布、无指纹）。
+    不存在的账号本就不需要盐参与校验：应答阶段 verify_login_proof 走的是同代价
+    dummy 比较（host.py 内 `hmac.new(b"tv-dummy", nonce, …)`），盐只在 CHAL 报文里
+    过网一次，因此随机化不影响任何正确性路径，代价为零。
     """
-    return hmac.new(b"tv-nouser", (user or "").encode("utf-8"),
-                    "sha256").hexdigest()[:32]
+    return secrets.token_hex(16)
 
 
 def _auth_required_phase(sock, addr, runtime, auth_cfg):
@@ -1988,11 +2004,16 @@ def _auth_optional_phase(sock, addr):
 
 def _do_auth(sock, addr, runtime, host_cfg):
     """账户准入阶段；返回 (是否放行, 用户名)。第 109 条：从 _handle_client_inner 拆出。"""
-    auth_cfg = host_cfg.get("auth", {})
-    if not isinstance(auth_cfg, dict):
-        log.warning("配置 host.auth 不是对象（%r），按准入关闭处理", auth_cfg)
-        auth_cfg = {}
-    if auth_cfg.get("enabled", False):
+    auth_cfg = cfg_section(host_cfg, "auth")
+    # auth-022（2026-09-20）：这里旧写法是 `auth_cfg = {}` 后
+    # `auth_cfg.get("enabled", False)` → 一条把 host.auth 写成字符串/数字/数组的
+    # 坏配置就让**准入静默关闭**，而同一份配置下 register_policy 按缺键取默认
+    # "open" —— 一次输入错误同时关掉两道安全开关，任何能连上的人都能自建账号看屏。
+    # 安全开关的兜底取向必须与 auth-007 对 allow_register 的既定口径一致：fail-closed。
+    if not isinstance(host_cfg.get("auth"), dict):
+        log.warning("配置 host.auth 不是对象（%r），按**开启准入**处理（fail-closed）",
+                    host_cfg.get("auth"))
+    if auth_cfg.get("enabled", True):
         return _auth_required_phase(sock, addr, runtime, auth_cfg)
     return _auth_optional_phase(sock, addr)
 
@@ -2578,9 +2599,16 @@ def _listen_target(cfg):
     """
     host_cfg = cfg.get("host") if isinstance(cfg, dict) and isinstance(cfg.get("host"), dict) else {}
     listen_host = host_cfg.get("listen_host")
-    if not isinstance(listen_host, str):
-        listen_host = ""
-    port = safe_int(host_cfg.get("port", 5700), 5700, 1, 65535)
+    if not isinstance(listen_host, str) or not listen_host.strip():
+        # D-02（2026-09-20）：旧实现把"非字符串"归一为 ""，而 "" 属于 bind_all 集合
+        # → 坏配置反而**绑 0.0.0.0 全网卡**，与文档"默认/兜底只允许本机"、以及
+        # host_ui.py:237（ui-007）同一情形兜底 127.0.0.1 的口径双向相反。
+        # 安全默认方向统一为回环：兜底失败时收紧而不是放开。
+        log.warning("配置 host.listen_host 非字符串或为空（%r），按只允许本机与 frp 隧道接入", listen_host)
+        listen_host = "127.0.0.1"
+    # cfg-008（2026-09-20）：端口要的是"要么合法要么回退默认"，不是钳制——
+    # 旧实现 `"port": 0` 会被 safe_int 钳成 **监听端口 1**（而不是回退 5700）且零提示。
+    port = safe_int(host_cfg.get("port", 5700), 5700, 1, 65535, clamp=False)
     return listen_host, port, listen_host in ("", "0.0.0.0", "::")
 
 
@@ -2671,24 +2699,39 @@ def _start_tunnel_selfcheck(runtime, port, delay=3.0):
         return
 
     def _probe():
-        # net-023（2026-09-18）：自检改为**周期循环**——旧实现只在启动后跑一次，
-        # 隧道重启/掉线后面板仍显示旧"通过"；结论带 ts，面板据此提示时效。
+        # net-032（2026-09-20）：旧实现在循环内写 `delay = 600.0` 却没声明 nonlocal，
+        # Python 编译期就把 delay 定为 _probe 的局部名 → **首次迭代**读它即
+        # UnboundLocalError，线程一启动就死、异常无人接，自检从"启动跑一次"退化为
+        # "从不跑"。这里改用只属于本函数的 next_delay，外层形参只读不写。
+        # net-033（2026-09-20）：旧实现只在 _start_tunnel_selfcheck 入口判一次
+        # is_running()，net-032 一修好就变成"用户停掉 frpc 后仍每 10 分钟对外拨号
+        # 直到进程退出"。两条必须同时落地。
+        next_delay = float(delay)
         waited = 0.0
-        while not runtime.stop_event.is_set():
-            host, pub_port = target
-            if runtime.stop_event.wait(max(0.0, delay - waited)):
-                return
-            waited = 0.0
-            delay = 600.0      # 首次 3 秒后自检，此后每 10 分钟复检一次
-            try:
-                sock = socket.create_connection((host, pub_port), timeout=8)
-            except Exception as e:
-                log.warning("公网隧道自检失败：无法连接 %s:%s（%s）——请确认 frpc 已在运行、"
-                            "隧道已启用；若连接被拒绝，检查樱花控制台里隧道的本地地址/端口", host, pub_port, e)
-                # B2（第 134 条）：四种结论除日志外同步进 _net_status（面板/诊断报告消费）
-                runtime.set_net_status("fail", "无法连接 %s:%s（隧道未就绪？）" % (host, pub_port))
-                continue
-            _probe_once(runtime, sock, host, pub_port, port)
+        try:
+            while not runtime.stop_event.is_set():
+                if not runtime.frp.is_running():
+                    log.info("公网隧道自检停止：frpc 已不在运行")
+                    return
+                host, pub_port = target
+                if runtime.stop_event.wait(max(0.0, next_delay - waited)):
+                    return
+                waited = 0.0
+                next_delay = 600.0      # 首次 3 秒后自检，此后每 10 分钟复检一次
+                try:
+                    sock = socket.create_connection((host, pub_port), timeout=8)
+                except Exception as e:
+                    log.warning("公网隧道自检失败：无法连接 %s:%s（%s）——请确认 frpc 已在运行、"
+                                "隧道已启用；若连接被拒绝，检查樱花控制台里隧道的本地地址/端口",
+                                host, pub_port, e)
+                    # B2（第 134 条）：四种结论除日志外同步进 _net_status（面板/诊断报告消费）
+                    runtime.set_net_status("fail", "无法连接 %s:%s（隧道未就绪？）" % (host, pub_port))
+                    continue
+                _probe_once(runtime, sock, host, pub_port, port)
+        except Exception:
+            # net-032：线程体内任何意外都不能让自检静默消失——daemon 线程抛出的
+            # 异常只有 stderr（windowed 打包下没有 stderr），这里兜底记一条日志。
+            log.exception("公网隧道自检线程异常退出")
 
     def _probe_once(runtime, sock, host, pub_port, port):
         try:
@@ -3557,7 +3600,7 @@ def _install_excepthooks():
 
 def print_public_addr(cfg):
     """打印公网地址提示（日志输出，windowed 模式亦安全）。"""
-    public_addr = cfg["host"].get("frp", {}).get("public_addr", "")
+    public_addr = cfg_section(cfg["host"], "frp").get("public_addr", "")   # ui-022
     if public_addr:
         log.info(">>> 请将公网地址发给队友: %s <<<", public_addr)
     else:
@@ -3587,10 +3630,19 @@ def main():
     # Windows 在进程首个 HWND 创建时即定死 DPI 感知，第 133 条把 splash 的 tk.Tk()
     # 提到了声明之前，使 enable_dpi_awareness() 必然失败且返回值被丢弃（完全静默）。
     # 与 viewer 侧顺序对齐。
+    # capture-005（2026-09-20）：DPI 声明不该与"是否有窗口"绑定。旧实现只在
+    # `not args.console` 时声明，命令行模式整个进程保持"未 DPI 感知"，于是
+    # mss（EnumDisplayMonitors → 逻辑像素）与 dxcam（物理像素）两套坐标口径不同：
+    # 系统缩放≠100% 时区域采集/副屏采集截错位置。另一半是时序隐患——
+    # `import dxcam` 自身会在模块级把进程抬成 per-monitor aware（vendor/dxcam 的
+    # DXFactory/Output.__post_init__ 调 SetProcessDpiAwareness(2)），不显式声明时
+    # "第一个采集会话"用一套口径、自愈重建之后换另一套，同一份配置前后不一致。
+    # 一开始就声明，两套口径从第一帧起统一。
+    if not enable_dpi_awareness():
+        log.warning("DPI 感知声明失败，高 DPI 下界面文字可能发虚、命令行模式的采集坐标"
+                    "可能与 dxcam 物理像素口径不一致（详见日志）")
     splash_root = None
     if not args.console:
-        if not enable_dpi_awareness():
-            log.warning("DPI 感知声明失败，高 DPI 下界面文字可能发虚（详见日志）")
         try:
             import tkinter as tk
             import splash as splash_mod
@@ -3613,7 +3665,7 @@ def main():
             pass
 
     # 自动启动 frpc（配置了 auto_start 时）
-    if cfg["host"].get("frp", {}).get("auto_start"):
+    if cfg_section(cfg["host"], "frp").get("auto_start"):   # ui-022（3616 行同源）
         ok, msg = runtime.frp.start()
         (log.info if ok else log.warning)("%s", msg)
 
