@@ -51,11 +51,23 @@ def _pid_matches(name, pid):
     return ("_pid%d.log" % pid) in name
 
 
+#: dist-014（2026-09-20）：本进程没有日志时（正是"崩溃/闪退后重启再导出"的场景），
+#: 退而收集最近若干个日志文件的上限。
+_FALLBACK_FILES = 6
+
+
 def recent_log_files(logs_dir, days=2, now=None, pid=None):
     """挑出最近 days 天（含今天）的 app_YYYYMMDD*_pidNNN.log；目录缺失返回空。
 
     auth-012（2026-09-18）：pid 给定时只收**本进程**的日志——host 与 viewer 同机
     运行时日志同目录，旧实现把两端的日志一并打包（混包泄露另一端的配置/账号线索）。
+
+    dist-014（2026-09-20）：但诊断包的使用场景恰恰是"上一个进程已经崩了"——PID 是
+    logger 建 handler 时定死的，崩溃/闪退、或按 FAQ"重启后再试一次"之后导出，
+    `pid` 过滤返回空列表，包照样打出来、report.txt 里也没有"日志缺失"这一项，
+    **它把唯一能说明问题的东西过滤掉了**。第 14 条的 per-PID 又让单日可达几十个 PID。
+    现在：本进程有日志时行为不变（继续防混包）；一条都没有时退化为"按 mtime 取最近
+    _FALLBACK_FILES 份"，并由 build_report_zip 在 report.txt 里显式写明收集了什么。
     """
     out = []
     if not logs_dir or not os.path.isdir(logs_dir):
@@ -76,7 +88,39 @@ def recent_log_files(logs_dir, days=2, now=None, pid=None):
         p = os.path.join(logs_dir, name)
         if os.path.isfile(p):
             out.append(p)
-    return out
+    if out or pid is None:
+        return out
+    # 本进程一条日志都没有 → 取时间窗内 mtime 最近的若干份（跨进程，报告里会注明）
+    cand = []
+    for name in names:
+        m = _LOG_DATE_RE.match(name)
+        if not m or m.group(1) not in wanted:
+            continue
+        p = os.path.join(logs_dir, name)
+        try:
+            if os.path.isfile(p):
+                cand.append((os.path.getmtime(p), p))
+        except OSError:
+            continue
+    cand.sort(reverse=True)
+    return [p for _t, p in cand[:_FALLBACK_FILES]]
+
+
+def _log_collection_note(logs_dir, pid, chosen):
+    """供 report.txt 使用：说明本次到底收了谁的日志（dist-014 的"显式写明"要求）。"""
+    if not logs_dir:
+        return "诊断包日志: 未指定日志目录，本次未收集任何日志"
+    if not chosen:
+        return ("诊断包日志: 时间窗内没有可收集的日志文件（logs 目录为空或不可读）"
+                "——崩溃时刻的线索可能已随文件轮转丢失")
+    if pid is not None and not any(_pid_matches(os.path.basename(p), pid)
+                                   for p in chosen):
+        return ("诊断包日志: 本进程(pid=%s)尚无日志文件，已改为收集最近 %d 份"
+                "（**可能包含同机另一端 host/viewer 的日志**）：\n  %s"
+                % (pid, len(chosen), "\n  ".join(os.path.basename(p) for p in chosen)))
+    return "诊断包日志: 收集本进程(pid=%s)日志 %d 份:\n  %s" % (
+        pid if pid is not None else "-", len(chosen),
+        "\n  ".join(os.path.basename(p) for p in chosen))
 
 
 def build_report_text(config, extra_text=""):
@@ -91,7 +135,9 @@ def build_report_text(config, extra_text=""):
     auth = host_cfg.get("auth") if isinstance(host_cfg.get("auth"), dict) else {}
     listen_host = host_cfg.get("listen_host")
     if not isinstance(listen_host, str) or not listen_host.strip():
-        listen_form = "0.0.0.0（全网卡）"
+        # D-02（2026-09-20）：与 host._listen_target 的实际兜底保持一致——
+        # 那里此前把非字符串/空串归一为 ""（=绑 0.0.0.0），报告与运行时双向相反。
+        listen_form = "127.0.0.1（回环/指定地址，非法值兜底）"
     elif listen_host in ("0.0.0.0", "::"):
         listen_form = "%s（全网卡）" % listen_host
     else:
@@ -122,17 +168,26 @@ def build_report_zip(dest_dir, *, config, logs_dir=None, extra_text="", pid=None
     auth-012：`pid` 给定时只收该进程的日志（两端同机运行时避免混包）。
     """
     os.makedirs(dest_dir, exist_ok=True)
-    dest = Path(dest_dir) / ("TeamVision-diag-%s.zip"
-                             % time.strftime("%Y%m%d-%H%M%S"))
+    # ui-021（2026-09-20）：文件名带 PID——共享端的工作线程与观看端主线程都往同一个
+    # logs 目录写 `TeamVision-diag-<秒级时间戳>.zip`，同秒启动即互相覆盖、
+    # 且 os.replace 有一方 FileNotFoundError（这才是同名 .part 的真实跨进程竞争面）。
+    dest = Path(dest_dir) / ("TeamVision-diag-%s-pid%d.zip"
+                             % (time.strftime("%Y%m%d-%H%M%S"), os.getpid()))
     tmp = Path(str(dest) + ".part")
+    logs = recent_log_files(logs_dir, pid=pid)
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("report.txt",
-                        build_report_text(config, extra_text=extra_text))
+                        build_report_text(
+                            config,
+                            extra_text="\n".join(
+                                x for x in (str(extra_text).rstrip() if extra_text else "",
+                                            _log_collection_note(logs_dir, pid, logs))
+                                if x)))
             zf.writestr("config.json",
                         json.dumps(redact(config or {}), ensure_ascii=False,
                                    indent=2))
-            for p in recent_log_files(logs_dir, pid=pid):
+            for p in logs:
                 try:
                     zf.write(p, "logs/" + os.path.basename(p))
                 except OSError:

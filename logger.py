@@ -37,6 +37,10 @@ _MAX_BYTES = 5 * 1024 * 1024
 _BACKUP_COUNT = 5
 #: 按日期保留的历史日志文件数（app_YYYYMMDD.log，超出部分在跨天时清理）
 _KEEP_DAYS = 5
+#: dist-011（2026-09-20）：per-PID 之后"天数"不再是增长的上界（每次启动一个新 PID，
+#: 单日可产生几十份，每份还能滚出 .1~.5 五个备份）。这两个常量给出**绝对**上界。
+_KEEP_FILES = 120
+_KEEP_TOTAL_BYTES = 64 * 1024 * 1024
 
 #: C3：日志文件名里的日期前缀（app_YYYYMMDD[_pidN][.N].log）。
 #: 用正则严格取日期，避免 app_debug.log 之类的非日期名被切片成假"日期键"而挤掉真日志。
@@ -73,10 +77,18 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         return os.path.join(self._log_dir, "app_%s_pid%d.log" % (date, os.getpid()))
 
     def _prune_old(self):
-        """清理超出保留天数的历史日志文件（含大小滚动备份 .1/.2 与各 PID 文件）。
+        """清理超出保留范围的日志（含大小滚动备份 .1/.2 与各 PID 文件）。
 
-        按日期分组（app_YYYYMMDD_pid*.log 及其备份属于同一日期组），只保留最新的
-        KEEP_DAYS 天，其余整组删除——避免旧日期文件长期累积。兼容旧的无 PID 命名。
+        dist-011（2026-09-20）：旧实现两处不足——
+        ① `keep_keys = sorted(groups)[-5:]` 保留的是"目录里现存的后 5 个**日期组**"，
+           而不是"距今 5 天"。本机长期只开一天机器再停几天时，最旧那组哪怕已经
+           9 天前也照样整组保留（本机实测现存 20260911/17/18/19/20 五组，最旧一组
+           是 9 天前，实删 0 个文件）；
+        ② 组内不限量：per-PID 让文件数从"每天一份"变成"每次启动一份"，
+           docstring 声称"避免磁盘无限增长"，实际增长维度换成了启动次数
+           （本机 logs/ 已 191 个文件，2026-09-11 单日 69 个且 PID 互不相同）。
+        现在：按"距今 N 天"筛日期组，保留组内再按**总文件数/总字节**二次裁剪，
+        最旧的先删。
 
         C3（2026-09-11）：日期键必须是**真正的 8 位日期**。原实现用 `name[4:12]` 直接
         切片，目录里若存在 `app_debug.log` 这类非日期命名文件，其"日期"键 `"debug.lo"`
@@ -93,15 +105,44 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
                 if not m:
                     continue  # app_debug.log 之类的非日期文件：不分组、不清理
                 groups.setdefault(m.group(1), []).append(name)
-            keep_keys = set(sorted(groups)[-_KEEP_DAYS:])
-            for date, names in groups.items():
-                if date in keep_keys:
+            # ① 按"距今 _KEEP_DAYS 天"筛，而不是"现存的最后 5 组"
+            today = time.strftime("%Y%m%d")
+            try:
+                cutoff = time.strftime(
+                    "%Y%m%d",
+                    time.localtime(time.time() - (_KEEP_DAYS - 1) * 86400))
+            except Exception:
+                cutoff = today
+            for date in list(groups):
+                if date < cutoff:
+                    for name in groups.pop(date):
+                        try:
+                            os.remove(os.path.join(self._log_dir, name))
+                        except OSError:
+                            pass
+            # ② 保留组内再按总量裁剪：最旧日期、文件名字序最小的先删
+            survivors = []
+            for date in sorted(groups):
+                for name in sorted(groups[date]):
+                    survivors.append((date, name))
+            total_bytes = 0
+            sized = []
+            for date, name in survivors:
+                try:
+                    st = os.stat(os.path.join(self._log_dir, name))
+                except OSError:
                     continue
-                for name in names:
-                    try:
-                        os.remove(os.path.join(self._log_dir, name))
-                    except OSError:
-                        pass
+                sized.append((date, name, st.st_size))
+                total_bytes += st.st_size
+            while (len(sized) > _KEEP_FILES or total_bytes > _KEEP_TOTAL_BYTES) \
+                    and sized:
+                date, name, size = sized.pop(0)
+                try:
+                    os.remove(os.path.join(self._log_dir, name))
+                    total_bytes -= size
+                except OSError:
+                    sized.insert(0, (date, name, size))
+                    break
         except OSError:
             pass
 

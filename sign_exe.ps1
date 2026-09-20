@@ -9,16 +9,22 @@
 # 正式发布（对外分发）必须显式声明，且必须提供 CA 证书：
 #   powershell -ExecutionPolicy Bypass -File sign_exe.ps1 -Release
 # 无商业证书时（不带 -Release）：自动创建/复用本机 CurrentUser 自签证书 CN=TeamVision。
+# dist-012（2026-09-20）：待签清单里**点名**的文件不存在即算失败（exit 1），不再静默跳过；
+# 只有通配条目（默认清单里的 dist\TeamVision-Setup-*.exe，安装包还没打时本就可以没有）
+# 才记"跳过"，且 -Release 下连通配未匹配也算失败——避免未签名产物带着 exit 0 出门。
 # 注意：自签证书只能让**本机**验签通过，在别人的机器上仍然是「未知发布者」，
 # 对反作弊/杀软白名单没有任何帮助——它只是让本地测试时不再出现未签名提示。
 
 [CmdletBinding()]
 param(
     # 第 131 条：打包形态改为 onedir，两个 exe 分别位于 dist\fps-host\ 与 dist\fps-viewer\
+    # dist-012（2026-09-20）：安装包条目改为通配。旧实现写死 'dist\TeamVision-Setup-1.4.0.exe'，
+    # 版本 bump 时只要漏改这一行，文件不存在就只记一次"跳过"、脚本仍 exit 0 —— 未签名的
+    # 对外产物会带着成功退出码出门。通配后文件名随 installer.iss 的 OutputBaseFilename 走。
     [string[]]$Files = @(
         'dist\fps-host\fps-host.exe',
         'dist\fps-viewer\fps-viewer.exe',
-        'dist\TeamVision-Setup-1.4.0.exe'
+        'dist\TeamVision-Setup-*.exe'
     ),
     [string]$PfxPath = $env:TEAMVIEW_PFX,
     [string]$PfxPassword = $env:TEAMVIEW_PWD,
@@ -96,10 +102,12 @@ function Get-CodeSigningCert {
 
 function Invoke-SignOne([string]$path, $cert) {
     if (-not (Test-Path $path)) {
-        # 尚未构建的产物（例如还没跑 build_installer.bat 时的安装包）不算失败，
-        # 否则「只签两个 exe」也会以退出码 1 收尾，调用方误以为签名整体失败。
-        Write-Host "    [跳过] 文件不存在: $path" -ForegroundColor Yellow
-        return $null
+        # dist-012（2026-09-20）：待签文件不存在**必须算失败**。旧实现只打一行 [跳过] 并
+        # 返回 $null，主流程记 skip++ 而不计 fail，脚本最后仍以 exit 0 收尾——未签名的对外
+        # 产物会带着"成功"退出码出门（版本 bump 漏改清单时正是这条路径）。
+        # "产物本就可以还没有"的情形（尚未打安装包）已由主流程的通配条目单独处理，
+        # 走到这里的都是调用方点名要签的文件。
+        throw "待签文件不存在: $path"
     }
 
     $current = Get-AuthenticodeSignature -FilePath $path
@@ -120,8 +128,13 @@ function Invoke-SignOne([string]$path, $cert) {
     }
 
     Write-Step "签名 $path"
+    # dist-012 附带：UnknownError 只在**本机自签**时才可放行——自签证书不进他人信任链是预期。
+    # 旧实现对任何证书都把 UnknownError 当成功，于是 CA 证书出现 UnknownError（时间戳服务
+    # 不可达、CRL/OCSP 拉不到等）同样被静默放过，对外产物带着验不过的签名出门。
+    $okStatuses = @('Valid')
+    if ($cert.Subject -eq $cert.Issuer) { $okStatuses += 'UnknownError' }
     $result = Set-AuthenticodeSignature @splat
-    if ($result.Status -in @('Valid', 'UnknownError')) {
+    if ($result.Status -in $okStatuses) {
         # UnknownError 常见于自签未加入信任链；签名本身已写入
         Write-Host "    Status=$($result.Status)  $($result.StatusMessage)"
     } elseif ($result.Status -eq 'NotSigned') {
@@ -144,7 +157,7 @@ function Invoke-SignOne([string]$path, $cert) {
     if ($verify.Status -eq 'NotSigned') {
         throw "签名复核失败（仍为 NotSigned）: $($verify.StatusMessage)"
     }
-    if ($verify.Status -in @('Valid', 'UnknownError')) {
+    if ($verify.Status -in $okStatuses) {
         Write-Host "    复核 Status=$($verify.Status)  $($verify.StatusMessage)"
         return $true
     }
@@ -167,20 +180,45 @@ $ok = 0
 $fail = 0
 $skip = 0
 foreach ($f in $Files) {
-    $full = Join-Path $root $f
-    try {
-        $r = Invoke-SignOne $full $cert
-        if ($null -eq $r) { $skip++ }
-        elseif ($r) { $ok++ }
-        else { $fail++ }
-    } catch {
-        Write-Host "    [错误] $_" -ForegroundColor Red
-        $fail++
+    # dist-012：条目分两类——
+    #   含通配符（如 dist\TeamVision-Setup-*.exe）：产物"本就可以还没构建"，展开后逐个签；
+    #     一条都没匹配上才算跳过。-Release 是对外发布，没匹配到安装包直接判失败。
+    #   显式路径（含调用方 -Files 传进来的）：不存在就是失败，见 Invoke-SignOne。
+    if ($f -match '[\*\?]') {
+        $hits = @(Get-ChildItem -Path (Join-Path $root $f) -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending)
+        if ($hits.Count -eq 0) {
+            if ($Release) {
+                Write-Host "    [错误] -Release 模式下通配条目未匹配到任何文件: $f" -ForegroundColor Red
+                $fail++
+            } else {
+                Write-Host "    [跳过] 通配未匹配到文件（该产物尚未构建）: $f" -ForegroundColor Yellow
+                $skip++
+            }
+            continue
+        }
+        if ($hits.Count -gt 1) {
+            Write-Host "    提示: $f 匹配到 $($hits.Count) 个文件，全部签名" -ForegroundColor Yellow
+        }
+        $targets = @($hits | ForEach-Object { $_.FullName })
+    } else {
+        $targets = @(Join-Path $root $f)
+    }
+    foreach ($full in $targets) {
+        try {
+            $r = Invoke-SignOne $full $cert
+            if ($null -eq $r) { $skip++ }
+            elseif ($r) { $ok++ }
+            else { $fail++ }
+        } catch {
+            Write-Host "    [错误] $_" -ForegroundColor Red
+            $fail++
+        }
     }
 }
 
 Write-Host ""
-Write-Host "签名完成: 成功 $ok / 失败 $fail / 跳过（不存在）$skip" -ForegroundColor Green
+Write-Host "签名完成: 成功 $ok / 失败 $fail / 跳过（通配未匹配）$skip" -ForegroundColor Green
 Get-ChildItem -Path $Files -ErrorAction SilentlyContinue | ForEach-Object {
     $sig = Get-AuthenticodeSignature $_.FullName
     Write-Host ("  {0,-40} {1}" -f $_.Name, $sig.Status)

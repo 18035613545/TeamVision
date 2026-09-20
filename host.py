@@ -82,6 +82,7 @@ from common import (  # noqa: F401
     # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
     # 各有一套 clamp），share.py 不再反向 import host。
     normalize_region, safe_float, safe_int,
+    acquire_file_lock, release_file_lock,
     # ui-022 / auth-022 / ui-030（2026-09-20）：配置子节判型的单点收口
     cfg_section,
 )
@@ -233,46 +234,21 @@ class AccountManager:
 
     @contextlib.contextmanager
     def _file_lock(self):
-        """跨进程互斥（auth-009）：`<accounts>.lock` 排他创建，陈旧锁自动接管。
+        """跨进程互斥（auth-009 → cfg-004 重做，2026-09-20）：yield 是否真的拿到锁。
 
-        双开实例时进程内锁互不排斥，没有它就会出现"账户被静默抹掉/复活"。
-        等待超时（2 秒）后不再阻塞——宁可放行本次写（极小概率竞争），也不能让
-        GUI 线程永久卡死。
+        旧实现与 config.json 那套同构：`O_CREAT|O_EXCL` 排他创建、锁龄 >10 秒才接管、
+        最多等 2 秒然后**照样往下写**。两个洞同 cfg-004：接管阈值(10s) > 等待上限(2s)
+        → 持有者崩溃后的前 10 秒每个写入者都无保护地写；Windows 下 os.remove 打不开
+        被别的进程持有句柄的文件（WinError 32）被 except 吞掉 → 活锁根本接管不了，
+        fail-open 是必然路径。双开实例下"账户被静默抹掉/复活"正是 auth-009 要防的。
+        现在与 common 共用同一套 OS 级字节范围锁（进程死亡即由内核释放），
+        拿不到锁就让 _mutate 放弃本次写（fail-closed）。
         """
-        lock_path = self._path + ".lock"
-        fd = None
-        deadline = time.monotonic() + 2.0
-        while True:
-            try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except FileExistsError:
-                # 陈旧锁（持有者被强杀）：超过 10 秒未更新直接接管
-                try:
-                    if time.time() - os.path.getmtime(lock_path) > 10.0:
-                        os.remove(lock_path)
-                        continue
-                except OSError:
-                    pass
-                if time.monotonic() >= deadline:
-                    log.warning("accounts.json 文件锁等待超时，本次写可能与另一实例竞争")
-                    break
-                time.sleep(0.05)
-            except OSError as e:
-                log.warning("accounts.json 文件锁创建失败（%s），本次写无跨进程保护", e)
-                break
+        fd = acquire_file_lock(self._path, timeout=2.0)
         try:
-            yield
+            yield fd is not None
         finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                try:
-                    os.remove(lock_path)
-                except OSError:
-                    pass
+            release_file_lock(self._path, fd)
 
     def _save(self):
         """写回账户表（`_mutate` 在本方法调用前置入读-改-写快照）；返回是否成功。
@@ -295,7 +271,13 @@ class AccountManager:
         调用方传入 `fn(users)`：收到**锁内重读的磁盘快照**并就地修改，返回 (ok, msg)。
         写盘成功才用该快照替换内存表；写失败保持内存原状（调用方无需回滚）。
         """
-        with self._lock, self._file_lock():
+        with self._lock, self._file_lock() as locked:
+            if not locked:
+                # cfg-004：另一实例正持有账户文件锁——本次改动放弃，而不是用
+                # 可能陈旧的快照整表覆盖对方（auth-009 要根治的场景）。
+                log.warning("accounts.json 未取得跨进程锁（另一实例正持有），"
+                            "本次账户改动未落盘，请稍后重试")
+                return False, fail_msg
             users = self._read_disk()
             if users is None:
                 users = {u: dict(r) if isinstance(r, dict) else r

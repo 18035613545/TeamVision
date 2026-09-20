@@ -123,15 +123,26 @@ def check_update(cfg=None, now=None, opener=None, cache_path=None):
                 # replace 失败重试一次（Windows 上撞读即 PermissionError）
                 tmp = "%s.%d.%d.tmp" % (cache_path, os.getpid(),
                                         threading.get_ident())
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump({"checked_at": checked_at, "tag": tag}, f)
                 try:
-                    os.replace(tmp, cache_path)
-                except PermissionError:
-                    time.sleep(0.05)
-                    os.replace(tmp, cache_path)
-            except OSError as e:
-                log.info("更新检查缓存写入失败（忽略）：%s", e)
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump({"checked_at": checked_at, "tag": tag}, f)
+                    try:
+                        os.replace(tmp, cache_path)
+                    except PermissionError:
+                        time.sleep(0.05)
+                        os.replace(tmp, cache_path)
+                except OSError as e:
+                    # cfg-006（2026-09-20）：临时名唯一（PID+线程），写失败后旧实现
+                    # 只 info、不清理 → 磁盘永久留下一个不会再被覆盖回收的残渣
+                    # （同族的 _persist_upgrade 落的是含明文 frp token 的整份配置，
+                    # 三处清理口径要一致）。replace 成功后 tmp 已不存在，remove 静默。
+                    log.info("更新检查缓存写入失败（忽略）：%s", e)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            except Exception as e:
+                log.info("更新检查缓存写入异常（忽略）：%s", e)
         elif not (isinstance(tag, str) and is_newer(tag)):
             return None
     return ("有新版 %s 可下载（GitHub Releases）" % tag) if is_newer(tag) else None

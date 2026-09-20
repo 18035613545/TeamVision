@@ -237,6 +237,10 @@ class HostConsole:
         # auth-022 同族：安全开关的兜底取向 fail-closed（与 host._do_auth 一致）
         self._auth_var = tk.BooleanVar(
             value=bool(self._section(host_cfg, "auth").get("enabled", True)))
+        # dist-009（2026-09-20）：更新检查开关（默认关闭，勾选才向 GitHub 外连）
+        uc = (self.runtime.cfg.get("update_check")
+              if isinstance(self.runtime.cfg.get("update_check"), dict) else {})
+        self._update_check_var = tk.BooleanVar(value=bool(uc.get("enabled", False)))
         # 监听地址：空/0.0.0.0/:: 同为「全网卡」；默认 127.0.0.1 只允许本机与 frp 隧道
         # ui-007：非法值兜底必须先与 DEFAULT_CONFIG / 配置迁移 / 界面文案（127.0.0.1=默认）
         # 一致——旧实现回退 "0.0.0.0"，用户一点"应用"就把全网卡监听固化进配置，
@@ -272,6 +276,16 @@ class HostConsole:
                        bg=COL_CARD, fg=COL_FG, selectcolor=COL_CTRL,
                        activebackground=COL_CARD, activeforeground=COL_FG,
                        font=("Microsoft YaHei", 9)).pack(side="left")
+        # dist-009（2026-09-20）：dist-004 把更新检查改成 opt-in，注释与审计都写着
+        # "需要更新提示时在共享端控制台勾选"，但 host_ui 全文此前**没有任何
+        # update_check 相关控件**（Checkbutton 只有隧道自启、自适应、账户准入三处）——
+        # opt-in 这条路对普通用户不可达，更新提示静默失效，注释在误导下一个读代码的人。
+        # 默认仍为关闭（不外连）；勾选即 opt-in，取消即停止后续外连。
+        tk.Checkbutton(row, text="检查更新", variable=self._update_check_var,
+                       command=self._update_check_toggle,
+                       bg=COL_CARD, fg=COL_FG, selectcolor=COL_CTRL,
+                       activebackground=COL_CARD, activeforeground=COL_FG,
+                       font=("Microsoft YaHei", 9)).pack(side="left", padx=(18, 0))
         btn_row = tk.Frame(trans_card, bg=COL_CARD)
         btn_row.pack(fill="x", padx=10, pady=(4, 8))
         self._button(btn_row, "应用传输设置", self._trans_save, accent=True).pack(side="left")
@@ -526,6 +540,23 @@ class HostConsole:
         self._region_var.set("")
         self._capture_save()
         self._set_status("已恢复全屏采集")
+
+    def _update_check_toggle(self):
+        """dist-009：勾选/取消「检查更新」即刻落盘并生效。
+
+        开启才允许向 api.github.com 外连（默认关闭 = 不外连）；取消后
+        `update_check.enabled()` 立即为 False，后台检查与启动检查都随之停住。
+        """
+        on = bool(self._update_check_var.get())
+        cfg = self.runtime.cfg
+        sec = cfg.get("update_check")
+        if not isinstance(sec, dict):
+            sec = {}
+            cfg["update_check"] = sec
+        sec["enabled"] = on
+        save_config(cfg, section="update_check")
+        self._set_status("更新检查已%s%s" % (
+            "开启（每 24 小时向 GitHub 查询一次）" if on else "关闭（不再外连）", ""))
 
     def _trans_save(self):
         """保存并即时应用传输参数：监听地址 / 注册策略 / fps / JPEG 质量 / 缩放 / 自适应 / 准入。

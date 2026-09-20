@@ -1,56 +1,60 @@
 @echo off
-chcp 65001 >nul
-rem ç¬¬ 81 æ¡ï¼šæµ‹è¯•åŸå…ˆåªèƒ½ã€Œåœ¨ä»“åº“æ ¹æ‰‹åŠ¨æ‰§è¡Œ python -m unittest discover -s testsã€æ‰è·‘å¾—èµ·æ¥ã€‚
-rem åŸå› ï¼štests ä¸‹ç”¨ä¾‹è£¸ import common/host/viewerï¼ˆå‡ä¸ºä»“åº“æ ¹æ¨¡å—ï¼‰ï¼Œæ—¢æ—  sys.path å¼•å¯¼ï¼Œä¹Ÿæ— 
-rem conftest.py / pytest.ini / __init__.pyï¼Œæ‰€ä»¥æ¢å½“å‰ç›®å½•ã€ç›´æ¥ python tests\test_x.pyã€æˆ–
-rem pytest tests\ éƒ½ä¼š ModuleNotFoundError: commonã€‚æœ¬è„šæœ¬å…ˆæŠŠå½“å‰ç›®å½•é’‰åˆ°ä»“åº“æ ¹ï¼ˆcd åˆ°è„šæœ¬è‡ªèº«
-rem æ‰€åœ¨ç›®å½•ï¼‰ï¼Œå†æ¿€æ´» fps-screen ç¯å¢ƒè·‘å‘ç°å¼æµ‹è¯•ï¼Œè®©ã€Œå…¨å¥—ä»¶ç»¿ç¯ã€æˆä¸ºä»»ä½•äººä¸€æ¡å‘½ä»¤å³å¯å¤ç°çš„
-rem ç»“æœï¼Œè€Œä¸å†ä¾èµ–å£å£ç›¸ä¼ çš„è°ƒç”¨æ–¹å¼ã€‚é€€å‡ºç  = æµ‹è¯•ç»“æœï¼ˆ0 å…¨è¿‡ / é 0 æœ‰å¤±è´¥ï¼‰ï¼Œä¾¿äºè„šæœ¬åˆ¤æ–­ã€‚
+chcp 936 >nul
+rem dist-015£¨2026-09-20£©£º±¾ÎÄ¼ş°´ **ANSI/GBK£¨´úÂëÒ³ 936£©** ±£´æ£¬ĞĞÊ× chcp Ò²ÒÑ¸Ä³É 936¡£
+rem ²»ÒªÔÙ¸Ä»Ø UTF-8 + chcp 65001£ºÄÇÖÖ×éºÏÏÂ cmd °´×Ö½Ú¶Á½Å±¾¡¢È´°´ÂëÒ³½âÎöĞĞ±ß½ç£¬Êµ²â»á°Ñ
+rem Ä³ĞĞµÄÎ²²¿Æ¬¶Îµ±³ÉÃüÁîÖ´ĞĞ¡¢Í¬Ê±ÍÌµôÏàÁÚÃüÁîĞĞ£¨ÊØÎÀ/Ç©ÃûÄÇ¼¸ĞĞÊ×µ±Æä³å£¬ÇÒÍË³öÂëÅöÇÉ»¹
+rem ÊÇ¶ÔµÄ£¬Êô½ÄĞÒ£©£»¸Ä´æ"´ø BOM µÄ UTF-8"Ôò»áÈÃÊ×ĞĞ @echo off ±ä³ÉÃüÁîÃû¶ø±¨´í¡£
+rem µÚ 81 Ìõ£º²âÊÔÔ­ÏÈÖ»ÄÜ¡¸ÔÚ²Ö¿â¸ùÊÖ¶¯Ö´ĞĞ python -m unittest discover -s tests¡¹²ÅÅÜµÃÆğÀ´¡£
+rem Ô­Òò£ºtests ÏÂÓÃÀıÂã import common/host/viewer£¨¾ùÎª²Ö¿â¸ùÄ£¿é£©£¬¼ÈÎŞ sys.path Òıµ¼£¬Ò²ÎŞ
+rem conftest.py / pytest.ini / __init__.py£¬ËùÒÔ»»µ±Ç°Ä¿Â¼¡¢Ö±½Ó python tests\test_x.py¡¢»ò
+rem pytest tests\ ¶¼»á ModuleNotFoundError: common¡£±¾½Å±¾ÏÈ°Ñµ±Ç°Ä¿Â¼¶¤µ½²Ö¿â¸ù£¨cd µ½½Å±¾×ÔÉí
+rem ËùÔÚÄ¿Â¼£©£¬ÔÙ¼¤»î fps-screen »·¾³ÅÜ·¢ÏÖÊ½²âÊÔ£¬ÈÃ¡¸È«Ì×¼şÂÌµÆ¡¹³ÉÎªÈÎºÎÈËÒ»ÌõÃüÁî¼´¿É¸´ÏÖµÄ
+rem ½á¹û£¬¶ø²»ÔÙÒÀÀµ¿Ú¿ÚÏà´«µÄµ÷ÓÃ·½Ê½¡£ÍË³öÂë = ²âÊÔ½á¹û£¨0 È«¹ı / ·Ç 0 ÓĞÊ§°Ü£©£¬±ãÓÚ½Å±¾ÅĞ¶Ï¡£
 rem
-rem ç­‰æ•ˆçš„æ‰‹åŠ¨è°ƒç”¨ï¼ˆå‡é¡»å…ˆä½äºä»“åº“æ ¹ã€ä¸”åœ¨ fps-screen ç¯å¢ƒå†…ï¼‰ï¼š
-rem   å…¨å¥—ä»¶ï¼š   python -m unittest discover -s tests -p "test*.py"
-rem   å•ä¸ªæ–‡ä»¶ï¼š python -m unittest tests.test_item57_buffer
-rem æ³¨æ„ï¼šä¸å¸¦ -m unittest ç›´æ¥è·‘ python tests\test_x.py ä»ä¼šå¤±è´¥ï¼Œè¯·ç”¨ä¸Šé¢çš„ -m unittest å½¢å¼ã€‚
+rem µÈĞ§µÄÊÖ¶¯µ÷ÓÃ£¨¾ùĞëÏÈÎ»ÓÚ²Ö¿â¸ù¡¢ÇÒÔÚ fps-screen »·¾³ÄÚ£©£º
+rem   È«Ì×¼ş£º   python -m unittest discover -s tests -p "test*.py"
+rem   µ¥¸öÎÄ¼ş£º python -m unittest tests.test_item57_buffer
+rem ×¢Òâ£º²»´ø -m unittest Ö±½ÓÅÜ python tests\test_x.py ÈÔ»áÊ§°Ü£¬ÇëÓÃÉÏÃæµÄ -m unittest ĞÎÊ½¡£
 cd /d "%~dp0"
 echo ============================================
-echo   å•å…ƒæµ‹è¯•ä¸€é”®è¿è¡Œ (unittest discover)
+echo   µ¥Ôª²âÊÔÒ»¼üÔËĞĞ (unittest discover)
 echo ============================================
 echo.
 
-rem ===== [1/2] æ£€æŸ¥ conda å¹¶æ¿€æ´» fps-screen ç¯å¢ƒ =====
-echo [1/2] æ£€æŸ¥ conda ç¯å¢ƒ...
+rem ===== [1/2] ¼ì²é conda ²¢¼¤»î fps-screen »·¾³ =====
+echo [1/2] ¼ì²é conda »·¾³...
 where conda >nul 2>nul
 if errorlevel 1 (
     echo.
-    echo [é”™è¯¯] æœªæ£€æµ‹åˆ° condaï¼Œè¯·å…ˆå®‰è£… Anaconda æˆ– Miniconda å¹¶åŠ å…¥ PATHã€‚
+    echo [´íÎó] Î´¼ì²âµ½ conda£¬ÇëÏÈ°²×° Anaconda »ò Miniconda ²¢¼ÓÈë PATH¡£
     echo.
     if not defined CI if not defined NOPAUSE pause
     exit /b 1
 )
-echo æ£€æµ‹åˆ° condaï¼Œæ­£åœ¨æ¿€æ´»ç¯å¢ƒ fps-screen ...
+echo ¼ì²âµ½ conda£¬ÕıÔÚ¼¤»î»·¾³ fps-screen ...
 call conda activate fps-screen
 if errorlevel 1 goto :failed
-rem ä¸ build_exe.bat åŒæºï¼šactivate å¯èƒ½ã€Œè¿”å› 0 å´æ²¡çœŸæ­£åˆ‡æ¢ã€ï¼ŒäºŒæ¬¡ç¡®è®¤ CONDA_DEFAULT_ENVï¼Œ
-rem é¿å…åœ¨ base/ç³»ç»Ÿç¯å¢ƒé‡Œè·‘æµ‹è¯•ï¼ˆç¼º cv2/av/numpy/PIL ä¼š ModuleNotFoundErrorï¼‰ã€‚
+rem Óë build_exe.bat Í¬Ô´£ºactivate ¿ÉÄÜ¡¸·µ»Ø 0 È´Ã»ÕæÕıÇĞ»»¡¹£¬¶ş´ÎÈ·ÈÏ CONDA_DEFAULT_ENV£¬
+rem ±ÜÃâÔÚ base/ÏµÍ³»·¾³ÀïÅÜ²âÊÔ£¨È± cv2/av/numpy/PIL »á ModuleNotFoundError£©¡£
 if /i not "%CONDA_DEFAULT_ENV%"=="fps-screen" (
-    echo [é”™è¯¯] conda ç¯å¢ƒæœªåˆ‡åˆ° fps-screenï¼Œå½“å‰ CONDA_DEFAULT_ENV=%CONDA_DEFAULT_ENV%ã€‚
-    echo        è¯·å…ˆæ‰§è¡Œï¼šconda init cmd.exe ï¼Œé‡å¼€ç»ˆç«¯åé‡è¯•ã€‚
+    echo [´íÎó] conda »·¾³Î´ÇĞµ½ fps-screen£¬µ±Ç° CONDA_DEFAULT_ENV=%CONDA_DEFAULT_ENV%¡£
+    echo        ÇëÏÈÖ´ĞĞ£ºconda init cmd.exe £¬ÖØ¿ªÖÕ¶ËºóÖØÊÔ¡£
     goto :failed
 )
-echo ç¯å¢ƒ fps-screen æ¿€æ´»æˆåŠŸã€‚
+echo »·¾³ fps-screen ¼¤»î³É¹¦¡£
 echo.
 
-rem ===== [2/2] è¿è¡Œæµ‹è¯• =====
-echo [2/2] è¿è¡Œ tests ä¸‹å…¨éƒ¨å•å…ƒæµ‹è¯• ...
+rem ===== [2/2] ÔËĞĞ²âÊÔ =====
+echo [2/2] ÔËĞĞ tests ÏÂÈ«²¿µ¥Ôª²âÊÔ ...
 echo.
 python -m unittest discover -s tests -p "test*.py"
 set "RC=%ERRORLEVEL%"
 echo.
 echo ============================================
 if "%RC%"=="0" (
-    echo   ç»“æœï¼šå…¨éƒ¨é€šè¿‡
+    echo   ½á¹û£ºÈ«²¿Í¨¹ı
 ) else (
-    echo   ç»“æœï¼šå­˜åœ¨å¤±è´¥æˆ–é”™è¯¯ï¼Œé€€å‡ºç  %RC%
+    echo   ½á¹û£º´æÔÚÊ§°Ü»ò´íÎó£¬ÍË³öÂë %RC%
 )
 echo ============================================
 if not defined CI if not defined NOPAUSE pause
@@ -58,6 +62,6 @@ exit /b %RC%
 
 :failed
 echo.
-echo [é”™è¯¯] æµ‹è¯•æ— æ³•å¯åŠ¨ï¼šç¯å¢ƒæ¿€æ´»å¤±è´¥ï¼Œè¯·æŒ‰ä¸Šæ–¹æç¤ºå¤„ç†åé‡è¯•ã€‚
+echo [´íÎó] ²âÊÔÎŞ·¨Æô¶¯£º»·¾³¼¤»îÊ§°Ü£¬Çë°´ÉÏ·½ÌáÊ¾´¦ÀíºóÖØÊÔ¡£
 if not defined CI if not defined NOPAUSE pause
 exit /b 1

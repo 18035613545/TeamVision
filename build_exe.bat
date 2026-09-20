@@ -1,108 +1,112 @@
 @echo off
-chcp 65001 >nul
-rem ç¬¬ 72 æ¡ï¼šåˆ‡åˆ°è„šæœ¬è‡ªèº«ç›®å½•ï¼Œç¡®ä¿ fps-host.spec / fps-viewer.spec / frpc.exe /
-rem dist\ï¼ˆåŠ spec å¼•ç”¨çš„ version_info.txtã€assets\app.icoï¼‰ç­‰ç›¸å¯¹è·¯å¾„ä¸éšè°ƒç”¨æ–¹
-rem å½“å‰ç›®å½•ï¼ˆæˆ– CI å·¥ä½œç›®å½•ï¼‰æ¼‚ç§»è€Œä»Žé”™è¯¯çš„ç›®å½•æ ‘å–æ–‡ä»¶ã€‚
+chcp 936 >nul
+rem dist-015£¨2026-09-20£©£º±¾ÎÄ¼þ°´ **ANSI/GBK£¨´úÂëÒ³ 936£©** ±£´æ£¬ÐÐÊ× chcp Ò²ÒÑ¸Ä³É 936¡£
+rem ²»ÒªÔÙ¸Ä»Ø UTF-8 + chcp 65001£ºÄÇÖÖ×éºÏÏÂ cmd °´×Ö½Ú¶Á½Å±¾¡¢È´°´ÂëÒ³½âÎöÐÐ±ß½ç£¬Êµ²â»á°Ñ
+rem Ä³ÐÐµÄÎ²²¿Æ¬¶Îµ±³ÉÃüÁîÖ´ÐÐ¡¢Í¬Ê±ÍÌµôÏàÁÚÃüÁîÐÐ£¨ÊØÎÀ/Ç©ÃûÄÇ¼¸ÐÐÊ×µ±Æä³å£¬ÇÒÍË³öÂëÅöÇÉ»¹
+rem ÊÇ¶ÔµÄ£¬Êô½ÄÐÒ£©£»¸Ä´æ"´ø BOM µÄ UTF-8"Ôò»áÈÃÊ×ÐÐ @echo off ±ä³ÉÃüÁîÃû¶ø±¨´í¡£
+rem µÚ 72 Ìõ£ºÇÐµ½½Å±¾×ÔÉíÄ¿Â¼£¬È·±£ fps-host.spec / fps-viewer.spec / frpc.exe /
+rem dist\£¨¼° spec ÒýÓÃµÄ version_info.txt¡¢assets\app.ico£©µÈÏà¶ÔÂ·¾¶²»Ëæµ÷ÓÃ·½
+rem µ±Ç°Ä¿Â¼£¨»ò CI ¹¤×÷Ä¿Â¼£©Æ¯ÒÆ¶ø´Ó´íÎóµÄÄ¿Â¼Ê÷È¡ÎÄ¼þ¡£
 cd /d "%~dp0"
 echo ============================================
-echo   å…±äº«ç«¯/è§‚çœ‹ç«¯ ä¸€é”®æ‰“åŒ…è„šæœ¬ (PyInstaller)
+echo   ¹²Ïí¶Ë/¹Û¿´¶Ë Ò»¼ü´ò°ü½Å±¾ (PyInstaller)
 echo ============================================
 echo.
 
-rem ===== [1/5] æ£€æŸ¥ conda å¹¶æ¿€æ´»çŽ¯å¢ƒ =====
-echo [1/5] æ£€æŸ¥ conda çŽ¯å¢ƒ...
+rem ===== [1/5] ¼ì²é conda ²¢¼¤»î»·¾³ =====
+echo [1/5] ¼ì²é conda »·¾³...
 where conda >nul 2>nul
 if errorlevel 1 (
     echo.
-    echo [é”™è¯¯] æœªæ£€æµ‹åˆ° condaï¼Œè¯·å…ˆå®‰è£… Anaconda æˆ– Miniconda å¹¶åŠ å…¥ PATHã€‚
+    echo [´íÎó] Î´¼ì²âµ½ conda£¬ÇëÏÈ°²×° Anaconda »ò Miniconda ²¢¼ÓÈë PATH¡£
     echo.
     if not defined CI if not defined NOPAUSE pause
     exit /b 1
 )
-echo æ£€æµ‹åˆ° condaï¼Œæ­£åœ¨æ¿€æ´»çŽ¯å¢ƒ fps-screen ...
+echo ¼ì²âµ½ conda£¬ÕýÔÚ¼¤»î»·¾³ fps-screen ...
 call conda activate fps-screen
 if errorlevel 1 goto :failed
-rem ç¬¬ 73 æ¡ï¼šactivate å¯èƒ½ã€Œè¿”å›ž 0 å´æ²¡çœŸæ­£åˆ‡æ¢ã€ï¼ˆconda æœªå¯¹ cmd åˆå§‹åŒ–æ—¶ï¼‰ï¼Œ
-rem äºŒæ¬¡ç¡®è®¤ CONDA_DEFAULT_ENVï¼Œé¿å…åœ¨ base/ç³»ç»ŸçŽ¯å¢ƒé‡Œæ‰“åŒ…å‡ºç¼ºä¾èµ–çš„ exeã€‚
+rem µÚ 73 Ìõ£ºactivate ¿ÉÄÜ¡¸·µ»Ø 0 È´Ã»ÕæÕýÇÐ»»¡¹£¨conda Î´¶Ô cmd ³õÊ¼»¯Ê±£©£¬
+rem ¶þ´ÎÈ·ÈÏ CONDA_DEFAULT_ENV£¬±ÜÃâÔÚ base/ÏµÍ³»·¾³Àï´ò°ü³öÈ±ÒÀÀµµÄ exe¡£
 if /i not "%CONDA_DEFAULT_ENV%"=="fps-screen" (
-    echo [é”™è¯¯] conda çŽ¯å¢ƒæœªåˆ‡åˆ° fps-screenï¼ˆå½“å‰ CONDA_DEFAULT_ENV=%CONDA_DEFAULT_ENV%ï¼‰ã€‚
-    echo        ä¸ºé¿å…åœ¨ base/ç³»ç»ŸçŽ¯å¢ƒæ‰“åŒ…å‡ºç¼º cv2/av/numpy çš„ exeï¼Œå·²ä¸­æ­¢ã€‚
-    echo        è¯·å…ˆæ‰§è¡Œï¼šconda init cmd.exe ï¼Œé‡å¼€ç»ˆç«¯åŽé‡è¯•ã€‚
+    echo [´íÎó] conda »·¾³Î´ÇÐµ½ fps-screen£¨µ±Ç° CONDA_DEFAULT_ENV=%CONDA_DEFAULT_ENV%£©¡£
+    echo        Îª±ÜÃâÔÚ base/ÏµÍ³»·¾³´ò°ü³öÈ± cv2/av/numpy µÄ exe£¬ÒÑÖÐÖ¹¡£
+    echo        ÇëÏÈÖ´ÐÐ£ºconda init cmd.exe £¬ÖØ¿ªÖÕ¶ËºóÖØÊÔ¡£
     goto :failed
 )
-echo çŽ¯å¢ƒ fps-screen æ¿€æ´»æˆåŠŸã€‚
+echo »·¾³ fps-screen ¼¤»î³É¹¦¡£
 echo.
 
-rem ===== [2/5] å®‰è£… PyInstallerï¼ˆé˜¿é‡Œäº‘é•œåƒä»…æœ¬æ¬¡å‘½ä»¤ç”Ÿæ•ˆï¼Œä¸æ”¹å…¨å±€ pip é…ç½®ï¼‰=====
-echo [2/5] ä»Žé˜¿é‡Œæºå®‰è£… PyInstaller åˆ°å½“å‰çŽ¯å¢ƒ ...
-rem ç¬¬ 73 æ¡ï¼šåŽŸ `pip config set global.index-url ...` ä¼šæ°¸ä¹…ä¿®æ”¹æœ¬æœºå…¨å±€ pip é…ç½®
-rem ï¼ˆå½±å“æ‰€æœ‰é¡¹ç›®ï¼Œè¶…å‡ºæœ¬é¡¹ç›®èŒƒå›´ï¼‰ï¼›æ”¹ç”¨ -i/--trusted-host åªå¯¹è¿™ä¸€æ¡å‘½ä»¤ç”Ÿæ•ˆã€‚
-rem python -m pip ç¡®ä¿è£…è¿›ä¸Šæ–¹å·² conda activate å¹¶æ ¡éªŒè¿‡çš„ fps-screen çŽ¯å¢ƒã€‚
+rem ===== [2/5] °²×° PyInstaller£¨°¢ÀïÔÆ¾µÏñ½ö±¾´ÎÃüÁîÉúÐ§£¬²»¸ÄÈ«¾Ö pip ÅäÖÃ£©=====
+echo [2/5] ´Ó°¢ÀïÔ´°²×° PyInstaller µ½µ±Ç°»·¾³ ...
+rem µÚ 73 Ìõ£ºÔ­ `pip config set global.index-url ...` »áÓÀ¾ÃÐÞ¸Ä±¾»úÈ«¾Ö pip ÅäÖÃ
+rem £¨Ó°ÏìËùÓÐÏîÄ¿£¬³¬³ö±¾ÏîÄ¿·¶Î§£©£»¸ÄÓÃ -i/--trusted-host Ö»¶ÔÕâÒ»ÌõÃüÁîÉúÐ§¡£
+rem python -m pip È·±£×°½øÉÏ·½ÒÑ conda activate ²¢Ð£Ñé¹ýµÄ fps-screen »·¾³¡£
 python -m pip install -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com pyinstaller
 if errorlevel 1 goto :failed
-echo PyInstaller å®‰è£…å®Œæˆã€‚
+echo PyInstaller °²×°Íê³É¡£
 echo.
 
-rem ===== [3/5] æ‰“åŒ…å…±äº«ç«¯ï¼ˆwindowed æ— é»‘çª— + å¯é€‰ dxcam é‡‡é›†åŽç«¯ï¼‰=====
-echo [3/5] æ‰“åŒ…å…±äº«ç«¯ fps-host.exe ...
-rem ç¬¬ 68 æ¡ï¼šç›´æŽ¥ç”¨ä»“åº“å·²æäº¤çš„ fps-host.spec æ‰“åŒ…ï¼Œä¸å†ç”¨ pyinstaller CLI ä¼ å‚ã€‚
-rem CLI ä¼ å‚ä¼šé‡æ–°ç”Ÿæˆå¹¶è¦†ç›– .specï¼ŒæŠŠå…¶ä¸­çš„ collect_all('av') æŠ¹æŽ‰â€”â€”av.libs çš„
-rem FFmpeg DLL èƒ½å¦æ‰“è¿›åŽ»å°±å…¨çœ‹æœªå›ºå®šç‰ˆæœ¬çš„ pyinstaller-hooks-contribï¼›ä¸€æ—¦æ¼æ‰“ï¼Œ
-rem import av å¤±è´¥è¢« codec.py é™é»˜åžæŽ‰ï¼Œç”¨æˆ·ç«¯æ— å£°é€€å›ž JPEGï¼ˆå¸¦å®½ 5-20 å€å›žé€€ï¼‰ã€‚
-rem fps-host.spec å†…å·²å« pathex=['vendor']ã€collect_all('av')ã€hiddenimports=['dxcam']ã€
-rem console=Falseã€version_info.txtã€iconã€onedirï¼Œç­‰ä»·äºŽåŽŸ CLI çš„å…¨éƒ¨å‚æ•°ã€‚
+rem ===== [3/5] ´ò°ü¹²Ïí¶Ë£¨windowed ÎÞºÚ´° + ¿ÉÑ¡ dxcam ²É¼¯ºó¶Ë£©=====
+echo [3/5] ´ò°ü¹²Ïí¶Ë fps-host.exe ...
+rem µÚ 68 Ìõ£ºÖ±½ÓÓÃ²Ö¿âÒÑÌá½»µÄ fps-host.spec ´ò°ü£¬²»ÔÙÓÃ pyinstaller CLI ´«²Î¡£
+rem CLI ´«²Î»áÖØÐÂÉú³É²¢¸²¸Ç .spec£¬°ÑÆäÖÐµÄ collect_all('av') Ä¨µô¡ª¡ªav.libs µÄ
+rem FFmpeg DLL ÄÜ·ñ´ò½øÈ¥¾ÍÈ«¿´Î´¹Ì¶¨°æ±¾µÄ pyinstaller-hooks-contrib£»Ò»µ©Â©´ò£¬
+rem import av Ê§°Ü±» codec.py ¾²Ä¬ÍÌµô£¬ÓÃ»§¶ËÎÞÉùÍË»Ø JPEG£¨´ø¿í 5-20 ±¶»ØÍË£©¡£
+rem fps-host.spec ÄÚÒÑº¬ pathex=['vendor']¡¢collect_all('av')¡¢hiddenimports=['dxcam']¡¢
+rem console=False¡¢version_info.txt¡¢icon¡¢onedir£¬µÈ¼ÛÓÚÔ­ CLI µÄÈ«²¿²ÎÊý¡£
 pyinstaller --noconfirm --clean fps-host.spec
 if errorlevel 1 goto :failed
-echo å…±äº«ç«¯æ‰“åŒ…å®Œæˆã€‚
+echo ¹²Ïí¶Ë´ò°üÍê³É¡£
 echo.
 
-rem ===== [4/5] æ‰“åŒ…è§‚çœ‹ç«¯ï¼ˆwindowed æ— é»‘çª—ï¼‰å¹¶å¤„ç† frpc =====
-echo [4/5] æ‰“åŒ…è§‚çœ‹ç«¯ fps-viewer.exeï¼ˆwindowed æ— é»‘çª—ï¼‰...
-rem ç¬¬ 68 æ¡ï¼šåŒä¸Šï¼Œç”¨å·²æäº¤çš„ fps-viewer.specï¼ˆå« collect_all('av') ä¾› H.264 è§£ç ã€
-rem console=Falseã€version_info.txtã€iconã€onedirï¼‰ï¼Œé¿å… CLI è¦†ç›– spec æŠ¹æŽ‰ pyav æ”¶é›†ã€‚
+rem ===== [4/5] ´ò°ü¹Û¿´¶Ë£¨windowed ÎÞºÚ´°£©²¢´¦Àí frpc =====
+echo [4/5] ´ò°ü¹Û¿´¶Ë fps-viewer.exe£¨windowed ÎÞºÚ´°£©...
+rem µÚ 68 Ìõ£ºÍ¬ÉÏ£¬ÓÃÒÑÌá½»µÄ fps-viewer.spec£¨º¬ collect_all('av') ¹© H.264 ½âÂë¡¢
+rem console=False¡¢version_info.txt¡¢icon¡¢onedir£©£¬±ÜÃâ CLI ¸²¸Ç spec Ä¨µô pyav ÊÕ¼¯¡£
 pyinstaller --noconfirm --clean fps-viewer.spec
 if errorlevel 1 goto :failed
-echo è§‚çœ‹ç«¯æ‰“åŒ…å®Œæˆã€‚
+echo ¹Û¿´¶Ë´ò°üÍê³É¡£
 echo.
 
-rem frpc.exe æ”¾åœ¨ dist\ æ ¹ï¼ˆ= ä¸¤ä¸ª onedir ç›®å½•çš„ä¸Šä¸€çº§ï¼‰ï¼šhost/viewer æŒ‰
-rem common.app_dirs() æœç´¢ exe ç›®å½•ä¸Žä¸Šä¸€çº§ï¼Œå› æ­¤æ”¾åœ¨å®‰è£…æ ¹å³å¯è¢«ä¸¤ç«¯æ‰¾åˆ°ã€‚
+rem frpc.exe ·ÅÔÚ dist\ ¸ù£¨= Á½¸ö onedir Ä¿Â¼µÄÉÏÒ»¼¶£©£ºhost/viewer °´
+rem common.app_dirs() ËÑË÷ exe Ä¿Â¼ÓëÉÏÒ»¼¶£¬Òò´Ë·ÅÔÚ°²×°¸ù¼´¿É±»Á½¶ËÕÒµ½¡£
 if exist frpc.exe (
     copy /y frpc.exe dist\frpc.exe >nul
     if errorlevel 1 (
-        echo [è­¦å‘Š] frpc.exe å¤åˆ¶å¤±è´¥ï¼Œè¯·æ‰‹åŠ¨å°†å…¶æ”¾å…¥ dist\ æ ¹ç›®å½•ã€‚
+        echo [¾¯¸æ] frpc.exe ¸´ÖÆÊ§°Ü£¬ÇëÊÖ¶¯½«Æä·ÅÈë dist\ ¸ùÄ¿Â¼¡£
     ) else (
-        echo å·²å¤åˆ¶ frpc.exe åˆ° dist\ æ ¹ç›®å½•ã€‚
+        echo ÒÑ¸´ÖÆ frpc.exe µ½ dist\ ¸ùÄ¿Â¼¡£
     )
 ) else (
-    echo frpc.exe ä¸å­˜åœ¨ï¼Œå¯ç¨åŽä»Žæ¨±èŠ±ç®¡ç†é¢æ¿ä¸‹è½½å¹¶æ”¾å…¥ dist\ æ ¹ç›®å½•ã€‚
+    echo frpc.exe ²»´æÔÚ£¬¿ÉÉÔºó´ÓÓ£»¨¹ÜÀíÃæ°åÏÂÔØ²¢·ÅÈë dist\ ¸ùÄ¿Â¼¡£
 )
 echo.
 
-rem ===== [5/5] Authenticode ç­¾åï¼ˆé™ä½Žæ€è½¯/FPS åä½œå¼Šå¯¹æœªç­¾å PE çš„è¯¯æŠ¥ï¼‰=====
-rem ä¸ä¼  -Filesï¼šç”¨ sign_exe.ps1 é‡Œçš„é»˜è®¤åˆ—è¡¨ï¼ˆæ­£æ˜¯åˆšæ‰“å¥½çš„ä¸¤ä¸ª exeï¼‰ã€‚
-rem ç» cmd ä¼  "-Files a,b" ä¼šè¢«å½“æˆå•ä¸ªå­—ç¬¦ä¸²ç»‘å®šåˆ° [string[]]ï¼Œå‚æ•°ç»‘å®šä¸å¯é ã€‚
-echo [5/5] å¯¹ä¸¤ä¸ª exe åšä»£ç ç­¾å ...
+rem ===== [5/5] Authenticode Ç©Ãû£¨½µµÍÉ±Èí/FPS ·´×÷±×¶ÔÎ´Ç©Ãû PE µÄÎó±¨£©=====
+rem ²»´« -Files£ºÓÃ sign_exe.ps1 ÀïµÄÄ¬ÈÏÁÐ±í£¨ÕýÊÇ¸Õ´òºÃµÄÁ½¸ö exe£©¡£
+rem ¾­ cmd ´« "-Files a,b" »á±»µ±³Éµ¥¸ö×Ö·û´®°ó¶¨µ½ [string[]]£¬²ÎÊý°ó¶¨²»¿É¿¿¡£
+echo [5/5] ¶ÔÁ½¸ö exe ×ö´úÂëÇ©Ãû ...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1"
 if errorlevel 1 (
-    echo [è­¦å‘Š] ç­¾åå¤±è´¥æˆ–éƒ¨åˆ†å¤±è´¥ï¼Œäº§ç‰©ä»å¯ç”¨ï¼Œä½†æœªç­¾å exe æ›´å®¹æ˜“è¢«è¯¯æŠ¥ã€‚
+    echo [¾¯¸æ] Ç©ÃûÊ§°Ü»ò²¿·ÖÊ§°Ü£¬²úÎïÈÔ¿ÉÓÃ£¬µ«Î´Ç©Ãû exe ¸üÈÝÒ×±»Îó±¨¡£
 ) else (
-    echo ä»£ç ç­¾åå®Œæˆã€‚
+    echo ´úÂëÇ©ÃûÍê³É¡£
 )
 echo.
 
 echo ============================================
-echo   æ‰“åŒ…å®Œæˆï¼äº§ç‰©ä½äºŽ dist\ ç›®å½•ï¼ˆonedirï¼‰ï¼š
-echo     dist\fps-host\fps-host.exe      å…±äº«ç«¯
-echo     dist\fps-viewer\fps-viewer.exe  è§‚çœ‹ç«¯
-echo     dist\frpc.exe                   å…¬ç½‘éš§é“ï¼ˆå¯é€‰ï¼‰
-echo   è¯´æ˜Žï¼šå·²å…³é—­ UPXï¼›è¯·ç¡®è®¤ Authenticode å·²å†™å…¥ï¼ˆsign_exe.ps1ï¼‰ã€‚
+echo   ´ò°üÍê³É£¡²úÎïÎ»ÓÚ dist\ Ä¿Â¼£¨onedir£©£º
+echo     dist\fps-host\fps-host.exe      ¹²Ïí¶Ë
+echo     dist\fps-viewer\fps-viewer.exe  ¹Û¿´¶Ë
+echo     dist\frpc.exe                   ¹«ÍøËíµÀ£¨¿ÉÑ¡£©
+echo   ËµÃ÷£ºÒÑ¹Ø±Õ UPX£»ÇëÈ·ÈÏ Authenticode ÒÑÐ´Èë£¨sign_exe.ps1£©¡£
 echo ============================================
 if not defined CI if not defined NOPAUSE pause
 exit /b 0
 
 :failed
 echo.
-echo [é”™è¯¯] æ‰“åŒ…è¿‡ç¨‹ä¸­å‡ºçŽ°é”™è¯¯ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹æ—¥å¿—åŽé‡è¯•ã€‚
+echo [´íÎó] ´ò°ü¹ý³ÌÖÐ³öÏÖ´íÎó£¬Çë¼ì²éÉÏ·½ÈÕÖ¾ºóÖØÊÔ¡£
 if not defined CI if not defined NOPAUSE pause
 exit /b 1

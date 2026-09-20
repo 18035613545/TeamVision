@@ -999,8 +999,12 @@ class TestB13CredentialRetryUX(unittest.TestCase):
 class TestC3LogPrune(unittest.TestCase):
     def test_non_date_files_do_not_evict_real_logs(self):
         with tempfile.TemporaryDirectory() as tmp:
+            # dist-011（2026-09-20）：保留窗口改为"距今 N 天"，因此夹具的日期必须
+            # 相对今天生成——原先写死的 202601xx 在新口径下全部超龄（那正是新行为）。
+            dates = [time.strftime("%Y%m%d", time.localtime(
+                        time.time() - d * 86400)) for d in range(6, -1, -1)]
             names = ["app_debug.log"] + [
-                "app_202601%02d_pid1.log" % (d + 1) for d in range(7)]
+                "app_%s_pid1.log" % ds for ds in dates]
             for n in names:
                 open(os.path.join(tmp, n), "w", encoding="utf-8").close()
             handler = logger_mod._DateRotatingFileHandler.__new__(
@@ -1011,9 +1015,28 @@ class TestC3LogPrune(unittest.TestCase):
             self.assertIn("app_debug.log", left, "非日期命名文件不得被当成日期组")
             date_files = sorted(n for n in left if n != "app_debug.log")
             self.assertEqual(len(date_files), logger_mod._KEEP_DAYS)
-            # 保留的是最新的 5 天（20260103..20260107）
-            self.assertNotIn("app_20260101_pid1.log", left)
-            self.assertIn("app_20260107_pid1.log", left)
+            # 保留的是最新的 5 天，最旧的两天被删
+            self.assertNotIn("app_%s_pid1.log" % dates[0], left)
+            self.assertIn("app_%s_pid1.log" % dates[-1], left)
+
+    def test_stale_group_dropped_even_when_fewer_than_keep_days(self):
+        # dist-011（2026-09-20）：旧实现 `sorted(groups)[-5:]` 保留的是"目录里现存的
+        # 后 5 个日期组"而不是"距今 5 天"——只开过一天的机器隔 9 天再用，最旧那组
+        # 照样完整保留、实删 0 个文件（本机现存 5 组、最旧 9 天前即为此）。
+        with tempfile.TemporaryDirectory() as tmp:
+            old = time.strftime("%Y%m%d", time.localtime(time.time() - 9 * 86400))
+            for n in ("app_%s_pid1.log" % old,
+                      "app_%s_pid2.log" % old,
+                      "app_%s_pid3.log" % time.strftime("%Y%m%d")):
+                open(os.path.join(tmp, n), "w", encoding="utf-8").close()
+            handler = logger_mod._DateRotatingFileHandler.__new__(
+                logger_mod._DateRotatingFileHandler)
+            handler._log_dir = tmp
+            handler._prune_old()
+            left = set(os.listdir(tmp))
+            self.assertNotIn("app_%s_pid1.log" % old, left,
+                             "超龄日期组必须整组删除，哪怕现存组数不足 KEEP_DAYS")
+            self.assertIn("app_%s_pid3.log" % time.strftime("%Y%m%d"), left)
 
 
 class TestC7ListenBacklog(unittest.TestCase):

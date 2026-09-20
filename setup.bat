@@ -1,61 +1,80 @@
 @echo off
-chcp 65001 >nul
-rem ç¬¬ 72 æ¡ï¼šåˆ‡åˆ°è„šæœ¬è‡ªèº«ç›®å½•ï¼Œç¡®ä¿ requirements.txt ç­‰ç›¸å¯¹è·¯å¾„ä¸éšè°ƒç”¨æ–¹
-rem å½“å‰ç›®å½•ï¼ˆæˆ– CI å·¥ä½œç›®å½•ï¼‰æ¼‚ç§»è€Œè£…é”™æ–‡ä»¶ã€‚
+chcp 936 >nul
+rem dist-015£¨2026-09-20£©£º±¾ÎÄ¼þ°´ **ANSI/GBK£¨´úÂëÒ³ 936£©** ±£´æ£¬ÐÐÊ× chcp Ò²ÒÑ¸Ä³É 936¡£
+rem ²»ÒªÔÙ¸Ä»Ø UTF-8 + chcp 65001£ºÄÇÖÖ×éºÏÏÂ cmd °´×Ö½Ú¶Á½Å±¾¡¢È´°´ÂëÒ³½âÎöÐÐ±ß½ç£¬Êµ²â»á°Ñ
+rem Ä³ÐÐµÄÎ²²¿Æ¬¶Îµ±³ÉÃüÁîÖ´ÐÐ¡¢Í¬Ê±ÍÌµôÏàÁÚÃüÁîÐÐ£¨ÊØÎÀ/Ç©ÃûÄÇ¼¸ÐÐÊ×µ±Æä³å£¬ÇÒÍË³öÂëÅöÇÉ»¹
+rem ÊÇ¶ÔµÄ£¬Êô½ÄÐÒ£©£»¸Ä´æ"´ø BOM µÄ UTF-8"Ôò»áÈÃÊ×ÐÐ @echo off ±ä³ÉÃüÁîÃû¶ø±¨´í¡£
+rem µÚ 72 Ìõ£ºÇÐµ½½Å±¾×ÔÉíÄ¿Â¼£¬È·±£ requirements.txt µÈÏà¶ÔÂ·¾¶²»Ëæµ÷ÓÃ·½
+rem µ±Ç°Ä¿Â¼£¨»ò CI ¹¤×÷Ä¿Â¼£©Æ¯ÒÆ¶ø×°´íÎÄ¼þ¡£
 cd /d "%~dp0"
 set ENV_NAME=fps-screen
 set PYTHON_VERSION=3.10
-rem ç¬¬ 73 æ¡ï¼šé•œåƒåªä½œä¸ºã€Œæœ¬æ¬¡å‘½ä»¤ã€çš„å‚æ•°ä¼ å…¥ï¼Œä¸å†ç”¨ conda config / pip config æ°¸ä¹…
-rem ä¿®æ”¹å…¨å±€é…ç½®â€”â€”é‚£ä¼šå½±å“æœ¬æœºæ‰€æœ‰é¡¹ç›®ï¼Œè¶…å‡ºæœ¬é¡¹ç›®èŒƒå›´ã€‚è‹¥ç¡®éœ€å…¨å±€é•œåƒè¯·ç”¨æˆ·è‡ªè¡Œè®¾ç½®ã€‚
-set CONDA_MIRROR=-c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/ -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/
-set PIP_MIRROR=-i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+rem µÚ 73 Ìõ£º¾µÏñÖ»×÷Îª¡¸±¾´ÎÃüÁî¡¹µÄ²ÎÊý´«Èë£¬²»ÔÙÓÃ conda config / pip config ÓÀ¾Ã
+rem ÐÞ¸ÄÈ«¾ÖÅäÖÃ¡ª¡ªÄÇ»áÓ°Ïì±¾»úËùÓÐÏîÄ¿£¬³¬³ö±¾ÏîÄ¿·¶Î§¡£ÈôÈ·ÐèÈ«¾Ö¾µÏñÇëÓÃ»§×ÔÐÐÉèÖÃ¡£
+rem dist-013£¨2026-09-20£©£ºÄ¬ÈÏ¸ÄÓÃ¹Ù·½Ô´¡£¾ÉÊµÏÖ°ÑµÚÈý·½¾µÏñµ±Ä¬ÈÏ£¬»¹¸ø HTTPS Ô´¼ÓÁË
+rem --trusted-host mirrors.aliyun.com ¡ª¡ªÊµ²â¸ÃÖ÷»úÖ¤ÊéÓÉ GlobalSign Õý³£Ç©·¢¡¢Ä¬ÈÏÐÅÈÎÁ´
+rem ¼´¿ÉÐ£ÑéÍ¨¹ý£¬--trusted-host ÔÚÕâÀïÃ»ÓÐÈÎºÎ¼ÓËÙÊÕÒæ£¬Ö»»á¹ØµôÕâÌ¨Ö÷»úµÄÖ¤ÊéÐ£Ñé
+rem £¨µÈÓÚ½ÓÊÜÈÎÒâÖ¤Êé£©£¬°Ñ×°ÒÀÀµµÄÍ¨µÀ±ä³ÉÖÐ¼äÈË¿ÉÌæ»»µÄ¹©Ó¦Á´Èë¿Ú¡£
+rem ÐèÒª¹úÄÚ¾µÏñÊ±ÏÔÊ½¿ªÆô£ºsetup.bat --mirror  »òÏÈ set TV_USE_MIRROR=1
+set CONDA_MIRROR=
+set PIP_MIRROR=
+if /i "%~1"=="--mirror" set "TV_USE_MIRROR=1"
+if /i "%TV_USE_MIRROR%"=="1" (
+    set "CONDA_MIRROR=-c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/ -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/"
+    set "PIP_MIRROR=-i https://mirrors.aliyun.com/pypi/simple/"
+)
 
 echo ================================================
-echo FPS ç”»é¢ä¼ è¾“ç¨‹åº - conda çŽ¯å¢ƒä¸€é”®é…ç½®
+echo FPS »­Ãæ´«Êä³ÌÐò - conda »·¾³Ò»¼üÅäÖÃ
 echo ================================================
 
-:: æ£€æŸ¥ conda æ˜¯å¦å¯ç”¨
+:: ¼ì²é conda ÊÇ·ñ¿ÉÓÃ
 where conda >nul 2>nul
 if errorlevel 1 (
-    echo [é”™è¯¯] æœªæ£€æµ‹åˆ° condaï¼Œè¯·å…ˆå®‰è£… Anaconda æˆ– Minicondaã€‚
+    echo [´íÎó] Î´¼ì²âµ½ conda£¬ÇëÏÈ°²×° Anaconda »ò Miniconda¡£
     if not defined CI if not defined NOPAUSE pause
     exit /b 1
 )
 
-:: åˆ›å»º conda çŽ¯å¢ƒï¼ˆæ¸…åŽ TUNA é•œåƒï¼Œä»…æœ¬æ¬¡å‘½ä»¤ç”Ÿæ•ˆï¼‰
-echo [1/3] åˆ›å»º conda çŽ¯å¢ƒ %ENV_NAME%ï¼ˆPython %PYTHON_VERSION%ï¼‰...
+:: ´´½¨ conda »·¾³£¨Ä¬ÈÏ¹Ù·½Ô´£»--mirror / TV_USE_MIRROR=1 Ê±²ÅÓÃÇå»ª TUNA ¾µÏñ£©
+if defined CONDA_MIRROR (
+    echo [Ô´] ±¾´ÎÊ¹ÓÃ¹úÄÚ¾µÏñ£ºconda Çå»ª TUNA / pip °¢ÀïÔÆ£¨HTTPS Ð£Ñé±£³Ö¿ªÆô£©¡£
+) else (
+    echo [Ô´] ±¾´ÎÊ¹ÓÃ¹Ù·½Ô´£ºconda defaults / PyPI Ö±Á¬¡£ÍøÂçÊÜÏÞÊ±¼Ó --mirror ²ÎÊý¡£
+)
+echo [1/3] ´´½¨ conda »·¾³ %ENV_NAME%£¨Python %PYTHON_VERSION%£©...
 call conda create -n %ENV_NAME% python=%PYTHON_VERSION% -y %CONDA_MIRROR%
 if errorlevel 1 goto :failed
 
-:: æ¿€æ´»çŽ¯å¢ƒ
-echo [2/3] æ¿€æ´» conda çŽ¯å¢ƒ %ENV_NAME% ...
+:: ¼¤»î»·¾³
+echo [2/3] ¼¤»î conda »·¾³ %ENV_NAME% ...
 call conda activate %ENV_NAME%
 if errorlevel 1 goto :activate_failed
-rem ç¬¬ 73 æ¡ï¼šactivate å¯èƒ½ã€Œè¿”å›ž 0 å´æ²¡çœŸæ­£åˆ‡æ¢ã€ï¼ˆconda æœªå¯¹ cmd åˆå§‹åŒ–æ—¶ï¼‰ã€‚
-rem ç”¨ CONDA_DEFAULT_ENV äºŒæ¬¡ç¡®è®¤ï¼Œé¿å…æŠŠä¾èµ–è£…è¿› base/ç³»ç»Ÿ Pythonã€‚
+rem µÚ 73 Ìõ£ºactivate ¿ÉÄÜ¡¸·µ»Ø 0 È´Ã»ÕæÕýÇÐ»»¡¹£¨conda Î´¶Ô cmd ³õÊ¼»¯Ê±£©¡£
+rem ÓÃ CONDA_DEFAULT_ENV ¶þ´ÎÈ·ÈÏ£¬±ÜÃâ°ÑÒÀÀµ×°½ø base/ÏµÍ³ Python¡£
 if /i not "%CONDA_DEFAULT_ENV%"=="%ENV_NAME%" goto :activate_failed
 
-:: å®‰è£…é¡¹ç›®ä¾èµ–ï¼ˆé˜¿é‡Œäº‘é•œåƒ + çŽ¯å¢ƒè‡ªå¸¦ pipï¼Œä»…æœ¬æ¬¡å‘½ä»¤ç”Ÿæ•ˆï¼‰
-echo [3/3] ä»Žé˜¿é‡Œæºå®‰è£…é¡¹ç›®ä¾èµ–åˆ° %ENV_NAME% ...
+:: °²×°ÏîÄ¿ÒÀÀµ£¨»·¾³×Ô´ø pip£»¾µÏñ½öÔÚÏÔÊ½¿ªÆôÊ±¸½¼Ó£¬½ö±¾´ÎÃüÁîÉúÐ§£©
+echo [3/3] °²×°ÏîÄ¿ÒÀÀµµ½ %ENV_NAME% ...
 call python -m pip install %PIP_MIRROR% -r requirements.txt
 if errorlevel 1 goto :failed
 
 echo ================================================
-echo çŽ¯å¢ƒé…ç½®å®Œæˆï¼
-echo æ—¥å¸¸ä½¿ç”¨è¯·æ‰§è¡Œï¼šconda activate %ENV_NAME%
+echo »·¾³ÅäÖÃÍê³É£¡
+echo ÈÕ³£Ê¹ÓÃÇëÖ´ÐÐ£ºconda activate %ENV_NAME%
 echo ================================================
 if not defined CI if not defined NOPAUSE pause
 exit /b 0
 
 :activate_failed
 echo.
-echo [é”™è¯¯] conda çŽ¯å¢ƒ %ENV_NAME% æ¿€æ´»å¤±è´¥ï¼ˆå½“å‰ CONDA_DEFAULT_ENV=%CONDA_DEFAULT_ENV%ï¼‰ã€‚
-echo        ä¸ºé¿å…æŠŠä¾èµ–è£…è¿› base/ç³»ç»Ÿ Pythonï¼Œå·²ä¸­æ­¢å®‰è£…ã€‚
-echo        è¯·å…ˆæ‰§è¡Œï¼šconda init cmd.exe ï¼Œé‡å¼€ç»ˆç«¯åŽå†è¿è¡Œæœ¬è„šæœ¬ã€‚
+echo [´íÎó] conda »·¾³ %ENV_NAME% ¼¤»îÊ§°Ü£¨µ±Ç° CONDA_DEFAULT_ENV=%CONDA_DEFAULT_ENV%£©¡£
+echo        Îª±ÜÃâ°ÑÒÀÀµ×°½ø base/ÏµÍ³ Python£¬ÒÑÖÐÖ¹°²×°¡£
+echo        ÇëÏÈÖ´ÐÐ£ºconda init cmd.exe £¬ÖØ¿ªÖÕ¶ËºóÔÙÔËÐÐ±¾½Å±¾¡£
 if not defined CI if not defined NOPAUSE pause
 exit /b 1
 
 :failed
-echo æ‰§è¡Œè¿‡ç¨‹ä¸­å‡ºçŽ°é”™è¯¯ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹æ—¥å¿—åŽé‡è¯•ã€‚
+echo Ö´ÐÐ¹ý³ÌÖÐ³öÏÖ´íÎó£¬Çë¼ì²éÉÏ·½ÈÕÖ¾ºóÖØÊÔ¡£
 if not defined CI if not defined NOPAUSE pause
 exit /b 1

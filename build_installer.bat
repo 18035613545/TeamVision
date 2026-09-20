@@ -1,113 +1,169 @@
 @echo off
-chcp 65001 >nul
-rem ç¬¬ 72 æ¡ï¼šåˆ‡åˆ°è„šæœ¬è‡ªèº«ç›®å½•ï¼Œç¡®ä¿ installer.iss / dist\ ç­‰ç›¸å¯¹è·¯å¾„ä¸éš
-rem è°ƒç”¨æ–¹å½“å‰ç›®å½•ï¼ˆæˆ– CI å·¥ä½œç›®å½•ï¼‰æ¼‚ç§»è€Œä»Žé”™è¯¯çš„ç›®å½•æ ‘å–æ–‡ä»¶ã€‚
+chcp 936 >nul
+rem dist-015£¨2026-09-20£©£º±¾ÎÄ¼þ°´ **ANSI/GBK£¨´úÂëÒ³ 936£©** ±£´æ£¬ÐÐÊ× chcp Ò²ÒÑ¸Ä³É 936¡£
+rem ²»ÒªÔÙ¸Ä»Ø UTF-8 + chcp 65001£ºÄÇÖÖ×éºÏÏÂ cmd °´×Ö½Ú¶Á½Å±¾¡¢È´°´ÂëÒ³½âÎöÐÐ±ß½ç£¬Êµ²â»á°Ñ
+rem Ä³ÐÐµÄÎ²²¿Æ¬¶Îµ±³ÉÃüÁîÖ´ÐÐ¡¢Í¬Ê±ÍÌµôÏàÁÚÃüÁîÐÐ£¨ÊØÎÀ/Ç©ÃûÄÇ¼¸ÐÐÊ×µ±Æä³å£¬ÇÒÍË³öÂëÅöÇÉ»¹
+rem ÊÇ¶ÔµÄ£¬Êô½ÄÐÒ£©£»¸Ä´æ"´ø BOM µÄ UTF-8"Ôò»áÈÃÊ×ÐÐ @echo off ±ä³ÉÃüÁîÃû¶ø±¨´í¡£
+rem µÚ 72 Ìõ£ºÇÐµ½½Å±¾×ÔÉíÄ¿Â¼£¬È·±£ installer.iss / dist\ µÈÏà¶ÔÂ·¾¶²»Ëæ
+rem µ÷ÓÃ·½µ±Ç°Ä¿Â¼£¨»ò CI ¹¤×÷Ä¿Â¼£©Æ¯ÒÆ¶ø´Ó´íÎóµÄÄ¿Â¼Ê÷È¡ÎÄ¼þ¡£
 cd /d "%~dp0"
 echo ============================================
-echo   å®‰è£…åŒ…ç”Ÿæˆè„šæœ¬ (Inno Setup 6)
+echo   °²×°°üÉú³É½Å±¾ (Inno Setup 6)
 echo ============================================
 echo.
 
-rem ===== [1/4] å‰ç½®æ£€æŸ¥ï¼šdist äº§ç‰©ç¼ºå¤±å³ä¸­æ­¢ =====
-rem dist-002ï¼ˆ2026-09-18ï¼‰ï¼šæ—§å®žçŽ°ç¼º exe åªæ‰“å°ã€Œæç¤ºã€ç»§ç»­èµ°â€”â€”Inno çš„ dist\fps-host\*
-rem é€šé…åœ¨ç›®å½•ä¸å­˜åœ¨æ—¶ä»… warningï¼ŒäºŽæ˜¯èƒ½ç¼–è¯‘å‡º"å®‰è£…åŒ…å·²ç”Ÿæˆ"çš„**ç©ºå£³åŒ…**ä¸”è„šæœ¬ exit 0ã€‚
-rem ä¸¤ä¸ªç«¯çš„ exe æ˜¯ç¡¬å‰æï¼Œç¼ºå¤±ç›´æŽ¥å¤±è´¥ï¼ˆCI æ‰èƒ½æ­£ç¡®æ‹¦æˆªï¼‰ã€‚
-echo [1/4] æ£€æŸ¥ dist ç›®å½•ä¸‹çš„ç¼–è¯‘äº§ç‰©...
+rem ===== [1/4] Ç°ÖÃ¼ì²é£ºdist ²úÎïÈ±Ê§¼´ÖÐÖ¹ =====
+rem dist-002£¨2026-09-18£©£º¾ÉÊµÏÖÈ± exe Ö»´òÓ¡¡¸ÌáÊ¾¡¹¼ÌÐø×ß¡ª¡ªInno µÄ dist\fps-host\*
+rem Í¨ÅäÔÚÄ¿Â¼²»´æÔÚÊ±½ö warning£¬ÓÚÊÇÄÜ±àÒë³ö"°²×°°üÒÑÉú³É"µÄ**¿Õ¿Ç°ü**ÇÒ½Å±¾ exit 0¡£
+rem Á½¸ö¶ËµÄ exe ÊÇÓ²Ç°Ìá£¬È±Ê§Ö±½ÓÊ§°Ü£¨CI ²ÅÄÜÕýÈ·À¹½Ø£©¡£
+echo [1/4] ¼ì²é dist Ä¿Â¼ÏÂµÄ±àÒë²úÎï...
 set "HAS_FRPC=1"
 set "MISSING=0"
+rem dist-012£¨2026-09-20£©£º°²×°°üÎÄ¼þÃû´ËÇ°ÔÚ±¾ÎÄ¼þÀïÐ´ËÀÁËËÄ´¦£¬Óë installer.iss µÄ
+rem OutputBaseFilename ¸÷Ð´Ò»±é£»°æ±¾ bump Ê±Â©¸ÄÈÎÒ»´¦£¬ÏÂÃæµÄÊØÎÀÓëÇ©Ãû¾Í»áÈ¥²éÒ»¸ö
+rem ²»´æÔÚµÄ¾ÉÃû×Ö£¨¶ø sign_exe.ps1 ¶Ô"ÎÄ¼þ²»´æÔÚ"Ö»¼ÇÌø¹ý²¢ exit 0£©¡£¸ÄÎª´Ó iss ÏÖ¶Á£¬
+rem Á½´¦´Ó´Ë²»¿ÉÄÜÆ¯ÒÆ¡£
+set "SETUP_BASE="
+for /f "usebackq tokens=1,* delims==" %%A in ("installer.iss") do (
+    if /i "%%A"=="OutputBaseFilename" set "SETUP_BASE=%%B"
+)
+if not defined SETUP_BASE (
+    echo [´íÎó] Î´ÄÜ´Ó installer.iss ½âÎö³ö OutputBaseFilename£¬ÎÞ·¨È·¶¨°²×°°üÎÄ¼þÃû£¬ÒÑÖÐÖ¹¡£
+    if not defined CI if not defined NOPAUSE pause
+    exit /b 1
+)
+set "SETUP_EXE=dist\%SETUP_BASE%.exe"
+echo °²×°°üÄ¿±êÎÄ¼þ£¨È¡×Ô installer.iss£©£º%SETUP_EXE%
 if not exist "dist\fps-host\fps-host.exe" (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° dist\fps-host\fps-host.exeï¼Œè¯·å…ˆè¿è¡Œ build_exe.bat ç”Ÿæˆå…±äº«ç«¯ã€‚
+    echo [´íÎó] Î´ÕÒµ½ dist\fps-host\fps-host.exe£¬ÇëÏÈÔËÐÐ build_exe.bat Éú³É¹²Ïí¶Ë¡£
     set "MISSING=1"
 )
 if not exist "dist\fps-viewer\fps-viewer.exe" (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° dist\fps-viewer\fps-viewer.exeï¼Œè¯·å…ˆè¿è¡Œ build_exe.bat ç”Ÿæˆè§‚çœ‹ç«¯ã€‚
+    echo [´íÎó] Î´ÕÒµ½ dist\fps-viewer\fps-viewer.exe£¬ÇëÏÈÔËÐÐ build_exe.bat Éú³É¹Û¿´¶Ë¡£
     set "MISSING=1"
+)
+rem dist-010£¨2026-09-20£©£ºÁ½¸ö exe ¶¼ÔÚ ¡Ù ²úÎïÍêÕû¡£ÕæÕý³ÐÔØ python3xx.dll / av.libs /
+rem numpy µÄÊÇ _internal Ä¿Â¼£¬Inno µÄ dist\fps-host\* Í¨Åä¶Ô"Ä¿Â¼ÔÚ¡¢_internal ¿ÕÁË"
+rem Ò²²»±¨ warning£¬ÓÚÊÇÕÕÑùÄÜ±à³ö"°²×°°üÒÑÉú³É"µÄ¿Õ¿Ç°ü£¬ÓÃ»§×°ÍêÆô¶¯¼´
+rem "Failed to load Python DLL"£¨µÚ 68 Ìõ spec ±»¸²¸ÇÄÇÒ»ÀàÊÂ¹ÊµÄÏÖ³É³ö¿Ú£©¡£
+for %%D in (fps-host fps-viewer) do (
+    if not exist "dist\%%D\_internal\" (
+        echo [´íÎó] Î´ÕÒµ½ dist\%%D\_internal Ä¿Â¼£¬PyInstaller onedir ²úÎï²»ÍêÕû¡£
+        set "MISSING=1"
+    )
+    if not exist "dist\%%D\_internal\python*.dll" (
+        echo [´íÎó] dist\%%D\_internal ÄÚÃ»ÓÐ pythonXX.dll ¡ª¡ª ×°ÍêÆô¶¯¼´ "Failed to load Python DLL"¡£
+        set "MISSING=1"
+    )
+    if not exist "dist\%%D\_internal\av.libs" (
+        echo [´íÎó] dist\%%D\_internal ÄÚÃ»ÓÐ av.libs ¡ª¡ª FFmpeg DLL Î´ÊÕ¼¯£¬ÊÓÆµÂ·¾¶»á¾²Ä¬ÍË»Ø JPEG¡£
+        set "MISSING=1"
+    )
 )
 if "%MISSING%"=="1" (
     echo.
-    echo [é”™è¯¯] dist äº§ç‰©ä¸å®Œæ•´ï¼Œå·²ä¸­æ­¢ï¼ˆé¿å…ç”Ÿæˆç©ºå£³å®‰è£…åŒ…ï¼‰ã€‚
+    echo [´íÎó] dist ²úÎï²»ÍêÕû£¬ÒÑÖÐÖ¹£¨±ÜÃâÉú³É¿Õ¿Ç°²×°°ü£©¡£
     if not defined CI if not defined NOPAUSE pause
     exit /b 1
 )
 if not exist "dist\frpc.exe" (
     set "HAS_FRPC=0"
-    echo [è­¦å‘Š] æœªæ‰¾åˆ° dist\frpc.exe â€”â€” æœ¬å®‰è£…åŒ…å°†ä¸åŒ…å« frpcã€‚
-    echo        åŽæžœï¼šè£…å¥½çš„ç¨‹åºåªèƒ½å±€åŸŸç½‘ç›´è¿žå…±äº«ï¼Œå…¬ç½‘/æ¨±èŠ± frp éš§é“ä¸å¯ç”¨ï¼›
-    echo        ç”¨æˆ·åœ¨ frpc åŒºç‚¹ã€Œå¯åŠ¨ã€ä¼šçœ‹åˆ°ã€Œæœªæ‰¾åˆ° frpc ç¨‹åºã€æç¤ºã€‚
-    echo        å¦‚éœ€å…¬ç½‘å…±äº«ï¼Œè¯·ä»Žæ¨±èŠ±ç®¡ç†é¢æ¿ä¸‹è½½ frpc æ”¾å…¥ dist\ åŽé‡è·‘æœ¬è„šæœ¬ã€‚
-    echo        è‹¥åªåšå±€åŸŸç½‘å…±äº«ï¼Œæ­¤è­¦å‘Šå¯å¿½ç•¥â€”â€”LAN-only å®‰è£…åŒ…æ˜¯æœ‰æ„æ”¯æŒçš„å½¢æ€ã€‚
+    echo [¾¯¸æ] Î´ÕÒµ½ dist\frpc.exe ¡ª¡ª ±¾°²×°°ü½«²»°üº¬ frpc¡£
+    echo        ºó¹û£º×°ºÃµÄ³ÌÐòÖ»ÄÜ¾ÖÓòÍøÖ±Á¬¹²Ïí£¬¹«Íø/Ó£»¨ frp ËíµÀ²»¿ÉÓÃ£»
+    echo        ÓÃ»§ÔÚ frpc Çøµã¡¸Æô¶¯¡¹»á¿´µ½¡¸Î´ÕÒµ½ frpc ³ÌÐò¡¹ÌáÊ¾¡£
+    echo        ÈçÐè¹«Íø¹²Ïí£¬Çë´ÓÓ£»¨¹ÜÀíÃæ°åÏÂÔØ frpc ·ÅÈë dist\ ºóÖØÅÜ±¾½Å±¾¡£
+    echo        ÈôÖ»×ö¾ÖÓòÍø¹²Ïí£¬´Ë¾¯¸æ¿ÉºöÂÔ¡ª¡ªLAN-only °²×°°üÊÇÓÐÒâÖ§³ÖµÄÐÎÌ¬¡£
 )
 echo.
-echo æé†’ï¼šè¯·ç¡®è®¤å·²å…ˆè¿è¡Œ build_exe.bat ç”Ÿæˆ dist\ ä¸‹çš„å…±äº«ç«¯/è§‚çœ‹ç«¯ exeã€‚
+echo ÌáÐÑ£ºÇëÈ·ÈÏÒÑÏÈÔËÐÐ build_exe.bat Éú³É dist\ ÏÂµÄ¹²Ïí¶Ë/¹Û¿´¶Ë exe¡£
 echo.
 
-rem ===== [2/4] æ£€æµ‹ Inno Setup 6 ç¼–è¯‘å™¨ =====
-echo [2/4] æ£€æµ‹ Inno Setup 6 ç¼–è¯‘å™¨ (ISCC.exe)...
+rem ===== [2/4] ¼ì²â Inno Setup 6 ±àÒëÆ÷ =====
+echo [2/4] ¼ì²â Inno Setup 6 ±àÒëÆ÷ (ISCC.exe)...
 set "ISCC="
 where iscc >nul 2>nul
 if not errorlevel 1 set "ISCC=iscc"
 if not defined ISCC if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not defined ISCC if exist "C:\Program Files\Inno Setup 6\ISCC.exe" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
-rem ç¬¬ 101 æ¡ï¼šInno Setup 6 é»˜è®¤æ˜¯ã€Œä»…ä¸ºæˆ‘å®‰è£…ã€â†’ è£…åœ¨ %LOCALAPPDATA%\Programs\Inno Setup 6ï¼Œ
-rem ä¸Šé¢ä¸¤ä¸ª Program Files è·¯å¾„éƒ½ä¸å­˜åœ¨ã€‚æ—§è„šæœ¬å› æ­¤è¯¯æŠ¥ã€Œæœªæ£€æµ‹åˆ° Inno Setup 6ã€ï¼Œ
-rem å³ä½¿ç”¨æˆ·å·²è£…å¥½ä¹Ÿæ‰“åŒ…ä¸å‡ºå®‰è£…åŒ…ã€‚è¡¥ä¸Šç”¨æˆ·çº§å®‰è£…ç›®å½•ã€‚
+rem µÚ 101 Ìõ£ºInno Setup 6 Ä¬ÈÏÊÇ¡¸½öÎªÎÒ°²×°¡¹¡ú ×°ÔÚ %LOCALAPPDATA%\Programs\Inno Setup 6£¬
+rem ÉÏÃæÁ½¸ö Program Files Â·¾¶¶¼²»´æÔÚ¡£¾É½Å±¾Òò´ËÎó±¨¡¸Î´¼ì²âµ½ Inno Setup 6¡¹£¬
+rem ¼´Ê¹ÓÃ»§ÒÑ×°ºÃÒ²´ò°ü²»³ö°²×°°ü¡£²¹ÉÏÓÃ»§¼¶°²×°Ä¿Â¼¡£
 if not defined ISCC if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 
 if not defined ISCC (
     echo.
-    echo [é”™è¯¯] æœªæ£€æµ‹åˆ° Inno Setup 6ï¼Œè¯·å…ˆå®‰è£…ï¼ˆhttps://jrsoftware.org/isdl.phpï¼‰åŽé‡è¯•ã€‚
+    echo [´íÎó] Î´¼ì²âµ½ Inno Setup 6£¬ÇëÏÈ°²×°£¨https://jrsoftware.org/isdl.php£©ºóÖØÊÔ¡£
     echo.
     if not defined CI if not defined NOPAUSE pause
     exit /b 1
 )
-echo æ£€æµ‹åˆ° ISCCï¼š%ISCC%
+echo ¼ì²âµ½ ISCC£º%ISCC%
 echo.
 
-rem ===== [3/4] ç¼–è¯‘å®‰è£…åŒ… =====
-echo [3/4] ç¼–è¯‘å®‰è£…åŒ… installer.iss ...
+rem ===== [3/4] ±àÒë°²×°°ü =====
+echo [3/4] ±àÒë°²×°°ü installer.iss ...
 "%ISCC%" installer.iss
 if errorlevel 1 goto :failed
 echo.
 
-rem ===== [4/4] æ ¡éªŒäº§ç‰© + Authenticode ç­¾å =====
-echo [4/4] æ ¡éªŒå¹¶ç­¾åå®‰è£…åŒ… ...
-rem dist-002ï¼šISCC è¿”å›ž 0 ä»å¯èƒ½æ˜¯"ç©ºå£³åŒ…"ï¼ˆè§ [1/4]ï¼‰ï¼Œè¿™é‡Œå†æ ¡éªŒäº§ç‰©å­˜åœ¨ä¸”éžç©ºå£³
-if not exist "dist\TeamVision-Setup-1.4.0.exe" (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° dist\TeamVision-Setup-1.4.0.exeï¼Œå®‰è£…åŒ…æœªç”Ÿæˆã€‚
+rem ===== [4/4] Ð£Ñé²úÎï + Authenticode Ç©Ãû =====
+echo [4/4] Ð£Ñé²¢Ç©Ãû°²×°°ü ...
+rem dist-002£ºISCC ·µ»Ø 0 ÈÔ¿ÉÄÜÊÇ"¿Õ¿Ç°ü"£¨¼û [1/4]£©£¬ÕâÀïÔÙÐ£Ñé²úÎï´æÔÚÇÒ·Ç¿Õ¿Ç
+if not exist "%SETUP_EXE%" (
+    echo [´íÎó] Î´ÕÒµ½ %SETUP_EXE%£¬°²×°°üÎ´Éú³É¡£
     if not defined CI if not defined NOPAUSE pause
     exit /b 1
 )
-for %%A in ("dist\TeamVision-Setup-1.4.0.exe") do set "SETUP_SIZE=%%~zA"
+for %%A in ("%SETUP_EXE%") do set "SETUP_SIZE=%%~zA"
 if %SETUP_SIZE% LSS 1048576 (
-    echo [é”™è¯¯] å®‰è£…åŒ…ä½“ç§¯å¼‚å¸¸å°ï¼ˆ%SETUP_SIZE% å­—èŠ‚ï¼‰ï¼Œç–‘ä¼¼ç©ºå£³åŒ…ï¼Œè¯·æ£€æŸ¥ [1/4] çš„äº§ç‰©ã€‚
+    echo [´íÎó] °²×°°üÌå»ýÒì³£Ð¡£¨%SETUP_SIZE% ×Ö½Ú£©£¬ÒÉËÆ¿Õ¿Ç°ü£¬Çë¼ì²é [1/4] µÄ²úÎï¡£
     if not defined CI if not defined NOPAUSE pause
     exit /b 1
 )
-if exist "dist\TeamVision-Setup-1.4.0.exe" (
+rem dist-010£º>1MiB Ö»ÄÜµ²×¡"ÍêÈ«¿Õ¿Ç"£¬µ²²»×¡ _internal Ö»Ê£ÁãÐÇÎÄ¼þ¡£ÊµÏÖ·½°¸ ¡ì1.1
+rem ×Ô¼ºÐ´µÄÑéÊÕ±ê×¼ÊÇ"°²×°°ü ¡Ö111MiB¡¢Æ«²î >10% ËµÃ÷ spec ÌÞ³ýÊ§Ð§"£¬ÕâÀïÂäµØ£º
+rem µÍÓÚÓ²ÏÂÏÞ£¨90MiB£©ÅÐ¶¨Îª²úÎï²»ÍêÕûÖ±½ÓÖÐÖ¹£»ÂäÔÚÄ¿±ê´ø£¨Ô¼ 100~122MiB£©Ö®ÍâÖ»¸æ¾¯£¬
+rem ÒòÎª LAN-only °ü£¨²»º¬ frpc£©ÓëºóÐøÒÀÀµÔö¼õ¶¼»áÈÃÌå»ýºÏ·¨µØÆ«ÒÆ¡£
+set "SETUP_FLOOR=94371840"
+set "SETUP_LO=104752819"
+set "SETUP_HI=128018278"
+if %SETUP_SIZE% LSS %SETUP_FLOOR% (
+    echo [´íÎó] °²×°°üÌå»ý %SETUP_SIZE% ×Ö½ÚµÍÓÚÍêÕû²úÎïÏÂÏÞ %SETUP_FLOOR% ×Ö½Ú£¨»ùÏßÔ¼ 111MiB£©¡£
+    echo        ÒÉËÆ _internal È± DLL »òÒÀÀµÂ©×°£¬ÒÑÖÐÖ¹¡ª¡ª²»Òª°ÑÕâ¸ö°ü·¢³öÈ¥¡£
+    if not defined CI if not defined NOPAUSE pause
+    exit /b 1
+)
+if %SETUP_SIZE% LSS %SETUP_LO% (
+    echo [¾¯¸æ] °²×°°üÌå»ý %SETUP_SIZE% ×Ö½ÚµÍÓÚÄ¿±ê´øÏÂÏÞ %SETUP_LO% ×Ö½Ú£¨111MiB »ùÏß -10 ¸ö°Ù·Öµã£©¡£
+)
+if %SETUP_SIZE% GTR %SETUP_HI% (
+    echo [¾¯¸æ] °²×°°üÌå»ý %SETUP_SIZE% ×Ö½Ú¸ßÓÚÄ¿±ê´øÉÏÏÞ %SETUP_HI% ×Ö½Ú£¨111MiB »ùÏß +10 ¸ö°Ù·Öµã£©¡£
+)
+if exist "%SETUP_EXE%" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1" ^
-        -Files "dist\TeamVision-Setup-1.4.0.exe"
+        -Files "%SETUP_EXE%"
     if errorlevel 1 (
-        echo [è­¦å‘Š] å®‰è£…åŒ…ç­¾åå¤±è´¥ï¼Œäº§ç‰©ä»å¯ç”¨ã€‚
+        echo [¾¯¸æ] °²×°°üÇ©ÃûÊ§°Ü£¬²úÎïÈÔ¿ÉÓÃ¡£
     )
 ) else (
-    echo [è­¦å‘Š] æœªæ‰¾åˆ° dist\TeamVision-Setup-1.4.0.exeï¼Œè·³è¿‡ç­¾åã€‚
+    echo [¾¯¸æ] Î´ÕÒµ½ %SETUP_EXE%£¬Ìø¹ýÇ©Ãû¡£
 )
 echo.
 echo ============================================
 if "%HAS_FRPC%"=="1" (
-    echo   å®‰è£…åŒ…å·²ç”Ÿæˆï¼šdist\ ä¸‹çš„ TeamVision-Setup-*.exe
-    echo   å·²åŒ…å« frpc.exe â€”â€” æ”¯æŒå…¬ç½‘/æ¨±èŠ± frp éš§é“å…±äº«ã€‚
+    echo   °²×°°üÒÑÉú³É£º%SETUP_EXE%
+    echo   ÒÑ°üº¬ frpc.exe ¡ª¡ª Ö§³Ö¹«Íø/Ó£»¨ frp ËíµÀ¹²Ïí¡£
 ) else (
-    echo   å®‰è£…åŒ…å·²ç”Ÿæˆï¼šdist\ ä¸‹çš„ TeamVision-Setup-*.exe
-    echo   æœªåŒ…å« frpc.exe â€”â€” ä»…å±€åŸŸç½‘ç›´è¿žå…±äº«ï¼Œå…¬ç½‘ frp éš§é“ä¸å¯ç”¨ã€‚
+    echo   °²×°°üÒÑÉú³É£º%SETUP_EXE%
+    echo   Î´°üº¬ frpc.exe ¡ª¡ª ½ö¾ÖÓòÍøÖ±Á¬¹²Ïí£¬¹«Íø frp ËíµÀ²»¿ÉÓÃ¡£
 )
-echo   ç‰ˆæœ¬å·åŒ installer.iss çš„ OutputBaseFilename
+echo   °æ±¾ºÅÍ¬ installer.iss µÄ OutputBaseFilename
 echo ============================================
 if not defined CI if not defined NOPAUSE pause
 exit /b 0
 
 :failed
 echo.
-echo [é”™è¯¯] å®‰è£…åŒ…ç¼–è¯‘å¤±è´¥ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹æ—¥å¿—åŽé‡è¯•ã€‚
+echo [´íÎó] °²×°°ü±àÒëÊ§°Ü£¬Çë¼ì²éÉÏ·½ÈÕÖ¾ºóÖØÊÔ¡£
 if not defined CI if not defined NOPAUSE pause
 exit /b 1

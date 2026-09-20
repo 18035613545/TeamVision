@@ -33,6 +33,11 @@ import tempfile
 import threading
 import time
 
+try:
+    import msvcrt as _msvcrt      # cfg-004（2026-09-20）：跨进程字节范围锁
+except ImportError:               # 非 Windows 下为 None，锁退化为"必成功"
+    _msvcrt = None
+
 
 def _log_warning(fmt, *args):
     """延迟导入 logger 记录告警：logger.py 反向依赖本模块（data_dir/exe_dir），
@@ -1174,14 +1179,24 @@ def _persist_upgrade(path, raw, changes, silent=False):
     try:
         with _config_lock:
             # cfg-001：与 save_config 同一套跨进程保护（唯一临时名 + replace 重试）
-            fd = _config_file_lock(path)
+            fd = acquire_file_lock(path)
+            if fd is None:
+                raise OSError("未能取得 config.json 的跨进程锁，本次升级写回已放弃")
+            tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
             try:
-                tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(raw, f, ensure_ascii=False, indent=2)
                 _replace_retry(tmp, path)
             finally:
-                _config_file_unlock(path, fd)
+                # cfg-006（2026-09-20）：临时名唯一（PID+线程），写失败后旧实现不清理，
+                # 下次启动也不会覆盖回收 → 磁盘上永久留下含**明文 frp token**的残渣
+                # （实测留下 config.json.<pid>.<tid>.tmp，内含 SECRET-TOKEN）。
+                # save_config 的写盘分支有 remove，这里此前漏了——清理口径不对称。
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                release_file_lock(path, fd)
     except OSError as e:
         try:
             import logger
@@ -1299,41 +1314,57 @@ def _recover_corrupt_config(path, exc):
         pass
 
 
-def _config_file_lock(path, timeout=2.0):
-    """跨进程互斥（cfg-001）：`<config>.lock` 排他创建；返回 fd 或 None（超时/不可用）。
+def acquire_file_lock(path, timeout=2.0):
+    """跨进程互斥（cfg-001 → cfg-004/005 重做）：返回锁 fd，拿不到返回 None。
 
-    陈旧锁（持有者被强杀）超过 10 秒未更新即接管。超时不阻塞——宁可放行本次写
-    （极小概率竞争），也不能让 GUI 回调卡死。
+    旧实现是"`O_CREAT|O_EXCL` 排他创建 + 完成后删除"，并用**锁文件年龄 >10 秒**判定
+    陈旧再 `os.remove` 接管。两个洞：
+      ① 接管阈值 10 秒 > 等待上限 2 秒 —— 持有者崩溃/被强杀后的整个 10 秒窗口里，
+         每个写入者都等满 2 秒然后**无保护地写**，恰好是 cfg-001/auth-009 要根治的
+         场景（host 与 viewer 互相陈旧覆盖、双开实例抹掉账户）；
+      ② Windows 语义 —— `os.remove` 作用于仍被其它进程以句柄打开的文件抛
+         `PermissionError [WinError 32]`（Python 的 os.open 不带 FILE_SHARE_DELETE），
+         而这里 `except OSError: pass` 直接吞掉 → **活着的竞争者根本无法被接管**，
+         fail-open 是必然路径而非小概率。
+    现在改用 OS 级字节范围锁（msvcrt.locking）：进程退出或被强杀时句柄由内核关闭、
+    锁立即释放，因此既不需要"陈旧判定"（cfg-005 的墙钟回拨问题同此消失），也不存在
+    无保护写。锁文件留在磁盘上不删（删除本身就是那个竞争点）。
+    拿不到锁**不再放行**：调用方必须放弃本次写并告警（fail-closed）。
     """
     lock_path = path + ".lock"
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    except OSError as e:
+        _log_warning("跨进程锁文件 %s 打开失败（%s）", lock_path, e)
+        return None
+    if _msvcrt is None:
+        return fd                      # 非 Windows 退化为"必成功"（本项目只发 Windows 产物）
     while True:
         try:
-            return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock_path) > 10.0:
-                    os.remove(lock_path)
-                    continue
-            except OSError:
-                pass
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+            return fd
+        except OSError:
             if time.monotonic() >= deadline:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
                 return None
             time.sleep(0.05)
-        except OSError:
-            return None
 
 
-def _config_file_unlock(path, fd):
-    """释放 `_config_file_lock` 持有的锁（幂等）。"""
+def release_file_lock(path, fd):
+    """释放 `acquire_file_lock` 持有的锁（幂等；path 形参保留以兼容调用点）。"""
     if fd is None:
         return
+    if _msvcrt is not None:
+        try:
+            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
     try:
         os.close(fd)
-    except OSError:
-        pass
-    try:
-        os.remove(path + ".lock")
     except OSError:
         pass
 
@@ -1366,7 +1397,16 @@ def save_config(cfg, section=None):
     """
     path = _config_path()
     with _config_lock:
-        fd = _config_file_lock(path)
+        fd = acquire_file_lock(path)
+        if fd is None:
+            # cfg-004（2026-09-20）：拿不到跨进程锁时旧实现**照常完成整份写盘**
+            # （fail-open），而 Windows 下活锁根本无法接管 → 竞争期间每次都无保护地写，
+            # 恰好重现 cfg-001 要根治的"host 与 viewer 互相陈旧覆盖"。
+            # 现在放弃本次写并明确告警：内存里的改动仍然生效，用户重试一次即可落盘，
+            # 远比另一进程的整份配置被踩掉好。
+            _log_warning("config.json 未取得跨进程锁（另一实例正持有），"
+                         "本次写盘已放弃：改动仅在本次运行内生效，请稍后重试保存")
+            return False
         try:
             out = cfg
             if section is not None:
@@ -1401,4 +1441,4 @@ def save_config(cfg, section=None):
                 except Exception:
                     pass
         finally:
-            _config_file_unlock(path, fd)
+            release_file_lock(path, fd)
