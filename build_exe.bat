@@ -38,11 +38,16 @@ echo 环境 fps-screen 激活成功。
 echo.
 
 rem ===== [2/5] 安装 PyInstaller（阿里云镜像仅本次命令生效，不改全局 pip 配置）=====
-echo [2/5] 从阿里源安装 PyInstaller 到当前环境 ...
+echo [2/5] 安装 PyInstaller 到当前环境（默认官方 PyPI，TV_USE_MIRROR=1 才用镜像）...
 rem 第 73 条：原 `pip config set global.index-url ...` 会永久修改本机全局 pip 配置
 rem （影响所有项目，超出本项目范围）；改用 -i/--trusted-host 只对这一条命令生效。
 rem python -m pip 确保装进上方已 conda activate 并校验过的 fps-screen 环境。
-python -m pip install -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com pyinstaller
+rem dist-013（2026-09-20，与 setup.bat 同口径）：默认走官方 PyPI。第三方镜像改成**显式开关**
+rem （TV_USE_MIRROR=1）才用；并去掉 --trusted-host —— 源本身是 HTTPS，那个参数在这里只起
+rem "跳过该主机证书校验"的纯降级作用，没有额外收益。
+set "PIP_INDEX=-i https://pypi.org/simple/"
+if /i "%TV_USE_MIRROR%"=="1" set "PIP_INDEX=-i https://mirrors.aliyun.com/pypi/simple/"
+python -m pip install %PIP_INDEX% pyinstaller
 if errorlevel 1 goto :failed
 echo PyInstaller 安装完成。
 echo.
