@@ -5,6 +5,7 @@
 实时性能统计/采集源设置/滚动日志区。与 host.HostRuntime 通过线程安全快照联动。
 """
 
+import copy
 import logging
 import os
 import queue
@@ -428,15 +429,23 @@ class HostConsole:
 
         第 100 条：mss 对越界区域**不报错**，只是返回全黑帧（实测 left/top=99999
         时 mean=0），于是观看端全黑、GUI 却显示"采集源已更新"、帧率正常。这里用
-        所有显示器的最大宽高做保守校验（不按单个显示器原点比对，避免多屏偏移误判）。
+        所有显示器矩形的**并集边界**做保守校验。
+        capture-008（2026-09-24）：旧实现只比 `max(宽,高)`、隐含原点为 0——副屏摆在
+        主屏左侧/上方（坐标为负）时把合法区域判成越界。改为按并集四至比较，
         枚举失败（monitor_rects 为空）时不做校验。
         """
-        max_w = max((m["width"] for m in self.monitor_rects), default=0)
-        max_h = max((m["height"] for m in self.monitor_rects), default=0)
-        if max_w <= 0 or max_h <= 0:
+        rects = [m for m in self.monitor_rects
+                 if isinstance(m, dict) and all(k in m for k in ("left", "top", "width", "height"))]
+        if not rects:
             return None
-        if region["left"] + region["width"] > max_w or region["top"] + region["height"] > max_h:
-            return max_w, max_h
+        left = min(int(m["left"]) for m in rects)
+        top = min(int(m["top"]) for m in rects)
+        right = max(int(m["left"]) + int(m["width"]) for m in rects)
+        bottom = max(int(m["top"]) + int(m["height"]) for m in rects)
+        if (region["left"] < left or region["top"] < top
+                or region["left"] + region["width"] > right
+                or region["top"] + region["height"] > bottom):
+            return right - left, bottom - top
         return None
 
     def run(self):
@@ -452,11 +461,23 @@ class HostConsole:
         # 顶部地址编辑后也同步到配置与 frpc 区，避免只复制不保存
         frp = self._frp_cfg()
         frp["public_addr"] = addr
-        save_config(self.runtime.cfg, "host")
+        self._save_cfg("host")
         self._frp_addr_var.set(addr)
         self.root.clipboard_clear()
         self.root.clipboard_append(addr)
         self._set_status("公网地址已复制到剪贴板并保存")
+
+    def _save_cfg(self, section=None):
+        """保存配置；失败时把原因明示到状态栏（cfg-013，2026-09-24）。
+
+        cfg-004 让 save_config 改为 fail-closed 并返回 False（另一实例持有跨进程锁
+        时放弃写盘），而 11 个调用点无一跟进：状态栏照报"已应用/已保存"，实际设置
+        只在本次运行内生效、重启即丢，唯一线索是 windowed 打包下看不见的 WARNING。
+        """
+        ok = save_config(self.runtime.cfg, section)
+        if not ok:
+            self._set_status("保存失败：另一实例正占用配置，改动仅本次运行有效", error=True)
+        return ok
 
     def _frp_start(self):
         """保存隧道配置并启动 frpc。
@@ -471,7 +492,7 @@ class HostConsole:
         frp["token"] = self._frp_token_var.get().strip()
         frp["tunnel_ids"] = self._frp_tunnel_var.get().strip()
         frp["public_addr"] = self._frp_addr_var.get().strip()
-        save_config(self.runtime.cfg, "host")
+        self._save_cfg("host")
         self._set_status("正在启动隧道…")
         frp_mgr = self.runtime.frp
 
@@ -480,6 +501,12 @@ class HostConsole:
                 ok, msg = frp_mgr.start()
             except Exception as e:          # 兜底：工作线程异常也不得静默丢失原因
                 ok, msg = False, "启动 frpc 失败: %s" % e
+            if ok:
+                # G11/net-039（2026-09-24）：自检线程原本只在 run_server 创建一次，
+                # 而 frp.auto_start 默认 False——绝大多数用户走 GUI 启动，那一刻
+                # frpc 还没跑就根本不建线程，整条自检链（第 134 条/B2）永不可达、
+                # 面板网络状态恒为"未跑"。启动成功后补建（内部幂等，不建第二条）。
+                self.runtime.ensure_tunnel_selfcheck()
             self._post_ui(lambda: self._set_status(msg, error=not ok))
 
         threading.Thread(target=_work, name="frp-start", daemon=True).start()
@@ -554,7 +581,13 @@ class HostConsole:
             sec = {}
             cfg["update_check"] = sec
         sec["enabled"] = on
-        save_config(cfg, section="update_check")
+        self._save_cfg("update_check")
+        if on:
+            # G28/ui-040（2026-09-24）：勾选后本会话原先不触发任何检查——update_check
+            # 是一次性检查且只有启动期调用，opt-in 要等下次启动才生效，而状态栏却写
+            # "每 24 小时向 GitHub 查询一次"（双重谎报）。勾选即补一次后台检查。
+            update_check.start_background_check(
+                cfg, lambda msg: self._post_ui(lambda m=msg: self._set_status(m)))
         self._set_status("更新检查已%s%s" % (
             "开启（每 24 小时向 GitHub 查询一次）" if on else "关闭（不再外连）", ""))
 
@@ -601,7 +634,7 @@ class HostConsole:
             host["auth"] = auth
         auth["enabled"] = bool(self._auth_var.get())
         auth["allow_register"] = policy
-        save_config(self.runtime.cfg, "host")
+        self._save_cfg("host")
         with self.runtime.slot_lock:
             self.runtime.slot["fps"] = fps
             self.runtime.slot["quality"] = quality
@@ -664,18 +697,30 @@ class HostConsole:
         hint.pack(anchor="w", padx=10)
 
         def refresh():
-            tree.delete(*tree.get_children())
-            rows = accounts.list_users()
-            for user, created, last in rows:
-                tree.insert("", "end", text=user,
-                            values=(created or "-", last or "-"))
-            if not rows:
-                hint.configure(text="（无账户；准入开启时观看端将无法登录）")
-            else:
-                # ui-016（2026-09-18）：加回账户后必须擦掉"无账户"提示——
-                # 旧实现只写不擦，提示与列表相互矛盾
-                hint.configure(text="")
-            return rows
+            # ui-045（2026-09-24）：函数体原先无异常保护——`list_users` 的
+            # `rows.sort(key=(created, user))` 对手改的 `"created": 12345` 抛 TypeError，
+            # 面板永久空白；`add_account` 成功弹窗后的回调抛错在 windowed 打包下
+            # 零提示（无 stderr）。这里兜住并在窗口内提示（第 91 条同类口未覆盖 host 侧）。
+            try:
+                tree.delete(*tree.get_children())
+                rows = accounts.list_users()
+                for user, created, last in rows:
+                    tree.insert("", "end", text=user,
+                                values=(created or "-", last or "-"))
+                if not rows:
+                    hint.configure(text="（无账户；准入开启时观看端将无法登录）")
+                else:
+                    # ui-016（2026-09-18）：加回账户后必须擦掉"无账户"提示——
+                    # 旧实现只写不擦，提示与列表相互矛盾
+                    hint.configure(text="")
+                return rows
+            except Exception as e:
+                log.warning("账户列表刷新失败: %s", e, exc_info=True)
+                try:
+                    hint.configure(text="读取账户表失败：%s（详见日志）" % e)
+                except Exception:
+                    pass
+                return []
 
         def selected_user():
             sel = tree.selection()
@@ -795,7 +840,12 @@ class HostConsole:
                                    parent=self.root)
             return
         logs_dir = os.path.join(base_dir, "logs")
-        cfg = self.runtime.cfg
+        # dist-017（2026-09-24）：必须给工作线程一份**快照**——旧实现把活动中的
+        # config 字典直接交给压缩线程，而主线程随时可能改它（勾选"检查更新"会新增
+        # 顶层键、改采集区域会写 capture 节），diag.redact 递归 `.items()` 遍历时抛
+        # `RuntimeError: dictionary changed size during iteration` → 用户看到"导出失败"；
+        # 即使不抛也可能打出半新半旧的 config.json（ui-008 把它移出主线程时引入）。
+        cfg = copy.deepcopy(self.runtime.cfg)
         extra_text = "\n".join(extra)
         self._diag_exporting = True
         try:

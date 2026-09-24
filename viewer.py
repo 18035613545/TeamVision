@@ -32,23 +32,29 @@ from tkinter import ttk, messagebox
 # onedir 冷启动时 cv2.pyd（~86MB）是导入大头；win32*/tkinter 是 Tk 系最轻的
 # 依赖，保留顶层。cv2/np/Image/ImageTk/share_mod 的全部使用点都在函数体内
 # （模块导入期零引用），哨兵初值不会被触及。
-cv2 = np = Image = ImageTk = share_mod = None
+cv2 = np = Image = ImageTk = share_mod = codec_mod = None
 
 
 def _load_heavy():
-    """惰性加载重依赖（幂等）：cv2 / numpy / PIL / share→pipeline 链。"""
-    global cv2, np, Image, ImageTk, share_mod
+    """惰性加载重依赖（幂等）：cv2 / numpy / PIL / share→pipeline 链 / codec→av。
+
+    G27/ui-039（2026-09-24）：`import codec as codec_mod` 曾在模块顶层，而 codec.py
+    顶层 `import av`——onedir 下 FFmpeg 全部 DLL 仍记在 splash 出现之前，第 133 条
+    "重依赖延后"的收益被吃掉一半。现在与 cv2/PIL 同批延后到 splash 之后。
+    """
+    global cv2, np, Image, ImageTk, share_mod, codec_mod
     if cv2 is not None:
         return
     import cv2 as _cv2
     import numpy as _np
     from PIL import Image as _Image, ImageTk as _ImageTk
     import share as _share
-    cv2, np, Image, ImageTk, share_mod = _cv2, _np, _Image, _ImageTk, _share
+    import codec as _codec
+    cv2, np, Image, ImageTk = _cv2, _np, _Image, _ImageTk
+    share_mod, codec_mod = _share, _codec
 
 import logger
 import splash
-import codec as codec_mod
 import diag
 import ui_common
 import update_check
@@ -93,6 +99,10 @@ from common import (
 
 #: 模块级日志（logger.setup_logger(cfg) 幂等初始化后生效）
 log = logger.get_logger()
+
+#: T-16（2026-09-24）：延迟样本环上限。测试必须引用本常量而不是自造 900——
+#: 旧用例自己建 deque(maxlen=900)，把生产值改成 90000 仍会绿（假绿）。
+_LATENCY_RING_MAX = 900
 
 #: 品牌标题（面板标题/悬浮窗占位文字共用）
 APP_TITLE = "%s v%s" % (APP_NAME, APP_VERSION)
@@ -333,7 +343,7 @@ class Channel:
         # E4（实现方案 §11.4）：30 秒 P50/P95 样本环（≈900 帧@30fps 封顶，防内存漂移），
         # 元素 (monotonic 到达时刻, latency_us)；_p_stats_cache = (算得时刻, p50, p95, n)，
         # 最长 5 秒重算一次（悬浮窗 15ms 轮询直接读缓存）。
-        self._latency_ring = deque(maxlen=900)
+        self._latency_ring = deque(maxlen=_LATENCY_RING_MAX)
         self._p_stats_cache = None
         threading.Thread(
             target=self._receiver_loop, name="channel-recv", daemon=True
@@ -443,6 +453,12 @@ class Channel:
                 self.status = "receiving"
                 self.video_mode = False
                 self._got_key = False
+                # net-042（2026-09-24）：追新状态必须随重连复位——旧实现只在 __init__ /
+                # switch_source / 关键帧到位三处清它，重连路径不清：新连接首个巡检窗口
+                # 判据（`_resync and now - _resync_at >= 阈值`）立即成立，而退避
+                # （_retry_delay 收帧即归零）压不住重连，链路正常也会反复断连。
+                self._resync = False
+                self._resync_at = 0.0
                 self._gen = getattr(self, "_gen", 0) + 1   # 第 105 条（B6）：作废在途批次（旧连接的 NAL）
                 # 第 116 条（C6）：重连尽量复用已有解码上下文（flush_buffers），
                 # 编码类型变化时才 set_codec 重建；原先每次重连都 new VideoDecoder。
@@ -682,9 +698,36 @@ class Channel:
             if self._active_sock is not sock:
                 return  # 连接已重建/断开：旧连接的心跳线程退出
             try:
-                self._send_locked(sock, {"action": Act.PING, "t": time.time_ns()})
+                t = time.time_ns()
+                # net-041（2026-09-24）：RTT 必须用**单调钟**测——旧实现在 PONG 侧用
+                # 墙钟相减，系统时间回拨幅度一旦超过真实 RTT，每个 pong 都算出负值被
+                # `0 < rtt_ms` 丢弃，`round_trip_ms` 永久锁存旧值，而
+                # `effective_latency_ms()` 优先取 RTT/2 → 延迟长期假显示。
+                # wire 上仍带墙钟 t（协议不变），本地另记一份单调时刻按 t 配对。
+                self._note_ping_sent(t, time.monotonic())
+                self._send_locked(sock, {"action": Act.PING, "t": t})
             except (OSError, ValueError):
                 return  # 连接已断/发送超时，接收循环会负责重连
+
+    def _note_ping_sent(self, t, mono=None):
+        """记录一次 ping 的发出时刻（net-041：RTT 用单调钟配对，键为 wire 上的 t）。
+
+        只保留最近 4 条，避免长连接下无界增长。
+        """
+        if mono is None:
+            mono = time.monotonic()
+        table = getattr(self, "_ping_mono", None)
+        if table is None:
+            table = self._ping_mono = {}
+        table[int(t)] = mono
+        while len(table) > 4:
+            table.pop(min(table), None)
+
+    def _pop_ping_sent(self, t):
+        table = getattr(self, "_ping_mono", None)
+        if not table:
+            return None
+        return table.pop(int(t), None)
 
     def _request_keyframe(self, sock):
         """向服务端请求关键帧（带 0.5s 冷却），用于首连/丢关键帧/花屏快速恢复。
@@ -862,7 +905,13 @@ class Channel:
         if action == Act.PONG:
             t = msg.get("t")
             if isinstance(t, int) and t > 0:
-                rtt_ms = (time.time_ns() - t) / 1_000_000.0
+                # net-041：优先用本地单调钟配对（时钟回拨不再污染 RTT）；配对失败
+                # （对端回了非本连接的旧 t）时退回墙钟差，保持旧行为可用。
+                t0 = self._pop_ping_sent(t)
+                if t0 is not None:
+                    rtt_ms = (time.monotonic() - t0) * 1000.0
+                else:
+                    rtt_ms = (time.time_ns() - t) / 1_000_000.0
                 if 0 < rtt_ms < 60_000:  # 过滤异常值（>60s 视为脏数据）
                     self.round_trip_ms = rtt_ms
         elif action == Act.CAP:
@@ -1189,8 +1238,11 @@ class Channel:
         # C19（2026-09-11）：轮询改用 _stop_evt.wait(0.1)——原来 time.sleep(0.1) 不受
         # stop()/request_stop() 影响，删除频道后接收线程仍会在这里空转最长 60 秒。
         stop_evt = getattr(self, "_stop_evt", None)
-        deadline = time.time() + 60
-        while time.time() < deadline:
+        # auth-024（2026-09-24）：等待用**单调钟**——开机阶段系统时间向后校正会让
+        # 墙钟 deadline 立即到期，for-else 直接返回 None，被当成"用户取消登录"并设
+        # 30 秒静默冷却。同函数下方的队列等待已是累加式，仅这一处漏改。
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
             if not getattr(self, "_running", True):
                 return None
             if stop_evt is not None and stop_evt.is_set():
@@ -1771,6 +1823,10 @@ class ViewerApp:
         self.menu = None
         self.hwnd = None
         self.panel = None
+        self._float_left = None       # 悬浮窗当前左缘（面板让位定位用）
+        self._panel_auto_xy = None    # 面板上次自动定位结果（用于检测用户手动挪动）
+        self._panel_auto_spec = None  # 上次下发的几何串（L5：未变则跳过冗余 Tcl 调用）
+        self._panel_user_moved = False
         # B4（实现方案 §6）：更新提示后缀，拼在面板底部状态标签的默认文本后
         self._update_hint = ""
         self._share_toggle_busy = False  # 第 60 条：共享开关异步执行期间的重入护栏
@@ -1820,12 +1876,28 @@ class ViewerApp:
         self.root = root if root is not None else tk.Tk()
         _TK_ROOT = self.root
         if root is not None:
+            # G4b/ui-036（2026-09-24）：三条语句原先共用一个 `except TclError: pass`，
+            # 而尺寸复位（geometry("")）排在末位——前两条任一抛错（splash root 被外部
+            # 销毁、销毁过程控件树不一致）就会跳过它，380x120 的 splash 尺寸与残留标签
+            # 一起留下，"小窗无法完整显示"症状原样复现且零日志。逐条独立保护。
             try:
                 root.overrideredirect(False)
+            except tk.TclError:
+                log.debug("解除 splash 无边框失败（root 已销毁？）", exc_info=True)
+            try:
                 for w in list(root.winfo_children()):
                     w.destroy()
             except tk.TclError:
-                pass  # splash root 已被外部销毁：照常继续（_build_ui 重设一切）
+                log.debug("清理 splash 子控件失败", exc_info=True)
+            # A3（第 133 条）：splash 给 root 下过**显式尺寸**（_FAST_SIZE 380x120），
+            # 而 `wm geometry "+x+y"` 只改位置、不改尺寸——复用后悬浮窗永远被钳在
+            # splash 大小：贴图 361x203 也只露出上面一条（用户报"右上角小窗无法
+            # 完整显示对方屏幕"，实测窗口恒 380x120 = 启动图尺寸）。空串 = 交还给
+            # 内容请求尺寸，之后 `_position_top_right` 的 "+x+y" 只挪位置不锁尺寸。
+            try:
+                root.geometry("")
+            except tk.TclError:
+                log.debug("解除 splash 显式尺寸失败（root 已销毁？）", exc_info=True)
         self._build_ui()
         self._maybe_run_wizard()
         self._build_panel()
@@ -1980,7 +2052,7 @@ class ViewerApp:
                 for ch in self.channels
                 if not getattr(ch, "ephemeral", False)
             ]
-            save_config(self.cfg, "viewer")
+            self._save_cfg()
 
     def _schedule_save(self):
         """合并短时间内的多次 viewer 配置写入（第 64 条）。
@@ -2008,7 +2080,7 @@ class ViewerApp:
         """立即落盘待写的 viewer 配置（去抖到期或退出兜底时调用）。"""
         self._save_after_id = None
         try:
-            save_config(self.cfg, "viewer")
+            self._save_cfg()
         except Exception:
             log.debug("保存 viewer 配置失败", exc_info=True)
 
@@ -2321,6 +2393,7 @@ class ViewerApp:
         self._panel_selected = None          # 预览/操作目标行；None 时跟随活动频道
         self._panel_known_count = None       # 上次列表行数（行数变化时重置选中）
         self._panel_suppress_select = False  # 重建列表时抑制选择事件
+        self._panel_last_size = None         # 面板上次尺寸（变化即重新让位，见 _on_panel_configure）
         self._status_after_id = None         # 底部状态标签的恢复定时器
         self._panel_last_serial = -1         # 预览已绘制的帧序号，避免重复缩放
         self._panel_last_idx = -1            # 预览已绘制的频道下标
@@ -2328,16 +2401,17 @@ class ViewerApp:
 
         # 关闭面板 = 隐藏（不退出程序）；overlay 右键菜单增加"显示控制台"
         panel.protocol("WM_DELETE_WINDOW", self._panel_hide)
+        panel.bind("<Configure>", self._on_panel_configure)
         self.menu.insert(1, "command", label="显示控制台", command=self._panel_show)
 
-        # 定位到屏幕右上角（悬浮窗左侧留边距）
-        panel.update_idletasks()
-        panel.geometry("+%d+%d" % (
-            panel.winfo_screenwidth() - panel.winfo_reqwidth() - 40, 60))
+        # 定位到屏幕右上角（悬浮窗左侧留边距，见 _position_panel_left_of）
+        self._position_panel_left_of()
 
         # 立即刷新一次，并进入 500ms / 200ms 周期调度
         self._panel_refresh_list()
         self._panel_refresh_preview()
+        # 首次刷新会填充树/预览内容，面板宽度以刷新后为准——按最终宽度再让位一次。
+        self._position_panel_left_of()
 
     # ---------- 面板：显示/隐藏 ----------
 
@@ -2346,11 +2420,21 @@ class ViewerApp:
         self.panel.withdraw()
 
     def _panel_show(self):
-        """重新显示面板（overlay 右键菜单"显示控制台"）。"""
+        """重新显示面板（overlay 右键菜单"显示控制台"），并复位自动跟随。
+
+        G3/ui-034（2026-09-24）：`_panel_user_moved` 旧实现一旦置位就永不复位（只有
+        重启 viewer 才能恢复跟随），而 docstring 声称"重新显示时就在正确位置"。
+        重新显示是用户可见的复位入口：清掉手动标记与几何缓存后按当前小窗重新让位。
+        """
+        self._panel_user_moved = False
+        # 面板此刻可能停在用户位置：旧坐标不能用来重判"用户挪动"，几何也必须重算
+        self._panel_auto_xy = None
+        self._panel_auto_spec = None
         self.panel.deiconify()
         self.panel.lift()
         if self.panel_topmost:
             self.panel.attributes("-topmost", True)
+        self._position_panel_left_of()
 
     def _panel_visible(self):
         """面板是否真实可见：withdraw（隐藏）后 winfo_viewable() 为假。
@@ -2803,6 +2887,26 @@ class ViewerApp:
 
     # ---------- 面板：底部状态标签 ----------
 
+    def _save_cfg(self, section="viewer"):
+        """落盘配置；失败（另一实例持跨进程锁时 save_config fail-closed 返回 False）时
+        在面板状态栏明示，返回是否成功（cfg-013，2026-09-24）。
+
+        cfg-004 之后 save_config 会返回 False，而调用点原先无一跟进——状态栏照报
+        "已保存"，设置只在本次运行内生效、重启即丢，windowed 打包下日志也看不见。
+        """
+        try:
+            ok = save_config(self.cfg, section)
+        except Exception:
+            log.debug("保存配置异常", exc_info=True)
+            ok = False
+        if not ok:
+            try:
+                self._panel_set_status("保存失败：另一实例正占用配置，改动仅本次运行有效",
+                                       error=True)
+            except Exception:
+                log.warning("viewer 配置未能写盘（另一实例持锁？）：改动仅本次运行有效")
+        return ok
+
     def _panel_set_status(self, text, error=False):
         """在底部状态标签显示消息（错误红色/成功绿色），3 秒后恢复默认。"""
         self._status_label.configure(text=text,
@@ -3004,13 +3108,13 @@ class ViewerApp:
         def _confirm():
             added, failed = self._wizard_apply(entry.get("1.0", "end"))
             self.cfg["viewer"]["wizard_done"] = True
-            save_config(self.cfg, "viewer")
+            self._save_cfg()
             log.info("首次使用向导完成：新增 %d 个频道，跳过 %d 行", added, failed)
             win.destroy()
 
         def _skip():
             self.cfg["viewer"]["wizard_done"] = True
-            save_config(self.cfg, "viewer")
+            self._save_cfg()
             log.info("用户跳过了首次使用向导")
             win.destroy()
 
@@ -3302,6 +3406,163 @@ class ViewerApp:
         x = self.root.winfo_screenwidth() - w - 10
         y = 10
         self.root.geometry("+%d+%d" % (x, y))
+        self._float_left = x
+        # 面板与悬浮窗同为 topmost，且面板创建更晚、z 序在上——两者一旦重叠，面板就会
+        # 把小窗里的对方画面盖掉（启动即发生）。悬浮窗尺寸一变就重新让位。
+        self._position_panel_left_of(x)
+
+    #: 面板自动定位参数：与悬浮窗左缘的水平间隙、贴顶 y、屏内边距、可用最小宽度
+    _PANEL_GAP = 20
+    _PANEL_Y = 60
+    _PANEL_MARGIN = 10
+    _PANEL_MIN_W = 320
+
+    def _float_max_height(self):
+        """悬浮窗画面允许的最大高度（ui-043）：屏高减去边距与任务栏余量。
+
+        拿不到屏高（测试替身/未 map）时返回一个宽松上限，不阻断绘制。
+        """
+        try:
+            h = int(self.root.winfo_screenheight())
+        except Exception:
+            h = 0
+        if h <= 0:
+            return 10000
+        return max(120, h - 80)
+
+    def _float_rect(self):
+        """悬浮窗当前屏幕矩形 (left, top, right, bottom)；尺寸未知时返回 None。
+
+        宽度口径与 `_position_top_right` 一致：root 当前宽、画面 label 请求宽、状态
+        叠加行请求宽取最大（ui-014），避免 map 前 winfo_width() 为 0 时算错。
+        """
+        try:
+            left = int(self.root.winfo_x())
+            top = int(self.root.winfo_y())
+            w = int(self.root.winfo_width() or 0)
+            label = getattr(self, "label", None)
+            overlay = getattr(self, "status_overlay", None)
+            if label is not None:
+                w = max(w, int(label.winfo_reqwidth()))
+            if overlay is not None:
+                w = max(w, int(overlay.winfo_reqwidth()))
+            h = int(getattr(self.root, "winfo_height", lambda: 0)() or 0)
+        except Exception:
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return left, top, left + w, top + h
+
+    def _panel_layout(self, panel, float_left):
+        """计算面板目标几何，返回 (spec, (x, y))；拿不到尺寸时返回 (None, None)。
+
+        G1/G2（2026-09-24）：旧实现只"让位"并把 x 钳到 0——屏宽 < 面板宽 + 小窗宽 +
+        间隙（1366 屏 + display_width=960、高 DPI 缩放、用户拖大 display_width）时
+        钳位后继续与小窗相交；y 恒 `_PANEL_Y` 且不校验屏高，1080p + 队伍行多时面板
+        底部（退出/关于/一键诊断 footer）越出屏幕下缘。现在：
+          ① 横向放得下 → 贴在悬浮窗左侧保间隙；
+          ② 放不下 → 收窄面板到可用宽度（不低于 `_PANEL_MIN_W`）；
+          ③ 仍放不下（小窗几乎占满屏宽）→ 宽度放开，尽量纵向躲到小窗下方；
+          ④ y 一律钳进屏内，保证面板整体可用。
+        """
+        try:
+            reqw = int(panel.winfo_reqwidth())
+        except Exception:
+            return None, None
+        reqh = int(getattr(panel, "winfo_reqheight", lambda: 0)() or 0)
+        try:
+            screen_w = int(self.root.winfo_screenwidth() or 0)
+        except Exception:
+            screen_w = 0
+        try:
+            screen_h = int(self.root.winfo_screenheight() or 0)
+        except Exception:
+            screen_h = 0                       # 测试替身拿不到屏高 → 不做纵向钳制
+        margin = self._PANEL_MARGIN
+        avail = max(0, int(float_left) - self._PANEL_GAP)
+        if reqw <= avail:
+            x, w = avail - reqw, reqw          # 常规：小窗左侧
+        elif avail >= self._PANEL_MIN_W and reqh > 0:
+            x, w = 0, avail                    # 兜底①：收窄面板到可用宽度
+        else:
+            x, w = 0, reqw                     # 兜底②：宽度放开（小窗几乎占满屏宽）
+        y = self._PANEL_Y
+        if screen_h > 0 and reqh > 0 and y + reqh > screen_h - margin:
+            y = max(margin, screen_h - reqh - margin)   # 纵向钳进屏内
+        # 兜底③：水平方向仍会小窗相交时，若小窗下方放得下就纵向躲开
+        if x + w + self._PANEL_GAP > int(float_left) and reqh > 0 and screen_h > 0:
+            rect = self._float_rect()
+            if rect is not None:
+                below = rect[3] + self._PANEL_GAP
+                if below + reqh <= screen_h - margin:
+                    y = below
+        if w != reqw and reqh > 0:
+            spec = "%dx%d+%d+%d" % (w, reqh, x, y)
+        else:
+            spec = "+%d+%d" % (x, y)
+        return spec, (x, y)
+
+    def _on_panel_configure(self, event):
+        """面板被内容撑大/缩小时重新让位。
+
+        面板宽度由内容决定：首次刷新填树/预览、运行中状态文本（更新提示、预览小字）
+        变长都会改变宽度，不跟就会向右吃掉间隙、重新压到悬浮窗上。只对**尺寸**变化
+        重排——位置变化不重排，避免与用户拖动、自动挪动互相触发。
+        """
+        if event.widget is not self.panel or getattr(self, "_panel_user_moved", False):
+            return
+        # ui-041（2026-09-24）：变化判定原先用 `event.width`（实际宽度）、定位用
+        # `winfo_reqwidth()`（请求宽度），面板未 resizable(False,False)，用户拖拽后
+        # 两者脱节——仍按旧 reqwidth 让位、且每次 Configure 都重排。统一用请求尺寸。
+        try:
+            self.panel.update_idletasks()
+            size = (self.panel.winfo_reqwidth(),
+                    int(getattr(self.panel, "winfo_reqheight", lambda: 0)() or 0))
+        except Exception:
+            size = (event.width, event.height)
+        if size == getattr(self, "_panel_last_size", None):
+            return
+        self._panel_last_size = size
+        self._position_panel_left_of()
+
+    def _position_panel_left_of(self, float_left=None):
+        """把控制台面板放到悬浮窗左侧（留 `_PANEL_GAP` 间隙），避免遮挡小窗画面。
+
+        旧实现按屏幕右缘内缩 40px 定位（`screenwidth - panel_reqwidth - 40`），完全
+        没算悬浮窗宽度（160~960px + 10px 边距）——而面板 z 序在悬浮窗之上，启动后
+        小窗几乎整块被面板压住，对方屏幕只能看到露在面板上方的一条。
+        用户手动拖过面板（当前位置与上次自动定位不符）后不再自动挪动，尊重手动摆放；
+        面板隐藏期间照常跟随，重新显示（`_panel_show`）即复位并回到正确位置。
+        窄屏/高 DPI 的兜底布局见 `_panel_layout`。
+        """
+        panel = getattr(self, "panel", None)
+        if panel is None or getattr(self, "_panel_user_moved", False):
+            return
+        try:
+            panel.update_idletasks()
+            auto = getattr(self, "_panel_auto_xy", None)
+            if (auto is not None and panel.state() == "normal"
+                    and (abs(panel.winfo_x() - auto[0]) > 5
+                         or abs(panel.winfo_y() - auto[1]) > 5)):
+                self._panel_user_moved = True   # 用户手动挪过面板：不再自动跟随
+                return
+            if float_left is None:
+                float_left = getattr(self, "_float_left", None)
+            if float_left is None:
+                return          # 悬浮窗尚未定位（_build_ui 之前），本轮不动面板
+            spec, xy = self._panel_layout(panel, float_left)
+            if spec is None or xy is None:
+                return
+            if spec == getattr(self, "_panel_auto_spec", None):
+                # L5/ui-042（2026-09-24）：几何未变即跳过 update_idletasks+geometry
+                # 的冗余 Tcl 下发（状态文本一变就走本函数，与解码/贴图抢主线程）。
+                self._panel_auto_xy = xy
+                return
+            self._panel_auto_spec = spec
+            self._panel_auto_xy = xy
+            panel.geometry(spec)
+        except Exception:
+            log.debug("面板定位失败", exc_info=True)
 
     def _process_cred_requests(self):
         """主线程：处理认证对话框请求队列（接收线程只入队，由主线程直接建窗以避免
@@ -3526,10 +3787,20 @@ class ViewerApp:
             if frame_w <= 0 or frame_h <= 0:
                 return
             new_h = max(1, int(round(frame_h * self.display_width / float(frame_w))))
+            # ui-043（2026-09-24）：小窗同样要按屏高钳制——竖长采集区（region 400×2000
+            # → 输出 854×4270）或 display_width 手改到 4096 时窗口高数千像素，越出屏幕
+            # 下缘（x 还会因宽度过大变负、窗体跑到左缘外）。预览早就有 165 高上限，小窗
+            # 此前没有。放不下时按同一比例同时收窄宽度，保持画面不变形。
+            disp_w = int(self.display_width)
+            max_h = self._float_max_height()
+            if new_h > max_h:
+                fit = max_h / float(new_h)
+                disp_w = max(64, int(disp_w * fit))
+                new_h = max(1, int(round(frame_h * disp_w / float(frame_w))))
             # 阶段 A1（优化方案 2026-09-17）：先缩放后转换。旧链对全分辨率帧做
             # cvtColor 再交给 PIL resize，转换输出的 99.9% 随即被丢弃——实测 1080p→854px
             # 每帧 10.9ms → 1.5ms。INTER_AREA 自带下采样抗锯齿，画质不低于原 PIL.BILINEAR。
-            small = cv2.resize(frame_bgr, (self.display_width, new_h),
+            small = cv2.resize(frame_bgr, (disp_w, new_h),
                                interpolation=cv2.INTER_AREA)
             rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -3544,7 +3815,7 @@ class ViewerApp:
                 # 第 98 条：窗口位置只取决于尺寸（=照片 display_width×new_h）；尺寸未变
                 # 则跳过每帧的 update_idletasks + winfo 查询 + geometry 下发（60fps 下纯冗余，
                 # 与解码/贴图抢主线程和 DWM）。尺寸变化（源分辨率/显示宽度变更）才重新定位。
-                size_key = (self.display_width, new_h)
+                size_key = (disp_w, new_h)
                 if size_key != self._last_pos_size:
                     self._position_top_right()
                     self._last_pos_size = size_key
@@ -3613,6 +3884,12 @@ class ViewerApp:
         x = event.x_root - self.drag_offset[0]
         y = event.y_root - self.drag_offset[1]
         self.root.geometry("+%d+%d" % (x, y))
+        # G4/ui-035（2026-09-24）：`_float_left` 是面板定位的唯一来源，旧实现只在
+        # 自动贴角路径（_position_top_right）更新——拖动小窗后（穿透关闭时才可能拖）
+        # 面板仍按失效左缘让位：小窗挪走后左侧留大片无谓空隙，拖进面板区则再次重叠。
+        # 拖动即同步并重新让位（未变几何由 _position_panel_left_of 内部跳过）。
+        self._float_left = x
+        self._position_panel_left_of(x)
 
     def toggle_click_through(self):
         self.click_through = not self.click_through
@@ -3916,7 +4193,9 @@ def main():
         addr_override = args.addr
         if not (cfg["viewer"].get("channels") or []):
             cfg["viewer"]["server_addr"] = args.addr
-            save_config(cfg, "viewer")
+            # cfg-013：main 阶段尚无面板/状态栏，保存失败只记日志
+            if not save_config(cfg, "viewer"):
+                log.warning("--addr 写回配置失败（另一实例持锁？），本次运行仍按该地址连接")
         log.info("已使用命令行地址 %s（作为首个频道，不写入配置）", args.addr)
 
     enable_dpi_awareness()
@@ -3936,13 +4215,21 @@ def main():
             except Exception:
                 pass
         splash_root = None
-    _load_heavy()
-
-    app = ViewerApp(cfg, addr_override=addr_override)
     try:
+        _load_heavy()
+        app = ViewerApp(cfg, addr_override=addr_override)
         app.run(root=splash_root)
     except Exception:
         log.exception("程序异常退出")
+        # ui-038（2026-09-24）：splash 之后任一步抛错（_load_heavy 缺 cv2/PIL、
+        # ViewerApp 构造失败）都必须收掉那个无边框+置顶+无任务栏按钮的"正在启动…"窗
+        # ——否则它盖在屏幕正中，连模态报错框都被压在它下面，用户只能杀进程，
+        # 且恰在最需要看清错误时。旧实现只在成功分支 destroy，异常路径无兜底。
+        if splash_root is not None:
+            try:
+                splash_root.destroy()
+            except Exception:
+                pass
         try:
             messagebox.showerror(
                 APP_NAME, "程序遇到错误，已写入 logs 目录日志文件"

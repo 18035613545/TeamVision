@@ -41,6 +41,9 @@ _KEEP_DAYS = 5
 #: 单日可产生几十份，每份还能滚出 .1~.5 五个备份）。这两个常量给出**绝对**上界。
 _KEEP_FILES = 120
 _KEEP_TOTAL_BYTES = 64 * 1024 * 1024
+#: dist-018（2026-09-24）：logs 目录里只保留最近这么多份诊断包（按 mtime），
+#: 与"日志文件"口径并列，避免多次导出后无界堆积
+_KEEP_DIAGS = 5
 
 #: C3：日志文件名里的日期前缀（app_YYYYMMDD[_pidN][.N].log）。
 #: 用正则严格取日期，避免 app_debug.log 之类的非日期名被切片成假"日期键"而挤掉真日志。
@@ -141,8 +144,30 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
                     os.remove(os.path.join(self._log_dir, name))
                     total_bytes -= size
                 except OSError:
-                    sized.insert(0, (date, name, size))
-                    break
+                    # dist-019（2026-09-24）：旧实现 `insert(0,…) + break` 是**整轮退出**
+                    # ——首个删不掉的文件（被占用：同机另一端正在写的当日文件、只读、
+                    # 杀软/索引器持句柄，实测 WinError 32）就让"绝对上界 120 文件/64MiB"
+                    # 整轮失效、回到它要根治的膨胀。改为跳过该文件继续处理其余候选。
+                    log.debug("日志清理跳过 %s（被占用/只读？）", name)
+                    continue
+            # ③ dist-018（2026-09-24）：诊断包（TeamVision-diag-*.zip）也落在 logs 目录，
+            #    而本函数的筛选口径只认 `app_*` + `.log` → 多次导出（崩溃排障常连点几次）
+            #    后无界堆积，且按支持提示"把 logs 里的包发出去"时易拿错陈旧包
+            #    （内含旧内网地址、用户名等线索）。只保留最近 _KEEP_DIAGS 个。
+            diags = []
+            for name in os.listdir(self._log_dir):
+                if name.startswith("TeamVision-diag-") and name.endswith(".zip"):
+                    try:
+                        st = os.stat(os.path.join(self._log_dir, name))
+                    except OSError:
+                        continue
+                    diags.append((st.st_mtime, name))
+            diags.sort(reverse=True)
+            for _mt, name in diags[_KEEP_DIAGS:]:
+                try:
+                    os.remove(os.path.join(self._log_dir, name))
+                except OSError:
+                    log.debug("诊断包清理跳过 %s（被占用？）", name)
         except OSError:
             pass
 

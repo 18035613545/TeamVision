@@ -32,9 +32,11 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Any
 
+_msvcrt: Any = None
 try:
-    import msvcrt as _msvcrt      # cfg-004（2026-09-20）：跨进程字节范围锁
+    import msvcrt as _msvcrt  # cfg-004（2026-09-20）：跨进程字节范围锁
 except ImportError:               # 非 Windows 下为 None，锁退化为"必成功"
     _msvcrt = None
 
@@ -147,7 +149,7 @@ def derive_dk(password, salt_hex, iterations=PBKDF2_ITERATIONS):
     try:
         it = int(iterations)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError("KDF 迭代次数非法: %r" % (iterations,))
+        raise ValueError("KDF 迭代次数非法: %r" % (iterations,)) from None
     if not (KDF_ITER_MIN <= it <= KDF_ITER_MAX):
         raise ValueError("KDF 迭代次数越界: %d（允许 %d~%d）" % (it, KDF_ITER_MIN, KDF_ITER_MAX))
     if (not _is_hex_str(salt_hex) or not (16 <= len(salt_hex) <= 64)
@@ -410,8 +412,18 @@ def parse_video(payload):
 
 
 def pack_msg(obj):
-    """把 dict 序列化为 [kind=2][4 字节大端长度][UTF-8 JSON]，用于 auth/ping/pong 等控制消息。"""
-    data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    """把 dict 序列化为 [kind=2][4 字节大端长度][UTF-8 JSON]，用于 auth/ping/pong 等控制消息。
+
+    net-038（2026-09-24）：`ensure_ascii=False` 下 json.dumps 会把对端可控文本里的
+    游离代理位（`json.loads('"\\ud800x"')` 原样产出）保留在输出里，严格 `.encode("utf-8")`
+    随即抛 UnicodeEncodeError——而全仓发送点只挡 OSError，异常会打断整条 roster 广播
+    并继续上抛。与 derive_hmac 同口径：非严格编码 + 替换，产出仍是可解码的 UTF-8。
+    """
+    text = json.dumps(obj, ensure_ascii=False)
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:
+        data = text.encode("utf-8", "replace")
     return _MSG_HDR.pack(MSG_CTRL, len(data)) + data
 
 
@@ -908,9 +920,12 @@ def normalize_region(region):
         # 直接打断 GUI 构造/采集线程
         _log_warning("采集区域配置缺少 left/top/width/height 或非整数（%r），按全屏处理", region)
         return None
-    if left < 0 or top < 0 or width <= 0 or height <= 0:
+    if width <= 0 or height <= 0:
         _log_warning("采集区域取值非法（%r），按全屏处理", region)
         return None
+    # capture-008（2026-09-24）：虚拟桌面坐标可为负——副屏摆在主屏左侧/上方是极常见的
+    # 双屏布局，旧实现要求 left/top >= 0，把合法区域判成"区域格式错误"，该屏只能全屏
+    # 采集。宽度/高度仍须为正；越界由 host_ui 按虚拟桌面并集边界单独校验。
     return {"left": left, "top": top, "width": width, "height": height}
 
 
@@ -1118,7 +1133,13 @@ def _deep_merge(base, override):
 
 
 def _upgrade_config(raw):
-    """就地把 1.x 遗留配置升级到当前结构版本，返回改动说明列表（无改动返回 []）。
+    """就地把 1.x 遗留配置升级到当前结构版本；返回 (changes, notes)。
+
+    changes = 实际改动（触发落盘 + 升级告警）；notes = 纯说明（只记 INFO，不落盘、
+    不影响版本判定）——cfg-015（2026-09-24）：旧实现把"监听地址为回环，已启用双栈
+    回环监听"这类**说明**也塞进 changes，于是 v1 配置本就合规也会落盘并打 WARNING
+    "配置已升级到 v2（更安全的默认值）：监听地址为回环…"，用户以为监听被改过（D
+    系列最需避免的误导排障点）。
 
     只处理「结构版本落后」这一种情况，且只在用户**显式**写了旧的安全默认值时才改
     （0.0.0.0 / 准入关闭），以免覆盖用户自己的选择；改动会逐条写进日志，用户照着
@@ -1137,24 +1158,29 @@ def _upgrade_config(raw):
     if version >= CONFIG_VERSION:
         # C12（2026-09-11）：结构版本已是最新时没有迁移动作，但这里仍返回 []。
         # 版本号缺失/落后的情况由上面的分支写回（见下方 raw["config_version"]）。
-        return []
+        return [], []
     changes = []
+    notes = []
     host = raw.get("host")
     if isinstance(host, dict):
-        if host.get("listen_host") in ("", "0.0.0.0", "::"):
+        # cfg-014（2026-09-24）：归一化口径必须一致——旧实现"不安全值"用精确匹配、
+        # "安全值"用 `.strip().lower()`，粘贴成 `" 0.0.0.0"`（首位空格）时迁移不触发、
+        # 日志不提，而 host 侧 family 判定用的还是未归一串。
+        raw_lh = host.get("listen_host")
+        lh = raw_lh.strip().lower() if isinstance(raw_lh, str) else None
+        if lh is not None and lh in ("", "0.0.0.0", "::"):
             host["listen_host"] = DEFAULT_CONFIG["host"]["listen_host"]
             changes.append("监听地址 0.0.0.0 → %s（只允许本机与 frp 隧道接入；"
                            "同时监听 127.0.0.1 与 [::1]，frpc 以 localhost 回连亦可达）"
                            % DEFAULT_CONFIG["host"]["listen_host"])
-        elif isinstance(host.get("listen_host"), str) and \
-                host["listen_host"].strip().lower() in ("127.0.0.1", "localhost", "::1"):
+        elif lh in ("127.0.0.1", "localhost", "::1"):
             # A0（2026-09-11）：已是回环地址的配置无需改动（host 侧会做回环双栈监听），
             # 但若配了 frp 隧道则记一条说明，避免用户仍按旧文档以为"隧道必失效"。
             frp = host.get("frp")
             if isinstance(frp, dict) and (str(frp.get("token") or "").strip()
                                           or str(frp.get("tunnel_ids") or "").strip()):
-                changes.append("监听地址为回环（%s），已启用 IPv4+IPv6 双栈回环监听以兼容 "
-                               "frpc 的 localhost 回连" % host["listen_host"])
+                notes.append("监听地址为回环（%s），已启用 IPv4+IPv6 双栈回环监听以兼容 "
+                             "frpc 的 localhost 回连" % host["listen_host"])
         auth = host.get("auth")
         if isinstance(auth, dict) and not auth.get("enabled", False):
             auth["enabled"] = True
@@ -1175,15 +1201,16 @@ def _upgrade_config(raw):
         # C12：即便本次没有实际改动，也要补写结构版本号，避免每次启动都重跑升级判定
         if version < CONFIG_VERSION:
             raw["config_version"] = CONFIG_VERSION
-        return []
+        return [], notes
     raw["config_version"] = CONFIG_VERSION
-    return changes
+    return changes, notes
 
 
-def _persist_upgrade(path, raw, changes, silent=False):
+def _persist_upgrade(path, raw, changes, silent=False, notes=()):
     """把升级后的配置写回磁盘并记录改动清单；写失败只告警（下次启动会再试一次）。
 
-    silent=True（C12：只补写缺失的结构版本号、无实际迁移动作）时不打印"配置已升级"。
+    silent=True（C12：只补写缺失的结构版本号、无实际迁移动作）时不打印"配置已升级"；
+    notes 是纯说明（cfg-015），始终只记 INFO，绝不冒充"已升级"。
     """
     try:
         with _config_lock:
@@ -1215,6 +1242,8 @@ def _persist_upgrade(path, raw, changes, silent=False):
         return
     try:
         import logger
+        if notes:
+            logger.get_logger().info("配置说明：%s", "；".join(notes))
         if not silent:
             logger.get_logger().warning(
                 "配置已升级到 v%d（更安全的默认值）：%s。需要局域网直连或匿名观看时，"
@@ -1251,6 +1280,38 @@ def _normalize_dict_sections(base, out, path=""):
     return fixed
 
 
+def _atomic_write_json(path, obj):
+    """原子写一份 JSON 配置（跨进程锁 + 唯一临时名 + os.replace）；返回是否成功。
+
+    cfg-011（2026-09-24）：`load_config` 首建与 `_recover_corrupt_config` 原先直接
+    `open(path, "w")` 截断写，绕过 cfg-001/004 的"锁 + tmp + os.replace"——host 与
+    viewer 设计上同目录并发首启时对端会读到半截文件，随即判损坏、改名留存并把整份
+    配置重置为默认；恢复期与对端读写重叠同理。与 `save_config` 的 docstring
+    "原子写回"自相矛盾。
+    """
+    fd = acquire_file_lock(path)
+    if fd is None:
+        _log_warning("config.json 未取得跨进程锁，放弃写入 %s", path)
+        return False
+    try:
+        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+            _replace_retry(tmp, path)
+            return True
+        except Exception as e:
+            # cfg-012 同款：清理放 finally 语义（非 OSError 也要清 tmp 并留痕）
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            _log_warning("config.json 写入失败 %s（%s）", path, e)
+            return False
+    finally:
+        release_file_lock(path, fd)
+
+
 def load_config():
     """加载配置：config.json 不存在时先写入 DEFAULT_CONFIG 再返回其深拷贝；
     存在时读取、做一次结构升级（见 _upgrade_config）并与 DEFAULT_CONFIG 深合并后返回。
@@ -1262,16 +1323,9 @@ def load_config():
     """
     path = _config_path()
     if not os.path.exists(path):
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            try:
-                import logger
-                logger.get_logger().warning(
-                    "config.json 无法写入 %s（%s），本次运行使用默认配置", path, e)
-            except Exception:
-                pass
+        # cfg-011：首建也走原子替换 + 跨进程锁（详见 _atomic_write_json）
+        if not _atomic_write_json(path, DEFAULT_CONFIG):
+            _log_warning("config.json 无法写入 %s，本次运行使用默认配置", path)
         return copy.deepcopy(DEFAULT_CONFIG)
     try:
         with open(path, encoding="utf-8") as f:
@@ -1279,19 +1333,19 @@ def load_config():
         if not isinstance(cfg, dict):
             raise ValueError("config.json 顶层不是对象（实际 %s）" % type(cfg).__name__)
         before_version = cfg.get("config_version")
-        changes = _upgrade_config(cfg)
+        changes, notes = _upgrade_config(cfg)
         merged = _deep_merge(DEFAULT_CONFIG, cfg)
         # ui-022 / auth-022（2026-09-20）：合并后再统一做一次"应为字典的节"类型校验，
         # 让所有下游读取点（get_snapshot、面板构造、诊断包、采集热路径）不必各写各的
         # isinstance，也不会出现"这一处兜成 False、那一处兜成 open"的取向打架。
         _normalize_dict_sections(DEFAULT_CONFIG, merged)
         if changes:
-            _persist_upgrade(path, cfg, changes)
+            _persist_upgrade(path, cfg, changes, notes=notes)
         elif (cfg.get("config_version") == CONFIG_VERSION
               and before_version != CONFIG_VERSION):
             # C12：只是补写缺失的结构版本号（值本身已是安全默认），静默落盘，
             # 避免每次启动都重跑升级判定。
-            _persist_upgrade(path, cfg, [], silent=True)
+            _persist_upgrade(path, cfg, [], silent=True, notes=notes)
         return merged
     except Exception as e:
         _recover_corrupt_config(path, e)
@@ -1310,11 +1364,9 @@ def _recover_corrupt_config(path, exc):
         os.replace(path, backup)
     except OSError:
         backup = None
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+    # cfg-011：回写默认配置同样走原子路径（旧实现截断写：与对端读写重叠时
+    # 可能喂出半截文件 → 下一次启动再判损坏 → 恢复循环）
+    _atomic_write_json(path, DEFAULT_CONFIG)
     try:
         import logger
         suffix = "，原文件已留存为 %s" % os.path.basename(backup) if backup else ""
@@ -1424,10 +1476,17 @@ def save_config(cfg, section=None):
                     try:
                         with open(path, encoding="utf-8") as f:
                             base = json.load(f)
-                        if not isinstance(base, dict):
-                            base = {}
-                    except Exception:
-                        base = {}
+                    except Exception as e:
+                        # cfg-010（2026-09-24）：旧实现把"读不到"当"没有"（base={}）继续写，
+                        # 整份配置塌缩成"只含本进程这一节"（对端整节设置、update_check 等
+                        # 无提示消失），且与 load_config 的恢复口径不对称。读基线失败时
+                        # 放弃本次写：内存里的改动仍生效，绝不覆盖对端数据。
+                        _log_warning("config.json 读基线失败（%s），为不覆盖对端设置本次写盘已放弃", e)
+                        return False
+                    if not isinstance(base, dict):
+                        _log_warning("config.json 顶层不是对象（%s），本次写盘已放弃",
+                                     type(base).__name__)
+                        return False
                 base[section] = cfg.get(section)
                 out = base
             # 第 102 条：写盘失败（目录只读/磁盘满/杀软占用）只记一条 ERROR 并返回。
@@ -1438,7 +1497,11 @@ def save_config(cfg, section=None):
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(out, f, ensure_ascii=False, indent=2)
                 _replace_retry(tmp, path)
-            except OSError as e:
+            except Exception as e:
+                # cfg-012（2026-09-24）：清理原先只在 `except OSError` 分支——配置里
+                # 任一字符串含转义游离代理位时 json.dump 抛 UnicodeEncodeError，
+                # 临时文件（含明文 frp token）永久留在磁盘上，且每次保存必失败而
+                # 日志零线索（异常不被任何 except 记 ERROR）。改为非 OSError 也清理并留痕。
                 try:
                     os.remove(tmp)
                 except OSError:

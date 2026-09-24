@@ -72,7 +72,7 @@ class ScreenShareSession:
         # 第 110 条（阶段 2）：编码器生命周期与 JPEG 回退改由 pipeline.FrameEncoder
         # 统一提供——与 host.py 共用同一实现（含第 53 条构造失败负缓存退避）。
         self._fe = pipeline.FrameEncoder(
-            width=0, height=0, fps=self._fps, bitrate=self._bitrate,
+            fps=self._fps, bitrate=self._bitrate,
             keyint=self._keyint, encoder_sel=self._encoder_sel, preset=self._preset,
             target_width=self._target_width, quality=self._quality, name=name,
             on_build=self._on_encoder_built)
@@ -136,13 +136,16 @@ class ScreenShareSession:
 
         第 111 条（阶段 2）：采集句柄的故障恢复与静止检测闸门改由
         pipeline.CaptureSource / pipeline.StillGate 统一提供（与 host.py 共用同一实现）。
-        差异只在参数：注入的伪采集器不重建（owned=False）、连续空帧按"帧数"阈值重建
-        （host 按"秒数 + 后端已死"）、空帧等待取 min(10ms, 帧间隔)。
+        差异只在参数：注入的伪采集器不重建（owned=False）。
+        capture-009（2026-09-24）：空帧重建阈值原先按**帧数**计（`max(10, fps*5)`），
+        而空帧轮询速率固定 ~100Hz、与 fps 解耦 → 静止屏幕下每约 1.5 秒重建一次
+        DXGI 采集器（release+create 抖动、每 1.5s 一条 WARNING，且每次重建后首个
+        grab() 必出一帧 → 静止画面仍持续编码上传）。host 侧用的是时间判据，现与之对齐。
         """
         src = pipeline.CaptureSource(
             self._backend, self._monitor, self._region, capture=self._cap,
             owned=self._cap_owned, name=self._name,
-            none_rebuild_frames=max(10, self._fps * 5),
+            none_rebuild_s=5.0,
             sleep_on_none=min(0.01, 1.0 / self._fps))
         self._src = src
         # 第 5 条：采集器构造可能"成功"但无任何可用后端（dxgi 与 mss 都挂时句柄置 None），
@@ -268,8 +271,13 @@ class ScreenShareSession:
                 # 只是永远等不到响应。缩放后的缓存帧其实在手，交给 JPEG 回退出帧。
                 if last_frame is None:
                     return False
-                return self._encode_send(
-                    last_frame, int(time.time() * 1_000_000), force_key=False) is not None
+                # codec-018（2026-09-24）：兜底必须**只**走 JPEG 出口——旧实现调
+                # _encode_send(force_key=False) 会再次尝试视频编码：libx265 4 帧流水线
+                # pre-roll 窗口里 force_idr 刚返回 None，紧接着这一次却可能出包，产出
+                # P 帧也算"成功"，调用方随即清掉 key_evt——新观众拿到无参考链的 P 帧，
+                # 静止画面下仍黑到下一次真实 IDR，且请求已被消费不再重试。与本函数
+                # 下方"非关键帧不发、保留请求重试"是同一条不变量。
+                return self._send_jpeg_cached(last_frame)
             nal, is_key, _ms, out_ts = res
             if not is_key:
                 # codec-004 同款：强制 IDR 未生效（编码器返回 P 帧）时不发，保留请求重试
@@ -281,6 +289,22 @@ class ScreenShareSession:
                 return True
             return False
         return bool(self._send_msg(last_packed))  # JPEG：重发自包含缓存帧
+
+    def _send_jpeg_cached(self, frame):
+        """把缓存帧编码成 JPEG 发送（自包含、可独立解码）；失败返回 False。
+
+        codec-018：静止期关键帧请求的**唯一**兜底出口——不得走 _encode_send 的
+        视频优先路径（那里产出 P 帧也会算成功）。编码异常与发送失败均返回 False，
+        由调用方保留请求重试（第 3 条 / codec-008 的成功才消费语义）。
+        """
+        if frame is None:
+            return False
+        try:
+            jpeg, _ms = pipeline.encode_bgr(frame, 1.0, self._quality, 0)
+        except Exception as e:
+            log.warning("频道[%s] 缓存帧 JPEG 回退编码失败: %s", self._name, e)
+            return False
+        return bool(self._send_msg(pack_frame(jpeg, int(time.time() * 1_000_000))))
 
     def _send_msg(self, msg):
         """经共享写锁发送完整消息；失败置停止位（连接已断由 Channel 层善后）。

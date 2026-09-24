@@ -44,6 +44,31 @@ _NVENC_PRESET = "p5"
 _X264_PRESET = "veryfast"
 _X265_PRESET = "veryfast"
 
+#: codec-016（2026-09-24）：preset 必须按编码器族校验——按 common.py 的注释填
+#: x264 风格 preset（veryfast 等）时，NVENC 的 ctx.open() 必失败，静默落到 libx264
+#: 软件编码（CPU 与延迟翻倍），用户按官方注释配置即永久失去硬件编码。
+_NVENC_PRESETS = frozenset({
+    "p1", "p2", "p3", "p4", "p5", "p6", "p7", "default", "lossless",
+    "slow", "medium", "fast", "hq", "ll", "llhq", "llhp", "hp", "bd",
+})
+_SW_PRESETS = frozenset({
+    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+    "slow", "slower", "veryslow", "placebo",
+})
+
+#: 一次性告警集（codec-019 等）：同一 key 只报一条
+_WARNED_ONCE = set()
+
+
+def _warn_once(key, msg, *args):
+    """模块级"只报一次"告警（跨 VideoEncoder 实例生效）。"""
+    if key in _WARNED_ONCE:
+        return
+    if len(_WARNED_ONCE) >= 32:
+        _WARNED_ONCE.clear()
+    _WARNED_ONCE.add(key)
+    log_note((msg % args) if args else msg)
+
 #: encoder_sel -> 候选编码器链（按优先级）；name 决定实际 codec_id
 _ENCODER_CHAIN = {
     "auto": ["hevc_nvenc", "h264_nvenc", "libx265", "libx264"],
@@ -69,7 +94,7 @@ class VideoEncoder:
     """
 
     def __init__(self, width, height, fps, bitrate, keyint=30,
-                 encoder_sel="auto", preset="", rate_control="vbr"):
+                 encoder_sel="auto", preset=""):
         self._w = int(width)
         self._h = int(height)
         self._fps = max(1, int(fps))
@@ -77,16 +102,14 @@ class VideoEncoder:
         self._keyint = max(1, int(keyint))
         self._encoder_sel = encoder_sel
         self._preset = (preset or "").strip()
-        self._rate_control = (rate_control or "vbr").strip().lower()
         self._ctx = None
         # 编码线程与 ABR 性能线程共享同一实例：用锁串行化 encode/set_bitrate/set_fps，
         # 避免并发重建上下文（set_bitrate 触发 _recreate）与编码操作互相踩踏
         self._lock = threading.RLock()
         self.name = ""           # 实际编码器名，如 hevc_nvenc / h264_nvenc / libx265 / libx264；空=不可用
-        self.keyframe_sent = 0   # 累计输出的关键帧数
-        self.frame_sent = 0      # 累计输出的帧数
-        self._rebuilt_at_frame = 0  # 最近一次重建成功时的 frame_sent（用于判定关键帧是否需要重建）
+        self.keyframe_sent = 0   # 累计输出的关键帧数（pipeline 读它做统计）
         self._last_bitrate = 0
+        self._reconfiguring = False  # codec-017：锁外构造期间的重建护栏
         self._encode_failures = 0   # 连续编码失败计数（第 6 条：超限则永久标记不可用）
         self._permafailed = False   # 编码器彻底失效，available 恒 False，调用方回退 JPEG
         self._closed = False        # close() 后禁止 set_bitrate/encode 复活（第 52 条）
@@ -97,6 +120,14 @@ class VideoEncoder:
     def _pick_encoder(self):
         """按 encoder_sel 返回候选编码器名列表；无候选或不可用时返回空列表。"""
         if not _AV_AVAILABLE:
+            # codec-019（2026-09-24）：PyAV 完全缺失（打包漏 collect_all('av')、
+            # 依赖损坏）时旧实现静默返回 []，全程零日志地永久跑 JPEG——上行占用与
+            # CPU 翻倍却无任何线索可查（codec-007 的"按名字记一次"只覆盖 av.Codec
+            # 抛错分支，第 11 条只覆盖解码侧）。这里补一条明确的一次性告警。
+            _warn_once("av-missing",
+                       "PyAV 不可用：视频编码整体禁用，将以 JPEG 逐帧上传"
+                       "（上行占用与 CPU 明显更高）。打包版请检查 PyInstaller 的 "
+                       "collect_all('av') 是否生效；源码运行请 pip install av")
             return []
         if self._encoder_sel == "jpeg":
             return []
@@ -115,19 +146,24 @@ class VideoEncoder:
     def _build_options(self, name, bitrate):
         """按编码器生成低延迟 + 码率控制选项（**实际恒为 VBR**，见下）。
 
-        codec-010（2026-09-20）：`rate_control` 是从不传入的内部形参——唯一构造点
-        pipeline.FrameEncoder 不带该参数，`DEFAULT_CONFIG["host"]["codec"]` 也没有
-        对应键，所以"可配 CBR"的说法与实现不符（cbr 分支是留着未接线的实现）。
-        本文件与 common.py / host.py 的注释统一改为"VBR、峰值 1.5×码率"，
-        排障时按 VBR 估上行占用（默认 upstream_max_kbps = 2 × codec.bitrate_kbps）。
+        codec-010（2026-09-20）：本文件与 common.py / host.py 的注释统一为
+        "VBR、峰值 1.5×码率"，排障时按 VBR 估上行占用
+        （默认 upstream_max_kbps = 2 × codec.bitrate_kbps）。
+        ui-046（2026-09-24）：`rate_control` 形参及 cbr 分支从未接线（唯一构造点
+        pipeline.FrameEncoder 与 DEFAULT_CONFIG 都没有对应入口），按"要么接线要么
+        删除"删除——避免"可配 CBR"的假接口再次误导排障。
         """
         b = max(64, int(bitrate))
         bufsize = max(128, int(b * 0.5))
         if name in ("h264_nvenc", "hevc_nvenc"):
             preset = self._preset or _NVENC_PRESET
-            rc = self._rate_control if self._rate_control in ("cbr", "vbr") else "vbr"
-            maxrate = str(b) if rc == "cbr" else str(int(b * 1.5))
-            bufsize = str(b) if rc == "cbr" else str(b)
+            if self._preset and self._preset not in _NVENC_PRESETS:
+                # codec-016：x264 风格 preset 会让 NVENC open() 必失败 → 静默退软件编码
+                _warn_once("preset-mismatch-nvenc-%s" % self._preset,
+                           "codec.preset=%r 不是 NVENC 预设（应为 p1..p7 等），"
+                           "已忽略并使用默认 %s——否则 NVENC 打开失败会静默退到软件编码（CPU 翻倍）",
+                           self._preset, _NVENC_PRESET)
+                preset = _NVENC_PRESET
             return {
                 "preset": preset,
                 "tune": "ull",
@@ -135,13 +171,19 @@ class VideoEncoder:
                 "delay": "0",  # 关闭编码器帧缓冲：每帧输入立即出包，消除恒定 2 帧延迟
                 "repeat_headers": "1",  # 每个关键帧前重复 SPS/PPS：观看端重连/重建解码器后可从任意关键帧起解
                 "forced-idr": "1",  # 让 pict_type=I 在既有上下文上原地产生真 IDR，无需重建编码器（第 47 条）
-                "rc": rc,
+                "rc": "vbr",
                 "b": str(b),
-                "maxrate": maxrate,
-                "bufsize": bufsize,
+                "maxrate": str(int(b * 1.5)),   # ui-046：VBR 峰值 1.5×码率
+                "bufsize": str(b),
             }
         if name == "libx265":
             preset = self._preset or _X265_PRESET
+            if self._preset and self._preset not in _SW_PRESETS:
+                # codec-016 同族收口：反向（NVENC 式 "p5" 喂给软件编码器）同样会 open 失败
+                _warn_once("preset-mismatch-sw-%s" % self._preset,
+                           "codec.preset=%r 不是 x264/x265 预设，已忽略并使用默认 %s",
+                           self._preset, _X265_PRESET)
+                preset = _X265_PRESET
             return {
                 "preset": preset,
                 "b": str(b),
@@ -155,6 +197,11 @@ class VideoEncoder:
                     % (self._keyint, self._keyint)),
             }
         preset = self._preset or _X264_PRESET
+        if self._preset and self._preset not in _SW_PRESETS:
+            _warn_once("preset-mismatch-sw-%s" % self._preset,
+                       "codec.preset=%r 不是 x264/x265 预设，已忽略并使用默认 %s",
+                       self._preset, _X264_PRESET)
+            preset = _X264_PRESET
         return {
             "preset": preset,
             "tune": "zerolatency",
@@ -202,7 +249,6 @@ class VideoEncoder:
         self._ctx = ctx
         self.name = name
         self._last_bitrate = int(bitrate)
-        self._rebuilt_at_frame = self.frame_sent  # 重建后首帧必为关键帧（IDR）
         self._retire_ctx(old)
 
     def _recreate(self, bitrate, keep_old_on_failure=False):
@@ -361,7 +407,6 @@ class VideoEncoder:
         self._encode_failures = 0
         encode_ms = (time.perf_counter() - start) * 1000.0
         pkt = pkts[-1]
-        self.frame_sent += 1
         is_key = any(bool(getattr(p, "is_keyframe", False)) for p in pkts)
         if is_key:
             self.keyframe_sent += 1
@@ -377,6 +422,12 @@ class VideoEncoder:
 
         第 112 条（C1）：构造新上下文在**锁外**完成，编码线程不再为一次调码率停等
         约 100ms；且新上下文建不出来时保持旧上下文可用（不再自毁编码器）。
+
+        codec-017（2026-09-24）：`_last_bitrate` 要到 `_install_ctx` 才更新，而构造在
+        锁外进行——性能线程与编码线程（host.py 每帧传 bitrate）可同时通过迟滞判据、
+        为同一次调整各构造一套上下文（check-then-act）：编码线程白停等一次完整 NVENC
+        初始化（约丢 3 帧），并发 NVENC 会话还多一路（有上限，可能直接 open 失败）。
+        这里加"重建中"标记：构造期间的后到者直接返回，不重复造上下文。
         """
         bps = max(64, int(bps))
         with self._lock:
@@ -384,8 +435,15 @@ class VideoEncoder:
                 return False  # 第 52 条：已关闭/已失效，禁止复活
             if self._ctx is not None and abs(bps - self._last_bitrate) <= self._last_bitrate * hysteresis:
                 return False
+            if self._reconfiguring:
+                return False  # codec-017：另一次重建正在锁外构造，避免重复构造
+            self._reconfiguring = True
             names = self._pick_encoder()
-        ctx, name = self._create_ctx_with(names, bps)
+        try:
+            ctx, name = self._create_ctx_with(names, bps)
+        finally:
+            with self._lock:
+                self._reconfiguring = False
         if ctx is None:
             return False
         with self._lock:

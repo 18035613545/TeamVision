@@ -594,6 +594,9 @@ class ClientInfo:
         self.watch_source = "local"  # "local" 或共享成员的 "peer:<n>"
         self.need_key = True         # 视频订阅者是否在等关键帧（新连接/切换源后为 True）
         self.share_id = None         # 登记为共享成员后的 "peer:<n>"；None=未共享
+        # net-040（2026-09-24）：被 net-020 配额限流的 UNSHARE 在此挂起，
+        # 由接收循环的空闲 tick 在配额窗口内补做（原先直接丢弃 → 幽灵源）
+        self.pending_unshare = False
         # 本连接全部 socket 写入（发送线程帧 + 各线程控制消息）共用写锁，
         # 防止多线程 sendall 字节交错破坏帧协议（新增跨连接转发后成为必要）
         self._write_lock = threading.Lock()
@@ -870,6 +873,8 @@ class FrpManager:
         self.cfg = cfg
         self._proc = None
         self._external_running = False  # 由 SakuraFrpService/Launcher 托管时不再重复拉起 frpc
+        self._ext_probe_at = 0.0        # net-043：外部托管实探缓存（TTL 2s）
+        self._ext_probe_ok = False
         self._last_frpc_line = ""  # 第 63 条：frpc 最近一行输出，验活失败时回报原因
         self._lock = threading.Lock()
 
@@ -1106,8 +1111,11 @@ class FrpManager:
             external = self._external_running
             proc = self._proc
         if external:
-            log.info("SakuraFrpService 正在管理隧道，未停止外部樱花服务")
-            return "樱花启动器正在托管隧道，未停止外部服务"
+            # net-043（2026-09-24）：外部服务已退出时不得再谎报"由启动器托管"——
+            # is_running() 实探后会复位 latch，这里据此决定是否真的跳过停止。
+            if self.is_running():
+                log.info("SakuraFrpService 正在管理隧道，未停止外部樱花服务")
+                return "樱花启动器正在托管隧道，未停止外部服务"
         if proc is None:
             return "frpc 未在运行"
         if proc.poll() is not None:
@@ -1139,10 +1147,29 @@ class FrpManager:
         return "frpc 已终止"
 
     def is_running(self):
+        """frpc 是否在跑：外部托管（SakuraFrpService）时**定期实探**，不自采信 latch。
+
+        net-043（2026-09-24）：第 62 条只在 `start()` 成功路径复位 `_external_running`，
+        而 `stop()`/`is_running()` 无条件采信它——用户关掉 SakuraFrpService 之后，
+        面板恒显"运行中"、停止按钮无效、自检线程继续对外拨号，必须重启 host 才能恢复。
+        实探带 2 秒缓存：本方法在面板快照（500ms）与自检循环（每轮）里都会调用，
+        进程枚举不宜每次都做。
+        """
         with self._lock:
-            if self._external_running:
-                return True
-            return self._proc is not None and self._proc.poll() is None
+            if not self._external_running:
+                return self._proc is not None and self._proc.poll() is None
+            now = time.monotonic()
+            if now - self._ext_probe_at < 2.0:
+                return self._ext_probe_ok
+        alive = self._sakura_service_running()
+        with self._lock:
+            self._ext_probe_at = time.monotonic()
+            self._ext_probe_ok = alive
+            if not alive:
+                self._external_running = False
+        if not alive:
+            log.info("SakuraFrpService 已不在运行，外部托管标记复位")
+        return alive
 
 
 #: 区分「参数未提供」与「显式传 None」的哨兵（第 32 条：region=None 表示清空回全屏，
@@ -1451,7 +1478,10 @@ class HostRuntime:
         if backend is not _UNSET:
             backend = "dxgi" if backend == "dxgi" else "mss"
             capture["backend"] = backend
-        save_config(self.cfg, "host")
+        # cfg-013（2026-09-24）：save_config 在 cfg-004 后 fail-closed 返回 False
+        # （另一实例持跨进程锁），调用方必须跟进——否则用户以为"已应用"，重启即丢。
+        if not save_config(self.cfg, "host"):
+            log.warning("采集源配置未能写盘（另一实例正占用配置？）：本次运行内生效，重启后可能丢失")
         with self.slot_lock:
             if monitor is not _UNSET:
                 self.slot["monitor"] = monitor
@@ -1465,6 +1495,23 @@ class HostRuntime:
         with self.stats_lock:
             self._net_status = {"state": state, "detail": detail,
                                 "ts": time.time()}
+
+    def ensure_tunnel_selfcheck(self, port=None):
+        """G11/net-039：幂等补建公网隧道自检线程（run_server 与 GUI 启动成功回调共用）。
+
+        旧实现只在 run_server 那一刻调用一次 `_start_tunnel_selfcheck`，而它入口要求
+        frpc 已在运行——frp.auto_start 默认 False，绝大多数用户走 GUI「启动隧道」，
+        启动那一刻 frpc 还没跑就根本不建线程：整条自检链（第 134 条/B2、net-023/032/033）
+        在默认配置下永不可达，面板网络状态恒为"未跑"，与 host_ui 文案"启动 frpc 后
+        自动执行"相反。GUI 侧无需 import host（host 作为 __main__ 运行时会二次导入），
+        直接经 runtime 方法触发。
+        """
+        if port is None:
+            port = _listen_target(self.cfg)[1]
+        try:
+            _start_tunnel_selfcheck(self, port)
+        except Exception as e:
+            log.debug("隧道自检线程创建失败（不影响隧道本身）: %s", e)
 
     def get_snapshot(self):
         """返回供 GUI 刷新的状态快照（线程安全）。
@@ -1506,7 +1553,12 @@ class HostRuntime:
                 "backend": self.slot["backend"],
             }
         return {
-            "port": self.cfg["host"]["port"],
+            # ui-037（2026-09-24）：port 是标量，逃过了 ui-022 的"应为字典的节"收口——
+            # 手改 "port": "5700" 时 host_ui 的 "%d" 格式化每 500ms 抛 TypeError、
+            # 控制台永久停在旧值。与 _listen_target 同口径：非法即回退默认端口，
+            # 0 也回退（cfg-008：0 会被实绑为 5700，显示 :0 同样是谎报）。
+            "port": safe_int(cfg_section(self.cfg, "host").get("port", 5700),
+                             5700, 1, 65535, clamp=False),
             # ui-022（2026-09-20）：旧写法 `self.cfg["host"].get("frp", {})` 只挡了
             # "键不存在"、挡不住"值不是字典"。host.auth 被写成非 None 标量（false/0/""/[]）
             # 时这里抛 AttributeError——而它在 _poll 的 try 内，异常发生在 snap 取到之前，
@@ -1724,8 +1776,24 @@ def _clip(text, n=200):
     return text if len(text) <= n else text[:n] + "…(共 %d 字符)" % len(text)
 
 
-CHALLENGE_TTL_S = 60.0  # D1（实现方案 §10.1）：挑战 nonce 有效期，超时须重新发起登录
+def _sanitize_username(text):
+    """对端可控用户名进 roster 前的统一净化（G5 / net-038 同族收口，2026-09-24）。
 
+    准入关闭或迟到 LOGIN 分支会把对端发来的 user 原名采纳进 `info.username`，而
+    `json.loads('"\\ud800x"')` 原样产出游离代理位：该名字进 roster 时 pack_msg 的
+    严格 UTF-8 编码抛 UnicodeEncodeError，广播在逐连接循环内中断（S2），继续上抛
+    即命中收尾守卫之外的泄漏路径（S1）。控制字符同理会把面板行撑乱。
+    这里移除代理位与控制字符，并按 MAX_USERNAME_LEN 截断——是"采纳对端名字"的
+    唯一出口，新增采纳点必须复用本函数。
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = "".join(ch for ch in text
+                      if ord(ch) >= 32 and not 0xD800 <= ord(ch) <= 0xDFFF)
+    return cleaned.strip()[:MAX_USERNAME_LEN]
+
+
+CHALLENGE_TTL_S = 60.0  # D1（实现方案 §10.1）：挑战 nonce 有效期，超时须重新发起登录
 #: auth-005（2026-09-18）：认证期的分档"进展"时限——总时限（auth_timeout，默认
 #: 240s）单独存在时，攻击者连上后一次不发也能占满一个连接名额 240 秒，约每 7.5 秒
 #: 开一条 socket 即可永久占满 max_clients。拆档后：
@@ -2107,6 +2175,15 @@ def _ctrl_watch(sock, info, runtime, msg, addr):
     return None
 
 
+def _ctrl_unshare(runtime, info, addr):
+    """执行"停止共享"：注销成员并广播 roster（幂等；share_id 为空时不做任何事）。"""
+    info.pending_unshare = False
+    if info.share_id is not None:
+        old_id = info.share_id
+        runtime._unregister_sharer(info)
+        log.info("共享成员 %s 注销：%s（%s）", addr, old_id, info.username or "-")
+
+
 def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
     """处理一条控制消息；返回 None 表示继续，返回字符串表示致命原因（需断开）。
 
@@ -2141,18 +2218,16 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
         return _ctrl_watch(sock, info, runtime, msg, addr)
     elif action == Act.UNSHARE:
         if not info.allow_ctrl_broadcast():
-            # net-029：停共享被限流时同样要给对端一个回话。这里不能复用 WATCH_REJECT
-            # （观看端会据此切回 local，而语义上共享并未停止），改为回一条明确的
-            # 错误控制消息，并把该连接的**待处理 unshare 合并**到配额窗口之后由
-            # roster 变化自然收敛——成员仍在 roster 中，观看端不会误切。
-            log.debug("客户端 %s unshare 被限速（合并到下一次广播）", addr)
+            # net-029 的注释承诺"把该连接的待处理 unshare 合并到配额窗口之后"，
+            # 但实现只有 log.debug + return——限流即静默丢弃，成员永久留在 roster
+            # （幽灵源、"停止共享"点了无效）。net-040（2026-09-24）：挂起标记，
+            # 由 _client_recv_loop 的空闲 tick 在窗口内补做（真按注释所述收敛）。
+            info.pending_unshare = True
+            log.debug("客户端 %s unshare 被限速（挂起，配额窗口内补做）", addr)
             return None
         # 成员主动停止共享（连接保留）：注销并广播 roster，
         # 让订阅该 peer 的观看端回落 local（viewer peers 处理）
-        if info.share_id is not None:
-            old_id = info.share_id
-            runtime._unregister_sharer(info)
-            log.info("共享成员 %s 注销：%s（%s）", addr, old_id, info.username or "-")
+        _ctrl_unshare(runtime, info, addr)
     elif action == Act.REQ_KEYFRAME:
         # codec-014（2026-09-20）：客户端主动路径旧实现**无合并、无限速**——一条约
         # 40 字节的消息即可把本机编码器钉成帧帧 IDR（每次 IDR 的码率开销远高于 P 帧），
@@ -2178,13 +2253,18 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
                         addr, type(msg.get("user")).__name__)
             late_user = ""
         late_user = (late_user or "").strip()
-        if auth_cfg.get("enabled", False):
+        # auth-023（2026-09-24）：兜底默认值必须与 _do_auth（2069）/快照（1516）的
+        # fail-closed 口径一致——旧实现这里是 False，而 host.auth 是字典但缺 enabled
+        # 键时 _do_auth 按 True 处理，本分支却当作"准入关闭"，把对端任意 user 采纳进
+        # info.username 并广播进 roster（身份伪造）。同族两处（2181/2891）本次一并收口。
+        if auth_cfg.get("enabled", True):
             if not _reply_ctrl(sock, info, {"action": Act.AUTH_RESULT, "ok": False,
                                             "msg": "需要登录"}, addr):
                 return "控制消息写入失败（连接已损坏）"
         else:
             if late_user:
-                info.username = late_user
+                # 名字进 roster 前过统一净化（G5）：非字符串已挡，游离代理位/控制字符在这里挡
+                info.username = _sanitize_username(late_user)
             if not _reply_ctrl(sock, info, {"action": Act.AUTH_RESULT, "ok": True,
                                             "msg": "账户准入已关闭，无需登录"}, addr):
                 return "控制消息写入失败（连接已损坏）"
@@ -2218,6 +2298,10 @@ def _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg):
             return "空闲超时（半开连接）"
         if partial_since is not None and now - partial_since > msg_timeout:
             return "单条消息超时（%.0f 秒内未收完整）" % msg_timeout
+        # net-040（2026-09-24）：配额窗口内补做被限流的"停止共享"。每秒一次 tick，
+        # 窗口通常 10 秒内让出名额；_ctrl_unshare 幂等，不会重复注销。
+        if info.pending_unshare and info.allow_ctrl_broadcast():
+            _ctrl_unshare(runtime, info, addr)
         return None
 
     def _on_buf(event, buf, now, n_msgs=0):
@@ -2334,35 +2418,36 @@ def _handle_client_inner(sock, addr, runtime):
         sock.settimeout(None)
     except OSError:
         pass
-    info = ClientInfo(addr, username)
+    info = ClientInfo(addr, _sanitize_username(username))
     info.note_rx()  # 认证完成即视为一次活跃
     # 先标记发送线程激活再加入集合，避免广播线程在窗口期内走阻塞的同步发送路径
     info._sender_active = True
-    with runtime.clients_lock:
-        runtime.clients[sock] = info
-        count = len(runtime.clients)
-    # 每个客户端一个独立发送线程：慢客户端只淘汰自己，不拖累其他观看端
-    threading.Thread(
-        target=_client_sender_loop,
-        args=(sock, info, runtime),
-        name="client-sender-%s" % addr[0],
-        daemon=True,
-    ).start()
-    # 新连接入册后补发一次 roster（含本连接在内广播，旧客户端忽略未知 action）
-    runtime.broadcast_roster()
-    log.info("客户端接入: %s（%s，当前 %d 个客户端）", addr, username or "未登录", count)
-    auth_cfg = host_cfg.get("auth", {})
-    if not isinstance(auth_cfg, dict):
-        auth_cfg = {}
-    # net-019（2026-09-18）：入册之后任何一步异常都必须走统一收尾——旧实现
-    # `_client_recv_loop`/`broadcast_roster` 抛异常时直接冒泡出 handle_client，
-    # 客户端留在 runtime.clients、发送线程继续活着（删不掉的源 + 线程/fd 泄漏）。
+    # net-037（2026-09-24）：net-019 的收尾守卫原先只罩住 `_client_recv_loop`，
+    # 而入册、发送线程启动、`broadcast_roster()`（其自身的 except BaseException
+    # 会重新抛出，见 1427-1431）都在 try 之外——其中任何一步抛异常都会让客户端
+    # 永久滞留 runtime.clients（幽灵源）+ 发送线程不死 + fd 不关，而 `_conn_count`
+    # 已归还、max_clients 不会报警。现在"入册之后每一步"都在守卫内，异常一律
+    # 走统一收尾（注释即 net-019 意图的原文，本次把实现补齐）。
     reason = "异常"
     try:
+        with runtime.clients_lock:
+            runtime.clients[sock] = info
+            count = len(runtime.clients)
+        # 每个客户端一个独立发送线程：慢客户端只淘汰自己，不拖累其他观看端
+        threading.Thread(
+            target=_client_sender_loop,
+            args=(sock, info, runtime),
+            name="client-sender-%s" % addr[0],
+            daemon=True,
+        ).start()
+        # 新连接入册后补发一次 roster（含本连接在内广播，旧客户端忽略未知 action）
+        runtime.broadcast_roster()
+        log.info("客户端接入: %s（%s，当前 %d 个客户端）", addr, username or "未登录", count)
+        auth_cfg = cfg_section(host_cfg, "auth")
         reason = _client_recv_loop(sock, info, runtime, addr, net_cfg, auth_cfg)
     except Exception as e:
         reason = "异常: %s" % e
-        log.warning("客户端 %s 接收循环异常，按断开收尾: %s", addr, e)
+        log.warning("客户端 %s 接入流程异常，按断开收尾: %s", addr, e)
     finally:
         _client_teardown(sock, info, runtime, addr, username, reason)
 def _subscriber_count(runtime, source="local"):
@@ -2687,12 +2772,14 @@ def _accept_loop_multi(servers, runtime, spawn):
 
 
 def _listen_target(cfg):
-    """解析 (listen_host, port, bind_all)；非字符串地址按“全网卡”处理。
+    """解析 (listen_host, port, bind_all)；归一去空格，非法/非字符串按**只允许本机**处理。
 
     第 19 条语义：bind_all（""/"0.0.0.0"/"::"/None）→ 双栈 socket，一个端口同时覆盖
     IPv4/IPv6（frp 本地回连在 SYSTEM 上下文优先走 ::1，必须双栈，否则公网链路握手即断）；
     指定具体地址（如 127.0.0.1）→ 只绑该地址、该地址族，真正把共享限制在本机。
-    手改成数字/对象时按全网卡处理而不是抛 TypeError（第 100 条口径：坏配置只回退）。
+    D-02（2026-09-20）：手改成数字/对象/空白串时**收紧**为 127.0.0.1（fail-closed）——
+    不是第 100 条那种"回退默认"，安全开关的兜底方向是收紧而不是放开全网卡。
+    cfg-014（2026-09-24）：字符串先 `.strip()` 归一（粘贴常带首尾空格）。
 
     A0（2026-09-11）：具体回环地址（127.0.0.1 / localhost / ::1）不再只绑单一地址族——
     frpc 的本地目标常写 `localhost`，Windows 解析优先 `::1`，只绑 IPv4 回环会让隧道永远
@@ -2700,7 +2787,12 @@ def _listen_target(cfg):
     """
     host_cfg = cfg.get("host") if isinstance(cfg, dict) and isinstance(cfg.get("host"), dict) else {}
     listen_host = host_cfg.get("listen_host")
-    if not isinstance(listen_host, str) or not listen_host.strip():
+    if isinstance(listen_host, str):
+        # cfg-014（2026-09-24）：先归一化（去首尾空格）再判型——粘贴来的 " 0.0.0.0"
+        # 旧实现会当成"指定地址"原样交给 bind（启动报错里看不见那个空格），
+        # 也逃过 _is_loopback_alias / bind_all 判定。与 _upgrade_config 的口径一致。
+        listen_host = listen_host.strip()
+    if not isinstance(listen_host, str) or not listen_host:
         # D-02（2026-09-20）：旧实现把"非字符串"归一为 ""，而 "" 属于 bind_all 集合
         # → 坏配置反而**绑 0.0.0.0 全网卡**，与文档"默认/兜底只允许本机"、以及
         # host_ui.py:237（ui-007）同一情形兜底 127.0.0.1 的口径双向相反。
@@ -2793,6 +2885,11 @@ def _start_tunnel_selfcheck(runtime, port, delay=3.0):
 
     无隧道配置或 frpc 未在运行时直接跳过；整个过程在 daemon 线程里做，不阻塞启动。
     """
+    # net-039（2026-09-24）：幂等且可重启——线程仍在跑就不重复建（run_server 与
+    # GUI「启动隧道」成功回调都会调这里）；线程已随 frpc 停止而退出时允许补建新的。
+    prev = getattr(runtime, "_selfcheck_thread", None)
+    if prev is not None and prev.is_alive():
+        return
     target = _frp_public_target(runtime)
     if target is None:
         return
@@ -2870,7 +2967,9 @@ def _start_tunnel_selfcheck(runtime, port, delay=3.0):
             except OSError:
                 pass
 
-    threading.Thread(target=_probe, daemon=True, name="frp-selfcheck").start()
+    th = threading.Thread(target=_probe, daemon=True, name="frp-selfcheck")
+    runtime._selfcheck_thread = th   # net-039：供幂等判定与"frpc 重启后补建"使用
+    th.start()
 
 
 def _log_security_notice(runtime):
@@ -2888,7 +2987,9 @@ def _log_security_notice(runtime):
     host_cfg = host_cfg if isinstance(host_cfg, dict) else {}
     listen_host, port, bind_all = _listen_target(runtime.cfg)
     auth_cfg = host_cfg.get("auth") if isinstance(host_cfg.get("auth"), dict) else {}
-    auth_on = bool(auth_cfg.get("enabled", False))
+    # auth-023（2026-09-24）：与 _do_auth/快照的 fail-closed 默认值对齐（旧实现为
+    # False → 缺 enabled 键时日志/告警把"准入开启"谎报成"未开启账户准入"）。
+    auth_on = bool(auth_cfg.get("enabled", True))
     if not bind_all:
         dual = bool(getattr(runtime, "listen_dual_loopback", False))
         if _is_loopback_alias(listen_host) and dual:
@@ -3108,9 +3209,16 @@ def _capture_loop(runtime, p):
         region = runtime.slot["region"]
     # 第 100 条：采集器构造永不抛异常（两个后端都失败时只把句柄置 None），此时
     # grab() 恒返回 None，线程会以 100Hz 空转且什么都不上报。启动即验活。
-    src = pipeline.CaptureSource(
-        backend, monitor, region, none_rebuild_s=5.0,
-        none_rebuild_requires_dead=True, none_warn_s=30.0)
+    # T-19（2026-09-24）：测试可注入伪采集器（runtime.capture_factory）——旧实现无条件
+    # 构造真实 CaptureManager，整个 Hub 集成用例依赖本机屏幕内容才能收到帧，静止/无显示
+    # 环境下三个 MSG_FRAME 用例间歇假红（采集链路本身正确，坏的是测试对环境的依赖）。
+    factory = getattr(runtime, "capture_factory", None)
+    if factory is not None:
+        src = factory(backend, monitor, region)
+    else:
+        src = pipeline.CaptureSource(
+            backend, monitor, region, none_rebuild_s=5.0,
+            none_rebuild_requires_dead=True, none_warn_s=30.0)
     if not src.working():
         log.error("采集后端初始化失败（dxgi/mss 均不可用），将无法共享画面；"
                   "请在控制台「采集源」切换后端后重试")
@@ -3229,9 +3337,13 @@ def _encode_static_keyframe(runtime, fe, last_frame, error_cooldown_until):
             runtime.force_key = True
         return error_cooldown_until
     if res is None:
-        with runtime.slot_lock:
-            runtime.force_key = True
-        return error_cooldown_until
+        # codec-015（2026-09-24）：`force_idr` 返回 (None, None) 的可达形态正是
+        # `fe.encoder 不可用`（编码器 permafailed / encoder_sel=jpeg / 打包缺 PyAV）
+        # ——默认 dxgi 后端 + 静止检测关闭时画面静止是常态（grab() 恒返回 None），
+        # 编码线程没有新帧可消费，新订阅者永远等不到 IDR、画面保持黑屏，force_key
+        # 自旋置位。share 侧 codec-011 已修同一形状（把缓存帧交给 JPEG 回退出帧），
+        # host 侧从未同步。缓存帧在手：走 JPEG 出口写出自包含帧。
+        return _static_jpeg_fallback(runtime, last_frame, error_cooldown_until)
     nal, is_key, encode_ms, out_ts = res
     if not is_key:
         # codec-013（2026-09-20）：codec-004 给 share.py 加的这道门（强制 IDR 未生效、
@@ -3255,6 +3367,43 @@ def _encode_static_keyframe(runtime, fe, last_frame, error_cooldown_until):
     with runtime.stats_lock:
         runtime.stats["encode_ms"] = encode_ms
     log.info("静止期响应关键帧请求（%d 字节）", len(nal))
+    return error_cooldown_until
+
+
+def _static_jpeg_fallback(runtime, frame, error_cooldown_until):
+    """codec-015：编码器不可用时静止期关键帧请求的 JPEG 出口（与 share 侧 codec-011 同形状）。
+
+    成功写出缓存帧后**消费**请求（不恢复 force_key）——否则编码线程每 50ms 的重试
+    会把同一帧反复重编码成 JPEG。缓存帧本身也没有尺寸校验，与视频路径口径一致
+    （尺寸不一致由 codec 侧自动重建吸收）。返回新的编码错误告警冷却时刻。
+    """
+    if frame is None:
+        with runtime.slot_lock:
+            runtime.force_key = True
+        return error_cooldown_until
+    with runtime.slot_lock:
+        quality = safe_int(runtime.slot.get("quality", 75), 75, 1, 100, warn=False)
+    try:
+        jpeg, ms = pipeline.encode_bgr(frame, 1.0, quality, 0)
+    except Exception as e:
+        now_j = time.perf_counter()
+        if now_j >= error_cooldown_until:
+            log.warning("静止期关键帧的 JPEG 回退编码失败: %s，10 秒内不再重复告警", e)
+            error_cooldown_until = now_j + 10.0
+        with runtime.slot_lock:
+            runtime.force_key = True
+        return error_cooldown_until
+    with runtime.slot_lock:
+        runtime.slot["jpeg"] = jpeg
+        runtime.slot["ts"] = int(time.time() * 1_000_000)  # 新时间戳绕过发送端同帧去重
+        runtime.slot["bitrate"] = 0
+        runtime.slot["encode_ms"] = ms
+        runtime.slot["out_w"] = frame.shape[1]
+        runtime.slot["out_h"] = frame.shape[0]
+    enc_evt = getattr(runtime, "enc_evt", None)
+    if enc_evt is not None:
+        enc_evt.set()
+    log.info("静止期以 JPEG 回退响应关键帧请求（%d 字节，视频编码器不可用）", len(jpeg))
     return error_cooldown_until
 
 
@@ -3293,7 +3442,7 @@ def _encode_loop(runtime, p):
             error_cooldown_until = now_e + 10.0
 
     fe = pipeline.FrameEncoder(
-        width=0, height=0, fps=p.base_fps, bitrate=runtime.target_bitrate,
+        fps=p.base_fps, bitrate=runtime.target_bitrate,
         keyint=p.keyint, encoder_sel=p.encoder_sel, preset=p.codec_preset,
         target_width=p.target_width, quality=p.base_quality,
         on_build=_on_build, on_error=_on_error)
@@ -3729,8 +3878,12 @@ def main():
     _install_excepthooks()
     if args.port is not None:
         cfg["host"]["port"] = args.port
-        save_config(cfg, "host")
-        log.info("监听端口已覆盖为 %d 并写入 config.json", args.port)
+        # cfg-013：写盘失败（另一实例持锁）时必须说出来——旧实现照报"已写入 config.json"
+        if not save_config(cfg, "host"):
+            log.warning("监听端口未能写盘（另一实例正占用配置？）：本次运行按 %d 监听，"
+                        "重启后可能恢复旧端口", args.port)
+        else:
+            log.info("监听端口已覆盖为 %d 并写入 config.json", args.port)
 
     # A3（第 133 条）：GUI 模式先上屏纯 tkinter 极简 splash，再触发重依赖加载
     # （HostRuntime.__init__ 里的 _load_heavy 兜底）——双击到可见窗口的间隔
@@ -3766,7 +3919,18 @@ def main():
                     pass
             splash_root = None
 
-    runtime = HostRuntime(cfg)
+    try:
+        runtime = HostRuntime(cfg)
+    except BaseException:
+        # ui-038（2026-09-24）：splash 之后任一步抛错都要收掉那个无边框+置顶+
+        # 无任务栏按钮的"正在启动…"窗——否则它盖在屏幕正中，模态报错框被压在
+        # 下面，用户只能杀进程，且恰在最需要看清错误时（旧实现只在成功分支 destroy）。
+        if splash_root is not None:
+            try:
+                splash_root.destroy()
+            except Exception:
+                pass
+        raise
 
     if splash_root is not None:
         try:
@@ -3790,32 +3954,44 @@ def main():
         except Exception as e:
             log.warning("图形控制台不可用，回退命令行模式: %s", e)
             gui = None
+            # ui-044（2026-09-24）：HostConsole.__init__ 可能在 tk.Tk() 之后抛错——
+            # 那个已创建但未接管的 root 旧实现没人销毁，回退命令行模式后留一个无响应
+            # 空窗、其 Tcl 解释器全程存活（与第 86 条同型的清理口）。
+            try:
+                import tkinter as _tk
+                root = getattr(_tk, "_default_root", None)
+                if root is not None:
+                    root.destroy()
+                    _tk._default_root = None
+            except Exception:
+                pass
 
-    if gui is not None:
-        print_public_addr(cfg)
-        runtime.start_server()
-        try:
-            gui.run()
-        except Exception:
-            log.exception("图形控制台运行异常")
-        finally:
-            runtime.shutdown()
-            log.info("已退出，再见！")
-        return
-
-    # 命令行模式（--console 或 GUI 不可用）：主线程阻塞运行服务，行为与旧版一致
-    print_public_addr(cfg)
+    # net-044（2026-09-24）：`frp.start()` 之后到主循环之间的任何失败都必须走
+    # runtime.shutdown()——旧实现只在各自的成功分支里收尾，`HostConsole`/`start_server`
+    # 抛错或该窗口 Ctrl+C 会跳过收尾，auto_start 拉起的 frpc 成孤儿进程占住隧道与端口。
     try:
-        run_server(runtime)
-    except KeyboardInterrupt:
-        log.info("正在退出...")
-    except Exception:
-        log.exception("程序发生错误")
+        if gui is not None:
+            print_public_addr(cfg)
+            runtime.start_server()
+            try:
+                gui.run()
+            except Exception:
+                log.exception("图形控制台运行异常")
+            return
+
+        # 命令行模式（--console 或 GUI 不可用）：主线程阻塞运行服务，行为与旧版一致
+        print_public_addr(cfg)
         try:
-            import tkinter.messagebox as mb
-            mb.showerror(APP_NAME, "程序发生错误，详见 logs 目录日志文件")
+            run_server(runtime)
+        except KeyboardInterrupt:
+            log.info("正在退出...")
         except Exception:
-            pass
+            log.exception("程序发生错误")
+            try:
+                import tkinter.messagebox as mb
+                mb.showerror(APP_NAME, "程序发生错误，详见 logs 目录日志文件")
+            except Exception:
+                pass
     finally:
         runtime.shutdown()
         log.info("已退出，再见！")

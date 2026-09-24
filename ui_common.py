@@ -129,6 +129,9 @@ def build_style(root, palette=None, include_base=True):
     """按深色主题配置 ttk 全局风格（host 基础控件 + viewer Panel.* 的并集）。
 
     palette 为 PALETTE 的可选覆盖字典（键同名）；未覆盖项使用本模块常量。
+    ui-046（2026-09-24）复核：本参数**不是**"改它无效"的假接口——覆盖生效由
+    tests/test_ui_common.py::TestBuildStyle.test_palette_override 用真实 Tk 断言；
+    当前两个调用点都不传（单主题取值一致），保留为可覆盖的扩展点。
     同名色两端历史取值完全一致，因此默认路径下两端外观逐字节不变（§8 验收：
     外观截图比对无回归）。
 

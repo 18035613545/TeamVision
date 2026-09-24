@@ -134,11 +134,15 @@ def build_report_text(config, extra_text=""):
         host_cfg = {}
     auth = host_cfg.get("auth") if isinstance(host_cfg.get("auth"), dict) else {}
     listen_host = host_cfg.get("listen_host")
-    if not isinstance(listen_host, str) or not listen_host.strip():
+    if isinstance(listen_host, str):
+        # cfg-014（2026-09-24）：与 host._listen_target / _upgrade_config 同口径归一，
+        # 否则粘贴的 " 0.0.0.0"（首尾空格）在报告里被写成"回环/指定地址"。
+        listen_host = listen_host.strip()
+    if not isinstance(listen_host, str) or not listen_host:
         # D-02（2026-09-20）：与 host._listen_target 的实际兜底保持一致——
         # 那里此前把非字符串/空串归一为 ""（=绑 0.0.0.0），报告与运行时双向相反。
         listen_form = "127.0.0.1（回环/指定地址，非法值兜底）"
-    elif listen_host in ("0.0.0.0", "::"):
+    elif listen_host.lower() in ("0.0.0.0", "::"):
         listen_form = "%s（全网卡）" % listen_host
     else:
         listen_form = "%s（回环/指定地址）" % listen_host

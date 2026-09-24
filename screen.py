@@ -17,6 +17,24 @@ import logger
 
 log = logger.get_logger()
 
+#: capture-010（2026-09-24）：dxcam 输出匹配的告警必须"每个原因只报一次"。
+#: 旧实现把标记挂在 CaptureManager 实例上（`self._pick_warned`），而 `_rebuild()`
+#: 每次都新建实例 → 注释写着"只报一次"、实际每次重建都重报一条，静止/独占全屏下
+#: 约每 1.5 秒一条把 5MB 滚动日志冲刷干净。模块级集合跨实例生效（同 codec 侧口径）。
+_PICK_WARNED = set()
+_PICK_WARNED_MAX = 32
+
+
+def _warn_pick_once(key, msg, *args):
+    """同一 key 只记一条 WARNING（模块级，跨 CaptureManager 实例）；之后降为 debug。"""
+    if key in _PICK_WARNED:
+        log.debug(msg, *args)
+        return
+    if len(_PICK_WARNED) >= _PICK_WARNED_MAX:
+        _PICK_WARNED.clear()      # 防御性上限：key 含 monitor 序号，理论上不会无限增长
+    _PICK_WARNED.add(key)
+    log.warning(msg, *args)
+
 
 #: B7：vendor 目录是否已接入 sys.path（只做一次）
 _VENDOR_ON_PATH = False
@@ -291,46 +309,58 @@ class CaptureManager:
         屏幕"）变成第一屏；混合显卡/多屏按序号枚举不一致时采错屏，越界则
         IndexError 被静默吞掉回退 mss。这里按**几何矩形**在 dxcam 输出列表里匹配
         配置的显示器；匹配不到或配置为"全部屏幕"时返回 None（调用方回退 mss）。
+
+        capture-007（2026-09-24）："没匹配上"的路径旧实现全部落到末尾的"序号-1"回退且
+        零日志（capture-006 的 WARNING 只在 except 分支）。现在按两类分开：
+          - **几何枚举不可用**（mss 矩形取不到 / dxcam 未暴露 outputs / 枚举抛错）：
+            dxcam 本身仍可用，保留"序号-1"旧回退，但**记一条一次性 WARNING**；
+          - **枚举成功但没有与配置显示器几何一致的输出**：这是 capture-004 要根治的
+            "采到错误显示器"，返回 None 交调用方回退 mss，同样记一条一次性 WARNING。
+        告警标记在模块级（capture-010：旧实现挂在实例上，每次重建都会重报）。
         """
         if self.monitor <= 0:
             return None      # 0 = 全部屏幕（虚拟桌面）：单输出无法表达，回退 mss
         rect = self._monitor_rect(self.monitor)
-        if rect is not None:
-            try:
-                import dxcam
-                factory = getattr(dxcam, "_DXFactory__factory", None) or \
-                    getattr(dxcam, "__factory", None)
-                outputs = getattr(factory, "outputs", None) if factory else None
-                if outputs:
-                    targets = []
-                    for didx, outs in enumerate(outputs):
-                        for oidx, output in enumerate(outs):
-                            desc = getattr(output, "desc", None)
-                            coords = getattr(desc, "DesktopCoordinates", None)
-                            if coords is None:
-                                continue
-                            out_rect = (int(coords.left), int(coords.top),
-                                        int(coords.right - coords.left),
-                                        int(coords.bottom - coords.top))
-                            if out_rect == rect:
-                                targets.append((didx, oidx))
-                    if targets:
-                        if len(targets) > 1:
-                            log.warning("多个 DXGI 输出与显示器 #%d 几何一致，取第一个",
-                                        self.monitor)
-                        return targets[0]
-            except Exception as e:
-                # capture-006（2026-09-20）：旧口径是 log.debug——默认日志级别下等于
-                # 静默，"按几何匹配显示器"整条路径失效却查不到线索。首次失败提为
-                # WARNING（一次性的，避免每次重建都刷一条）。
-                if not getattr(self, "_pick_warned", False):
-                    self._pick_warned = True
-                    log.warning("dxcam 输出枚举失败，按序号回退（capture-006，只报一次）: %s", e)
-                else:
-                    log.debug("dxcam 输出枚举失败，按序号回退: %s", e)
-        # 几何匹配不可用（dxcam 内部结构变化等）：退回"序号-1"的旧口径，
-        # 设备取默认 0（不改变历史行为）
-        return (0, self.monitor - 1)
+        if rect is None:
+            _warn_pick_once("rect-missing",
+                            "显示器 #%d 的矩形不可用（mss 初始化失败？），按序号回退 dxgi",
+                            self.monitor)
+            return (0, self.monitor - 1)
+        try:
+            import dxcam
+            factory = getattr(dxcam, "_DXFactory__factory", None) or \
+                getattr(dxcam, "__factory", None)
+            outputs = getattr(factory, "outputs", None) if factory else None
+            if not outputs:
+                _warn_pick_once("no-outputs",
+                                "dxcam 未暴露输出列表（内部结构变化？），按序号回退")
+                return (0, self.monitor - 1)
+            targets = []
+            for didx, outs in enumerate(outputs):
+                for oidx, output in enumerate(outs):
+                    desc = getattr(output, "desc", None)
+                    coords = getattr(desc, "DesktopCoordinates", None)
+                    if coords is None:
+                        continue
+                    out_rect = (int(coords.left), int(coords.top),
+                                int(coords.right - coords.left),
+                                int(coords.bottom - coords.top))
+                    if out_rect == rect:
+                        targets.append((didx, oidx))
+            if targets:
+                if len(targets) > 1:
+                    log.warning("多个 DXGI 输出与显示器 #%d 几何一致，取第一个",
+                                self.monitor)
+                return targets[0]
+            _warn_pick_once("no-match-%d" % self.monitor,
+                            "DXGI 输出中没有与显示器 #%d 几何一致的项（DPI 缩放/混合显卡"
+                            "枚举顺序不一致？），改用 mss 后端采集", self.monitor)
+            return None
+        except Exception as e:
+            # capture-006（2026-09-20）：旧口径是 log.debug——默认日志级别下等于
+            # 静默，"按几何匹配显示器"整条路径失效却查不到线索。
+            _warn_pick_once("enum-failed", "dxcam 输出枚举失败，按序号回退: %s", e)
+            return (0, self.monitor - 1)
 
     def grab(self):
         """采集一帧，返回 BGR numpy 数组；失败或无新帧返回 None。

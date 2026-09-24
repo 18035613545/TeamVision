@@ -57,11 +57,11 @@ class EncodedFrame:
 class FrameEncoder:
     """视频优先、JPEG 回退的编码器封装（线程内独占使用，非线程安全）。"""
 
-    def __init__(self, *, width, height, fps, bitrate, keyint, encoder_sel,
+    def __init__(self, *, fps, bitrate, keyint, encoder_sel,
                  preset="", target_width=0, quality=80, name="",
                  on_build=None, on_error=None):
-        self._w = width
-        self._h = height
+        # ui-046（2026-09-24）：width/height 是死参数——两个生产调用点被迫各传一个
+        # 无效的 0，而实际尺寸由 encode() 每帧按 scale/target_width 计算。删除。
         self._fps = max(1, int(fps))
         self._bitrate = int(bitrate)
         self._keyint = max(1, int(keyint))
