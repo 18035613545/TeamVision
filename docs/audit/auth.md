@@ -28,6 +28,9 @@ auth-020｜观看端非法挑战参数的捕获元组补 OverflowError/Attribute
 auth-021｜proof 校验失败不再把整段 %r（最长 32MB）写进日志，改记长度 + 前 8 位｜—
 auth-022｜host.auth 非字典时准入改 fail-closed（不再静默关闭登录）；load_config 出口统一校验「应为字典的节」｜tests/test_optimize_stage1.py
 
+auth-023｜auth.enabled 缺键兜底在同族三处统一为 True（fail-closed），迟到 LOGIN 的用户名过净化｜—
+auth-024｜等 mainloop 就绪改单调钟累加（开机阶段时间校正不再误判「用户取消登录」并静默冷却 30 秒）｜—
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 auth 的条目。一行一条 `第 N 条｜简述`。

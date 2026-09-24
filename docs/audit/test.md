@@ -22,3 +22,10 @@ T-10｜codec-002~008 登记为「—」且 set_fps 失败路径/多包合并/is_
 T-11｜auth-009 的跨进程锁与 cfg-001~003、net-016/017、ui-003~019 整体缺覆盖；_file_lock/_read_disk 在 tests/ 内零引用｜tests/test_bugfix_20260920_cfg004_lock.py（两个真实进程竞争同一 config.json，按报告要求不用 mock）；net-016/017 与 ui-003~019 的其余部分仍为 —，属元条目、随后续批次补
 T-12｜初稿"ui-011 的桩钉不住修复"方向写反，报告已整条撤销；仅保留成立部分——_prompt_blocked_until 的**赋值侧**用哪个时钟无断言｜—（不计为待修项）
 T-13｜test_d1_challenge_auth.py 的 last_login 与秒级墙钟字符串相等比较，跨秒偶发红（flaky）｜tests/test_d1_challenge_auth.py（已改为把记录值解析成时间戳、只要求落在本次调用前后的合理窗口内）
+
+T-14｜面板不重叠不变量用例只取宽屏、刻意避开已知失效组合：参数组补窄屏 1366/1280/1024，断言改为矩形不相交，并补收窄/纵向钳制/下移/拖动同步四例｜tests/test_panel_float_no_overlap.py
+T-15｜assertTrue(app.running is False or ... is True) 恒真：换成结论侧真断言（_build_ui + mainloop + running 复位）并补「子控件销毁失败仍要清尺寸」｜tests/test_viewer_splash_root_reset.py
+T-16｜自造 deque(maxlen=900) 从未调生产代码：上限提为 viewer._LATENCY_RING_MAX 供引用，封顶用例改经 _store_frame 灌满验证｜tests/test_latency_p95.py
+T-17｜约 17 个文件用 inspect.getsource 锁字面串：本批新增/改动用例全部行为断言（部分落地，残留见修复记录 §7.1）｜—
+T-18｜pytest/unittest 两套 runner 无交叉：新增守卫用例扫描模块顶层 test_* 函数并显式失败；CI 单测统一走 run_tests.bat｜tests/test_bugfix_20260924_round7.py
+T-19｜3 个 MSG_FRAME 用例依赖真实屏幕采集：host._capture_loop 加 capture_factory 注入缝，Hub 注入伪屏幕｜tests/test_multiview_integration.py

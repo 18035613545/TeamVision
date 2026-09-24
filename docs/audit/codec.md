@@ -20,6 +20,12 @@ codec-012｜set_fps 失败回滚 self._fps 并返回是否生效，pipeline 按�
 codec-013｜host 侧静止期强制 IDR 补 is_key 门禁、回了 P 帧时保留 force_key 不消费（codec-004 此前只改了 share 侧）｜—
 codec-014｜客户端 REQ_KEYFRAME 走带 1 秒冷却的去重（本地 _request_local_keyframe / peer 复用 _request_peer_keyframe），帧帧 IDR 的廉价放大堵死｜—
 
+codec-015｜host 侧静止期关键帧请求补 JPEG 出口（编码器不可用时用缓存帧出图，新观众不再永久黑屏）｜tests/test_bugfix_20260924_round7.py
+codec-016｜preset 按编码器族校验（x264 风格 preset 不再原样喂给 NVENC → 不再静默退软件编码）｜tests/test_bugfix_20260924_round7.py
+codec-017｜set_bitrate 加「重建中」护栏：一次调整只构造一套上下文（保留第 112 条锁外构造）｜tests/test_bugfix_20260924_round7.py
+codec-018｜share 侧关键帧兜底只走 JPEG（不再可能送 P 帧并谎报成功、也不消费请求）｜tests/test_bugfix_20260924_round7.py
+codec-019｜PyAV 缺失时记一条一次性告警（不再零日志永久跑 JPEG）｜tests/test_bugfix_20260924_round7.py
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 codec 的条目。一行一条 `第 N 条｜简述`。

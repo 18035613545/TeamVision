@@ -21,6 +21,17 @@ dist-013｜setup.bat 默认走官方源，国内镜像改 --mirror / TV_USE_MIRR
 dist-014｜诊断包在本进程一条日志都没有时（崩溃重启后 PID 已变，正是使用场景）退化为按 mtime 取最近 6 份，并在 report.txt 显式写明收集了什么｜—（tests/test_diag.py 全篇不传 pid=，该分支仍零覆盖，见 T-08）
 dist-015｜四支 .bat 改存 ANSI/GBK 并把 chcp 65001 改为 936（UTF-8 无 BOM + 65001 实测会破坏命令边界，可把一条命令静默并进上一条 echo）｜—
 
+dist-016｜签名失败升级为失败退出（build_exe.bat goto :failed、build_installer.bat exit /b 1）｜—（构建脚本，人工核验分支可达性）
+dist-017｜导出诊断包先 deepcopy 快照再交工作线程（不再有 dictionary changed size 竞态）｜—
+dist-018｜logs 目录里的诊断包纳入回收（只保留最近 _KEEP_DIAGS=5 个，按 mtime）｜tests/test_bugfix_20260924_round7.py
+dist-019｜日志清理第二遍改逐文件 continue（首个不可删文件不再让整轮上界失效）｜tests/test_bugfix_20260924_round7.py
+dist-020｜.gitignore 补 config.json.*（覆盖 .tmp/.corrupt-*/.lock，不匹配 config.example.json）｜—
+dist-021｜installer.iss 卸载清单对齐实际数据目录（{app}ps-host、{app}ps-viewer 的数据项）｜—
+dist-022｜CI 单测改调 run_tests.bat（口径单一来源）+ ruff/mypy 钉版并真正执行（本机两门均绿）｜—（CI 自身）
+dist-023｜删除恒真的 if exist "%SETUP_EXE%" 与不可达 else｜—（构建脚本）
+dist-024｜Inno 版本检测读卸载注册表 DisplayVersion，<6.3 明确报原因｜—（构建脚本）
+dist-025｜编译前清理非当前版本的 dist\TeamVision-Setup-*.exe；fps-host.spec 硬校验 dxcam/comtypes（见修复记录 §7.4）｜—（构建脚本/打包）
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 dist 的条目。一行一条 `第 N 条｜简述`。

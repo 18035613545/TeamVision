@@ -13,6 +13,13 @@
 - `cfg-008｜safe_int docstring 与实现相符（越界是钳制），并补 clamp=False 模式；监听端口按「要么合法要么回退默认 + WARNING」处理｜—`
 - `cfg-009｜docs/audit 的「关联测试」三处与事实相反（auth-009 登记落空 / capture-002 假绿未标 / codec-009 有效用例被记为无），已按 tests/ 实测逐行更正｜—（本条本身是索引准确性条目，无代码测试；核验证据见 docs/修复记录-2026-09-20-BUG审查报告.md §7）`
 
+cfg-010｜save_config 读基线失败即放弃本次写（不再把整份配置塌缩成「只含本进程那一节」）｜tests/test_bugfix_20260924_round7.py
+cfg-011｜新增 _atomic_write_json：load_config 首建与 _recover_corrupt_config 也走锁 + tmp + os.replace｜tests/test_bugfix_20260924_round7.py
+cfg-012｜save_config 写盘失败分支改 except Exception：非 OSError 也清 tmp 并记 ERROR｜tests/test_bugfix_20260924_round7.py
+cfg-013｜save_config 的 False 返回值在 11 个调用点接线（GUI 状态栏标红 / 面板提示 / 日志告警）｜—
+cfg-014｜listen_host 归一化口径统一（_upgrade_config / _listen_target / diag 三处都 strip().lower()）｜tests/test_bugfix_20260924_round7.py
+cfg-015｜_upgrade_config 返回 (changes, notes)：纯说明只记 INFO，不再冒充「配置已升级」并落盘｜tests/test_bugfix_20260924_round7.py
+
 ## 历史（旧编号，冻结）
 
 > 第 17 条｜config.json 原子写 + section 读改写（本次升级为跨进程锁，见 cfg-001）

@@ -29,6 +29,15 @@ net-034｜追新判据去两端墙钟差：改用「时延相对历史最优基�
 net-035｜去掉积压判据的 10 秒上界与「单次 recv 装得下 12 帧」的恒不可达档，改批内跨度比；补「追新 5 秒未等到关键帧即重连」兜底｜—
 net-036｜观看端 last_rx 改按完整消息刷新（接 on_buf）并接 on_tick 做停滞判定，滴字节不再把频道钉在「接收中」｜—
 
+net-037｜broadcast_roster 纳入「入册之后每一步」的统一收尾守卫（异常不再泄漏 client/发送线程/fd）｜tests/test_bugfix_20260924_round7.py
+net-038｜pack_msg 对游离代理位兜底（非严格 UTF-8 编码）+ 用户名统一净化（去代理位/控制字符 + 长度截断）｜tests/test_bugfix_20260924_round7.py
+net-039｜隧道自检线程改幂等补建（GUI「启动隧道」成功回调也建，frpc 重启后可补）｜tests/test_bugfix_20260924_round7.py
+net-040｜被配额限流的 UNSHARE 挂起并在窗口内补做（不再静默丢弃留幽灵源）｜tests/test_bugfix_20260924_round7.py
+net-041｜RTT 改单调钟配对（墙钟回拨不再把读数永久锁在旧值）｜tests/test_bugfix_20260924_round7.py
+net-042｜_resync/_resync_at 随重连复位（新连接第一个巡检窗口不再误判）｜—
+net-043｜外部托管改实探 SakuraFrpService（2 秒缓存），服务退出即复位 latch｜tests/test_item62_frp.py
+net-044｜main 尾部单一 try/finally：frp.start() 之后的失败也走 runtime.shutdown()（不留孤儿 frpc）｜—
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 net 的条目。一行一条 `第 N 条｜简述`。

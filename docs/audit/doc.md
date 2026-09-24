@@ -22,3 +22,5 @@ D-10｜README 主要依赖写 opencv-python，requirements.txt 是 opencv-python
 D-11｜README 写上行自动值 "0=自动 2×bitrate_kbps"，实际是 max(600, 2×bitrate)：补 600 Kbps 地板｜—
 D-12｜README 承诺 DEFAULT_CONFIG 为单一真源，面板三处兜底值（fps/enabled/注册策略）与之漂移：代码侧改同源；「注册策略」一子项经报告复核撤销｜—
 D-13｜faq/changelog 引用未跟踪文档「实现方案 §11.3」，克隆后引用落空：两处删悬空引用（文件本身仍未跟踪，属仓库决策）｜—
+
+D-14｜四处注释/docstring 与代码行为相反：screen._pick_output_idx、host_ui 自检文案、host UNSHARE 分支、host._listen_target —— 全部按修复后的实现改写｜—

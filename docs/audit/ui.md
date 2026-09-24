@@ -37,6 +37,22 @@ ui-029｜poll 纯文字分支也落账 serial/idx/status，断线态下 15→33�
 ui-030｜字符串 capture.monitor 经 safe_int：图形控制台不再构造失败并静默回落到无窗口（console=False）｜—
 ui-031｜叠加文本变长后重新定位悬浮窗（ui-014 只改宽度来源、未改触发条件）｜—
 
+ui-032｜面板让位补窄屏兜底：收窄面板到可用宽度（下限 320）/ 纵向躲到小窗下方｜tests/test_panel_float_no_overlap.py
+ui-033｜面板纵向适配：y 钳进 [边距, 屏高-面板高-边距]（footer 不越出下缘）｜tests/test_panel_float_no_overlap.py
+ui-034｜_panel_user_moved 提供复位入口（_panel_show 清标记与几何缓存后重新让位）｜tests/test_panel_float_no_overlap.py
+ui-035｜拖动悬浮窗同步 _float_left 并重新让位（面板不再按失效左缘定位）｜tests/test_panel_float_no_overlap.py
+ui-036｜run() 移植分支逐条独立 try（尺寸复位不再被前两条异常跳过）｜tests/test_viewer_splash_root_reset.py
+ui-037｜get_snapshot 的 port 过 safe_int（GUI 的 %d 格式化不再每 500ms 抛 TypeError 冻住面板）｜—
+ui-038｜splash 之后的异常路径先收掉幽灵置顶窗（viewer/host 两侧）｜tests/test_viewer_splash_root_reset.py
+ui-039｜import codec（→av）从 viewer 顶层移入 _load_heavy（splash 收益不再被吃掉一半）｜—
+ui-040｜update_check 勾选即触发一次后台检查（不再等下次启动）｜—
+ui-041｜_on_panel_configure 变化判定与定位统一用请求尺寸（拖拽面板后不再脱节）｜tests/test_panel_float_no_overlap.py
+ui-042｜面板几何加「未变即跳过」缓存（状态文本变化不再做冗余 Tcl 下发）｜tests/test_panel_float_no_overlap.py
+ui-043｜悬浮窗按屏高上限同比例缩小宽高（竖长采集区/超宽 display_width 不再越出屏幕）｜—
+ui-044｜HostConsole 构造失败时销毁已建的 Tk root（回退命令行不再留无响应空窗）｜—
+ui-045｜账户面板 refresh 加异常保护（手改 created 不再让面板永久空白且零提示）｜—
+ui-046｜删除死接口：FrameEncoder(width,height)、VideoEncoder(rate_control) 及 cbr 死分支、frame_sent/_rebuilt_at_frame；palette/mask_secret 经复核保留（见修复记录 §7）｜tests/test_optimize_stage2.py + tests/test_ui_common.py
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 ui 的条目。一行一条 `第 N 条｜简述`。

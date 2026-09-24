@@ -12,6 +12,11 @@ capture-004｜显示器序号按几何矩形匹配 DXGI 输出（0=全部屏幕�
 capture-005｜--console 也声明 DPI 感知（不再与「是否有窗口」绑定），mss 逻辑像素与 dxcam 物理像素不再混用｜—
 capture-006｜ensure_vendor_on_path() 提到 _open() 开头：源码运行首个采集会话的 DXGI 几何匹配不再恒失败；该 except 由 debug 提为一次性 warning｜—
 
+capture-007｜_pick_output_idx 分清「几何枚举不可用」（保留序号回退 + 一次性 WARNING）与「无几何一致项」（返回 None 回退 mss）｜tests/test_bugfix_20260924_round7.py
+capture-008｜normalize_region 放行负原点（副屏在主屏左侧可框选）；host_ui 越界校验改按显示器并集四至｜tests/test_bugfix_20260924_round7.py
+capture-009｜share 侧空帧重建改时间判据 5.0 秒（与 host 对齐，静止下不再每 ~1.5 秒重建 DXGI）｜tests/test_bugfix_20260924_round7.py
+capture-010｜dxcam 匹配告警集提到模块级（跨重建实例只报一次）｜tests/test_bugfix_20260924_round7.py
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 capture 的条目。一行一条 `第 N 条｜简述`。
