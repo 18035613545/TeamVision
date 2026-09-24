@@ -158,7 +158,7 @@ class TestLegacyConfigUpgrade(unittest.TestCase):
 
     def test_upgrade_flips_legacy_insecure_values(self):
         raw = {"host": {"listen_host": "0.0.0.0", "auth": {"enabled": False}}}
-        changes = common._upgrade_config(raw)
+        changes, _notes = common._upgrade_config(raw)
         self.assertEqual(len(changes), 2)
         self.assertEqual(raw["host"]["listen_host"], "127.0.0.1")
         self.assertTrue(raw["host"]["auth"]["enabled"])
@@ -166,18 +166,18 @@ class TestLegacyConfigUpgrade(unittest.TestCase):
 
     def test_upgrade_is_idempotent(self):
         raw = {"host": {"listen_host": "0.0.0.0", "auth": {"enabled": False}}}
-        self.assertTrue(common._upgrade_config(raw))
-        self.assertEqual(common._upgrade_config(raw), [])       # 第二次不再改动
+        self.assertTrue(common._upgrade_config(raw)[0])
+        self.assertEqual(common._upgrade_config(raw), ([], []))  # 第二次不再改动
 
     def test_custom_listen_host_is_preserved(self):
         raw = {"host": {"listen_host": "192.168.1.5", "auth": {"enabled": True}}}
-        self.assertEqual(common._upgrade_config(raw), [])
+        self.assertEqual(common._upgrade_config(raw), ([], []))
         self.assertEqual(raw["host"]["listen_host"], "192.168.1.5")
         self.assertTrue(raw["host"]["auth"]["enabled"])
 
     def test_already_enabled_auth_is_not_touched(self):
         raw = {"host": {"listen_host": "0.0.0.0", "auth": {"enabled": True}}}
-        changes = common._upgrade_config(raw)
+        changes, _notes = common._upgrade_config(raw)
         self.assertEqual(len(changes), 1)                        # 只改监听地址
         self.assertTrue(raw["host"]["auth"]["enabled"])
 

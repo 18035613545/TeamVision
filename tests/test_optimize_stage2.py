@@ -74,7 +74,7 @@ class TestEncoderBackoff(unittest.TestCase):
         _DeadEncoder.calls = []
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _DeadEncoder), \
                 mock.patch.object(pipeline.time, "monotonic", lambda: now[0]):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto")
             for i in range(10):
                 ef = fe.encode(_frame(), i)
@@ -98,7 +98,7 @@ class TestEncoderBackoff(unittest.TestCase):
         _DeadEncoder.calls = []
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _DeadEncoder), \
                 mock.patch.object(pipeline.time, "monotonic", lambda: now[0]):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto")
             for _ in range(10):
                 fe.encode(_frame(), 0)
@@ -115,7 +115,7 @@ class TestEncoderBackoff(unittest.TestCase):
         now = [0.0]
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _boom), \
                 mock.patch.object(pipeline.time, "monotonic", lambda: now[0]):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto")
             for i in range(5):
                 ef = fe.encode(_frame(), i)
@@ -126,7 +126,7 @@ class TestEncoderBackoff(unittest.TestCase):
     def test_jpeg_selector_never_builds_video_encoder(self):
         _DeadEncoder.calls = []
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _DeadEncoder):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="jpeg")
             ef = fe.encode(_frame(), 1)
         self.assertFalse(ef.is_video)
@@ -140,7 +140,7 @@ class TestEncoderLifecycle(unittest.TestCase):
         built = []
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _LiveEncoder):
             fe = pipeline.FrameEncoder(
-                width=64, height=48, fps=30, bitrate=1000, keyint=30,
+                fps=30, bitrate=1000, keyint=30,
                 encoder_sel="auto",
                 on_build=lambda enc, w, h, br: built.append((w, h, br)))
             ef1 = fe.encode(_frame(), 1)
@@ -152,7 +152,7 @@ class TestEncoderLifecycle(unittest.TestCase):
 
     def test_fps_change_reconfigures_encoder(self):
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _LiveEncoder):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto")
             fe.encode(_frame(), 1, fps=30)
             enc = fe.encoder
@@ -166,7 +166,7 @@ class TestEncoderLifecycle(unittest.TestCase):
 
         errors = []
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _RaisingEncoder):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto",
                                        on_error=errors.append)
             ef = fe.encode(_frame(), 1)          # 不得抛（第 90 条）
@@ -175,7 +175,7 @@ class TestEncoderLifecycle(unittest.TestCase):
 
     def test_force_idr_without_encoder_returns_none(self):
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _DeadEncoder):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto")
             fe.encode(_frame(), 1)
             res, err = fe.force_idr(_frame())
@@ -188,7 +188,7 @@ class TestEncoderLifecycle(unittest.TestCase):
                 raise RuntimeError("GPU 重置")
 
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _RaisingEncoder):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto")
             fe.encode(_frame(), 1)
             res, err = fe.force_idr(_frame())    # 不得抛
@@ -197,7 +197,7 @@ class TestEncoderLifecycle(unittest.TestCase):
 
     def test_close_releases_encoder(self):
         with mock.patch.object(pipeline.codec_mod, "VideoEncoder", _LiveEncoder):
-            fe = pipeline.FrameEncoder(width=64, height=48, fps=30, bitrate=1000,
+            fe = pipeline.FrameEncoder(fps=30, bitrate=1000,
                                        keyint=30, encoder_sel="auto")
             fe.encode(_frame(), 1)
             enc = fe.encoder

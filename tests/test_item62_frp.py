@@ -75,23 +75,40 @@ class TestExternalLatchReset(unittest.TestCase):
 
     def test_true_external_stop_terminates_nothing(self):
         # 正控：纯外部托管（无自spawn proc）时 stop() 不 terminate，is_running 仍报 True。
+        # net-043（2026-09-24）：外部托管从"采信 latch"改为**实探服务进程**，本用例
+        # 必须显式声明 SakuraFrpService 在跑（否则 stop() 会正确判定"未托管"）。
         mgr = _mgr()
         mgr._external_running = True
         mgr._proc = None
-        msg = mgr.stop()
-        self.assertIn("樱花", msg)
-        self.assertTrue(mgr.is_running())
+        with mock.patch.object(host.FrpManager, "_sakura_service_running",
+                               staticmethod(lambda: True)):
+            msg = mgr.stop()
+            self.assertIn("樱花", msg)
+            self.assertTrue(mgr.is_running())
 
-    def test_external_branch_would_orphan_if_latched(self):
-        # 负控/不变量：stop() 的外部托管分支跳过 terminate。这正是为什么 owned proc
-        # 绝不能与 latch 共存——若 latch 泄漏进 owned-proc 状态，stop() 就会漏杀。
+    def test_latched_state_self_heals_when_service_gone(self):
+        # 负控/不变量：latch 泄漏进 owned-proc 状态时，旧实现会跳过 terminate 留下孤儿。
+        # net-043（2026-09-24）：外部托管改为实探服务进程——服务不在时 latch 立即复位，
+        # stop() 走正常路径把自持有的 frpc 杀掉（不再需要重启 host 才能收拾）。
         mgr = _mgr()
         fake = FakeProc()
         mgr._proc = fake
         mgr._external_running = True   # 人为构造 bug 状态（fix #1 保证 start() 后不会这样）
-        msg = mgr.stop()
-        self.assertFalse(fake.terminated)   # 旧行为：孤儿
-        self.assertIn("樱花", msg)
+        with mock.patch.object(host.FrpManager, "_sakura_service_running",
+                               staticmethod(lambda: False)):
+            msg = mgr.stop()
+        self.assertTrue(fake.terminated, "服务已退出但 latch 未复位：frpc 成孤儿")
+        self.assertFalse(mgr._external_running, "latch 未复位（面板恒显运行中）")
+        self.assertIn("frpc 已终止", msg)
+
+    def test_is_running_probes_external_service(self):
+        """net-043：is_running() 必须实探——用户关掉 SakuraFrpService 后面板不能恒显运行中。"""
+        mgr = _mgr()
+        mgr._external_running = True
+        with mock.patch.object(host.FrpManager, "_sakura_service_running",
+                               staticmethod(lambda: False)):
+            self.assertFalse(mgr.is_running())
+        self.assertFalse(mgr._external_running)
 
 
 if __name__ == "__main__":

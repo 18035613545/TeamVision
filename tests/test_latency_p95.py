@@ -6,7 +6,9 @@
 2) 窗口只收 30s 内样本（100s 前的样本被剔除）；
 3) 样本 <10 记 0（暂无），避免个别抖动霸榜；
 4) 5 秒缓存：窗口内新样本不会立刻改变读数，5 秒后重算生效；
-5) deque 封顶 900（长跑内存不漂移）。
+5) deque 封顶（长跑内存不漂移）——T-16（2026-09-24）：上限必须引用生产常量
+   `viewer._LATENCY_RING_MAX`，并用**生产入口** `_store_frame` 灌满验证；
+   旧用例自己 `deque(maxlen=900)` 再 append，把生产上限改成 90000 仍会绿（假绿）。
 """
 import threading
 import time
@@ -21,7 +23,8 @@ def _mk_channel(samples, age_all_s=0.0):
     ch = viewer.Channel.__new__(viewer.Channel)
     ch.lock = threading.Lock()
     now = time.monotonic() - age_all_s
-    ch._latency_ring = deque(((now, us) for us in samples), maxlen=900)
+    ch._latency_ring = deque(((now, us) for us in samples),
+                             maxlen=viewer._LATENCY_RING_MAX)
     ch._p_stats_cache = None
     return ch
 
@@ -55,12 +58,21 @@ class TestLatencyPercentiles(unittest.TestCase):
         # 21 样本 [10..29,999]：p50=第11个(20ms)、p95=第20个(29ms)；单个离群值不霸榜
         self.assertEqual((p50, p95), (20.0, 29.0))
 
-    def test_ring_capped_at_900(self):
-        ch = _mk_channel([])
-        now = time.monotonic()
-        for _ in range(2000):
-            ch._latency_ring.append((now, 1000))
-        self.assertEqual(len(ch._latency_ring), 900)
+    def test_ring_capped_by_production_limit(self):
+        # 生产入口（_store_frame）灌满：上限改大/改小都会让本用例失败
+        ch = viewer.Channel.__new__(viewer.Channel)
+        ch.lock = threading.Lock()
+        ch._fps_times = []
+        ch._latency_samples = []
+        ch._latency_ring = deque(maxlen=viewer._LATENCY_RING_MAX)
+        ch._p_stats_cache = None
+        ch.frame_serial = 0
+        ch.last_frame = None
+        ch.fps = 0.0
+        ch.latency_ms = 0.0
+        for _ in range(viewer._LATENCY_RING_MAX + 200):
+            ch._store_frame(object(), time.time_ns() // 1000 - 40_000)
+        self.assertEqual(len(ch._latency_ring), viewer._LATENCY_RING_MAX)
 
 
 class TestStoreFrameFeedsRing(unittest.TestCase):
@@ -71,7 +83,7 @@ class TestStoreFrameFeedsRing(unittest.TestCase):
         ch.lock = threading.Lock()
         ch._fps_times = []
         ch._latency_samples = []
-        ch._latency_ring = deque(maxlen=900)
+        ch._latency_ring = deque(maxlen=viewer._LATENCY_RING_MAX)
         ch._p_stats_cache = None
         ch.frame_serial = 0
         ch.last_frame = None

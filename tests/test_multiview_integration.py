@@ -41,8 +41,33 @@ def _free_port():
     return port
 
 
+class _FakeScreen:
+    """伪屏幕：每帧内容变化（避免静止语义把帧源掐断）。"""
+
+    def __init__(self):
+        self.closed = False
+        self._i = 0
+
+    def grab(self):
+        self._i += 1
+        img = np.zeros((72, 128, 3), dtype=np.uint8)
+        img[:, :, 0] = self._i % 251
+        return img
+
+    def close(self):
+        self.closed = True
+
+    def set_params(self, *a):
+        pass
+
+
 class Hub:
-    """以线程方式启动真实 hub（HostRuntime.run_server）。"""
+    """以线程方式启动真实 hub（HostRuntime.run_server）。
+
+    T-19（2026-09-24）：本地采集改用伪屏幕——旧实现依赖真实 CaptureManager，
+    整个用例类都要靠"本机屏幕这一秒确实在变"才能收到帧，静止/无显示环境下
+    三个 MSG_FRAME 用例间歇假红（见记忆项「multiview 用例假红」）。
+    """
 
     def __init__(self):
         cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -52,6 +77,9 @@ class Hub:
         cfg["host"]["codec"]["encoder"] = "jpeg"         # 本地编码仅 JPEG（测试无解码）
         cfg["host"]["auth"]["enabled"] = False
         self.runtime = HostRuntime(cfg)
+        self.runtime.capture_factory = lambda backend, monitor, region: (
+            __import__("pipeline").CaptureSource(
+                backend, monitor, region, capture=_FakeScreen(), owned=False))
         self.runtime.start_server()
         deadline = time.time() + 5
         while time.time() < deadline and self.runtime._server is None:

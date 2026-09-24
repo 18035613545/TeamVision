@@ -861,7 +861,7 @@ class TestB10AuthTimeout(unittest.TestCase):
     def test_migration_raises_short_auth_timeout(self):
         raw = {"host": {"listen_host": "0.0.0.0",
                         "auth": {"enabled": False, "auth_timeout": 60}}}
-        changes = common._upgrade_config(raw)
+        changes, _notes = common._upgrade_config(raw)
         self.assertTrue(raw["host"]["auth"]["enabled"])
         self.assertEqual(raw["host"]["auth"]["auth_timeout"],
                          common.AUTH_TIMEOUT_DEFAULT_S)
@@ -1053,7 +1053,8 @@ class TestC7ListenBacklog(unittest.TestCase):
 class TestC12ConfigVersionWriteback(unittest.TestCase):
     def test_version_written_even_without_changes(self):
         raw = {"host": {"listen_host": "127.0.0.1", "auth": {"enabled": True}}}
-        self.assertEqual(common._upgrade_config(raw), [])
+        # cfg-015（2026-09-24）：返回 (changes, notes) —— notes 是纯说明、不落盘
+        self.assertEqual(common._upgrade_config(raw), ([], []))
         self.assertEqual(raw.get("config_version"), common.CONFIG_VERSION)
 
 
