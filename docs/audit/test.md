@@ -26,6 +26,6 @@ T-13｜test_d1_challenge_auth.py 的 last_login 与秒级墙钟字符串相等�
 T-14｜面板不重叠不变量用例只取宽屏、刻意避开已知失效组合：参数组补窄屏 1366/1280/1024，断言改为矩形不相交，并补收窄/纵向钳制/下移/拖动同步四例｜tests/test_panel_float_no_overlap.py
 T-15｜assertTrue(app.running is False or ... is True) 恒真：换成结论侧真断言（_build_ui + mainloop + running 复位）并补「子控件销毁失败仍要清尺寸」｜tests/test_viewer_splash_root_reset.py
 T-16｜自造 deque(maxlen=900) 从未调生产代码：上限提为 viewer._LATENCY_RING_MAX 供引用，封顶用例改经 _store_frame 灌满验证｜tests/test_latency_p95.py
-T-17｜约 17 个文件用 inspect.getsource 锁字面串：本批新增/改动用例全部行为断言（部分落地，残留见修复记录 §7.1）｜—
+T-17｜约 17 个文件、39 处 inspect.getsource：已删 2 处与行为用例重叠的字面串断言、把 1 处字面串改为行为断言（spawn 炸弹）；残留为与行为用例配对的 AST/结构断言（如"还原在 finally 内""先 _load_heavy 后 import dxcam"），见修复记录 §7.1｜tests/test_item100_fixes.py + tests/test_item96_sock_timeout.py + tests/test_item131_hardening.py（本次改动的三处）
 T-18｜pytest/unittest 两套 runner 无交叉：新增守卫用例扫描模块顶层 test_* 函数并显式失败；CI 单测统一走 run_tests.bat｜tests/test_bugfix_20260924_round7.py
 T-19｜3 个 MSG_FRAME 用例依赖真实屏幕采集：host._capture_loop 加 capture_factory 注入缝，Hub 注入伪屏幕｜tests/test_multiview_integration.py

@@ -3,6 +3,8 @@
 
 覆盖（每条对应审查报告里的编号）：
 1) dxgi 采集帧是 RGB 却按 BGR 用 → 显式要求 output_color="BGR"（screen.py）
+   —— T-17（2026-09-24）：用例走**实参断言**（见 test_requests_bgr_output），
+   不再用 inspect.getsource 锁源码字面串
 2) 握手阶段无超时 → handle_client 在 server_handshake 前把超时收紧（host.py）
 3) 非数字 fps/质量/缩放等配置 → 采集/编码/性能线程不再被 TypeError 打死（host.py）
 4) ViewerApp 在频道线程启动之后才建 _mainloop_ready → "等界面就绪"防护失效（viewer.py）
@@ -80,11 +82,6 @@ class TestDxgiColorOrder(unittest.TestCase):
         self.assertEqual(calls, [{"output_idx": 1, "output_color": "BGR"},
                                  {"output_idx": 1}])
         self.assertTrue(cap.working)
-
-    def test_source_passes_output_color(self):
-        src = inspect.getsource(screen.CaptureManager._open)
-        self.assertIn('output_color="BGR"', src)
-
 
 # ------------------------------------------------------------ 2) 握手超时
 

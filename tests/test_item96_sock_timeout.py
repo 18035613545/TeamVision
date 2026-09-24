@@ -13,7 +13,7 @@
 - sendall 抛错时 finally 仍还原（不会把 5.0 泄漏给后续发送方）
 - 保存→设 5.0→sendall→还原 整段都在 _tx 写锁内（与其它发送方串行）
 - 负向对照：旧逻辑（无还原）发送后把 socket 永久停在 5.0
-- 真实源码结构：_send_msg 含 gettimeout + finally 还原 + 临时 settimeout(5.0)
+- AST 结构：还原 settimeout 调用位于 try/finally 的 finalbody 内
 """
 import ast
 import inspect
@@ -178,13 +178,11 @@ class TestOldLogicBrokeInvariant(unittest.TestCase):
 
 
 class TestRealSourceRestores(unittest.TestCase):
-    def test_send_msg_has_gettimeout_and_finally_restore(self):
-        """真实源码结构：_send_msg 含 gettimeout 保存 + finally 还原 + 临时 5.0。"""
-        src = inspect.getsource(share.ScreenShareSession._send_msg)
-        self.assertIn("gettimeout", src, "未保存原超时")
-        self.assertIn("finally", src, "还原不在 finally（sendall 抛错会泄漏 5.0）")
-        self.assertIn("settimeout(5.0)", src, "未临时收紧到 5.0")
-
+    # T-17（2026-09-24）：原先还有一条 `assertIn("gettimeout"/"finally"/"settimeout(5.0)", 源码)`
+    # 的**字面串**用例——它锁的是文本而不是行为，且本文件上方的 _FakeSock 行为用例
+    # （还原到进入前的值、sendall 期间确为 5.0、失败仍还原、锁内顺序）已完整覆盖同一
+    # 不变量，故删除字面串半、保留下面的 AST 结构例（证明"还原在 finally 内"这一**结构**
+    # 事实，行为用例无法区分"finally 还原"与"try 末尾还原"）。
     def test_restore_is_inside_finally(self):
         """AST 断言：还原 settimeout 调用位于 try/finally 的 finalbody 内。"""
         src = textwrap.dedent(

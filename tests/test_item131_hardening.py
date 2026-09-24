@@ -225,11 +225,15 @@ class TestNoTasklistSubprocess(unittest.TestCase):
         popen.assert_not_called()
 
     def test_iter_process_names_does_not_shell_out(self):
-        # 真正的约束是「不拉起子进程」；方法注释里提到 tasklist 是为了记录这次改动
-        import inspect
-        src = inspect.getsource(host.FrpManager._iter_process_names)
-        self.assertNotIn("subprocess", src)
-        self.assertNotIn("Popen", src)
+        # T-17（2026-09-24）：旧写法是 `assertNotIn("subprocess", 源码)`——锁文本而非行为，
+        # 改名/换注释即失效，且注释里本来就写着 tasklist（被"锁"住反而阻碍说明）。
+        # 改为行为断言：把 spawn 入口打成炸弹，调用期间必须**一次都不被触发**。
+        import subprocess
+        def _boom(*a, **k):
+            raise AssertionError("枚举进程时拉起了子进程（反作弊视角的可疑行为）")
+        with mock.patch.object(subprocess, "Popen", _boom),                 mock.patch.object(subprocess, "run", _boom),                 mock.patch.object(subprocess, "check_output", _boom),                 mock.patch.object(os, "system", _boom),                 mock.patch.object(os, "popen", _boom):
+            names = host.FrpManager._iter_process_names()
+        self.assertIsInstance(names, list)
 
     @unittest.skipUnless(sys.platform == "win32", "Toolhelp32 仅 Windows 可用")
     def test_iter_process_names_finds_self(self):
