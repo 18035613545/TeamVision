@@ -21,6 +21,13 @@ config.json
 accounts.json
 frpc.exe
 
+# dist-020（2026-09-24）：save_config 的原子写临时文件 config.json.<pid>.<tid>.tmp
+# （common.py:1436）与损坏留存 config.json.corrupt-<ts>（common.py:1308）都可能含明文
+# frp token / 口令哈希；上面的 config.json 模式匹配不到这些带后缀的变体，git add -A
+# 会把它们提交进仓库（installer.iss 本身就清理 config.json.corrupt-*，说明这类文件确实落盘）。
+# config.json.* 覆盖全部后缀副本，且不匹配 config.example.json 这类需要跟踪的模板文件。
+config.json.*
+
 # ---- 代码签名证书（自签 pfx 含私钥，禁止入库）----
 certs/
 

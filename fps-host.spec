@@ -31,6 +31,19 @@ a = Analysis(
     optimize=0,
 )
 
+# dist-025（2026-09-24）：dxcam/comtypes 是纯 Python 包，PyInstaller 会把它们编进 exe 内嵌的
+# PYZ（实测 dist\fps-host\_internal 下没有任何 dxcam/comtypes 文件），所以
+# build_installer.bat 里那种 if exist 产物守卫查不到它们。干净克隆/CI（vendor\ 被 .gitignore，需按
+# docs/install.md §6.2/§6.3 离线装入）缺 dxcam 时 PyInstaller 只记一条 hidden import 警告继续
+# 出包，host 运行期静默退回 mss → 独占全屏黑屏，而安装包照报“已生成”。这里直接在分析结果
+# 上做硬校验（口径与 build_installer.bat 的产物守卫一致：缺即失败并给出中文原因）。
+_missing = [m for m in ('dxcam', 'comtypes') if not any(p[0] == m for p in a.pure)]
+if _missing:
+    raise SystemExit(
+        "[错误] 产物分析缺 %s：共享端 DXGI 采集后端不可用（运行期会静默退回 mss，独占全屏"
+        "黑屏）。请按 docs/install.md §6.2/§6.3 把 dxcam/comtypes 离线装入 vendor 目录后重跑"
+        " build_exe.bat。" % "/".join(_missing))
+
 # 阶段 B1（优化方案 2026-09-17）：剔除明确用不到的大二进制（单端省约 39MB，实测已验证）。
 # - cv2\opencv_videoio_ffmpeg*.dll（~31MB）：视频编解码走 PyAV，图像路径只用
 #   imencode/imdecode/resize/cvtColor，从不创建 VideoCapture/VideoWriter；OpenCV 对该

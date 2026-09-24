@@ -1,6 +1,12 @@
 # E1（实现方案 §11.1）：默认回归进 CI。约定维持 run_tests.bat 的只匹配 test*.py
 # （e2e_*/soak_*/stress_* 不进 CI）。依赖显示环境的用例（Tk 根窗口）自带 SkipTest
 # 兜底，headless 上跳过、本机全量仍会跑。
+# dist-022（2026-09-24）：单测步骤改为直接调用 run_tests.bat——命令口径只有这一处，不再内联
+# 复制（此前两处可各自漂移）。CI 上没有 conda/fps-screen 环境，用 TV_CI_NO_CONDA=1 让脚本
+# 退回 setup-python 的 python；本机不定义该变量，run_tests.bat 行为不变。
+# ruff/mypy 钉到本机实测版本（fps-screen 环境 ruff 0.16.8、base 环境 mypy 1.17.1）；mypy 配置
+# 在 pyproject.toml，E2 起配有但从未执行（G25），故新增执行步骤——随本批修复（common.py
+# 的 I001/B904/_msvcrt 赋值三处）后两道门在本机均为绿。
 name: tests
 
 on:
@@ -22,7 +28,14 @@ jobs:
         run: pip install -r requirements.txt
       - name: Lint (E2 阶段范围：核心三文件)
         run: |
-          pip install ruff
+          pip install ruff==0.16.8
           ruff check common.py codec.py screen.py
-      - name: Unit tests
-        run: python -m unittest discover -s tests -p "test*.py" -v
+      - name: Type check (mypy：common.py，配置见 pyproject.toml)
+        run: |
+          pip install mypy==1.17.1
+          python -m mypy
+      - name: Unit tests (run_tests.bat，口径单一来源)
+        shell: cmd
+        env:
+          TV_CI_NO_CONDA: "1"
+        run: cmd /c run_tests.bat

@@ -91,13 +91,13 @@ echo.
 rem ===== [5/5] Authenticode 签名（降低杀软/FPS 反作弊对未签名 PE 的误报）=====
 rem 不传 -Files：用 sign_exe.ps1 里的默认列表（正是刚打好的两个 exe）。
 rem 经 cmd 传 "-Files a,b" 会被当成单个字符串绑定到 [string[]]，参数绑定不可靠。
+rem dist-016（2026-09-24）：sign_exe.ps1 失败即 exit 1（dist-012 的收口），但调用方此前只
+rem echo [警告] 后继续走到 exit /b 0——未签名 exe 会以"构建成功"出门。这里与其它守卫同构，
+rem 非零返回码直接升级为失败退出。
 echo [5/5] 对两个 exe 做代码签名 ...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1"
-if errorlevel 1 (
-    echo [警告] 签名失败或部分失败，产物仍可用，但未签名 exe 更容易被误报。
-) else (
-    echo 代码签名完成。
-)
+if errorlevel 1 goto :failed
+echo 代码签名完成。
 echo.
 
 echo ============================================

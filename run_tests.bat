@@ -23,20 +23,23 @@ echo.
 
 rem ===== [1/2] 检查 conda 并激活 fps-screen 环境 =====
 echo [1/2] 检查 conda 环境...
+rem dist-022（2026-09-24）：CI（GitHub windows-latest + setup-python）没有 conda/fps-screen
+rem 环境，此前 CI 只能在 workflow 里内联复制本脚本 [2/2] 的 unittest 命令，两处口径会各自漂移。
+rem 现在 CI 直接调用本脚本并显式定义 TV_CI_NO_CONDA=1，conda 不可用时退回 setup-python 的
+rem python 跑同一条命令；该变量不复用 CI，避免本机为免 pause 设 CI=1 时绕开下面的环境守卫。
 where conda >nul 2>nul
-if errorlevel 1 (
-    echo.
-    echo [错误] 未检测到 conda，请先安装 Anaconda 或 Miniconda 并加入 PATH。
-    echo.
-    if not defined CI if not defined NOPAUSE pause
-    exit /b 1
-)
+if errorlevel 1 goto :conda_missing
 echo 检测到 conda，正在激活环境 fps-screen ...
 call conda activate fps-screen
-if errorlevel 1 goto :failed
+if errorlevel 1 goto :activate_failed
 rem 与 build_exe.bat 同源：activate 可能「返回 0 却没真正切换」，二次确认 CONDA_DEFAULT_ENV，
 rem 避免在 base/系统环境里跑测试（缺 cv2/av/numpy/PIL 会 ModuleNotFoundError）。
 if /i not "%CONDA_DEFAULT_ENV%"=="fps-screen" (
+    if defined TV_CI_NO_CONDA (
+        echo [警告] conda 环境未切到 fps-screen（TV_CI_NO_CONDA=1）：CI 上用当前 python 直接运行。
+        echo.
+        goto :run_tests
+    )
     echo [错误] conda 环境未切到 fps-screen，当前 CONDA_DEFAULT_ENV=%CONDA_DEFAULT_ENV%。
     echo        请先执行：conda init cmd.exe ，重开终端后重试。
     goto :failed
@@ -44,6 +47,7 @@ if /i not "%CONDA_DEFAULT_ENV%"=="fps-screen" (
 echo 环境 fps-screen 激活成功。
 echo.
 
+:run_tests
 rem ===== [2/2] 运行测试 =====
 echo [2/2] 运行 tests 下全部单元测试 ...
 echo.
@@ -59,6 +63,24 @@ if "%RC%"=="0" (
 echo ============================================
 if not defined CI if not defined NOPAUSE pause
 exit /b %RC%
+
+:conda_missing
+if defined TV_CI_NO_CONDA (
+    echo [警告] 未检测到 conda（TV_CI_NO_CONDA=1）：CI 上用当前 python 直接运行同一套测试命令。
+    echo.
+    goto :run_tests
+)
+echo.
+echo [错误] 未检测到 conda，请先安装 Anaconda 或 Miniconda 并加入 PATH。
+echo.
+if not defined CI if not defined NOPAUSE pause
+exit /b 1
+
+:activate_failed
+if not defined TV_CI_NO_CONDA goto :failed
+echo [警告] conda 激活 fps-screen 失败（TV_CI_NO_CONDA=1）：CI 上用当前 python 直接运行同一套测试命令。
+echo.
+goto :run_tests
 
 :failed
 echo.

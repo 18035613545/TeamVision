@@ -58,5 +58,19 @@ Type: files; Name: "{app}\accounts.json.corrupt-*"
 Type: files; Name: "{app}\config.json"
 Type: files; Name: "{app}\config.json.corrupt-*"
 Type: filesandordirs; Name: "{app}\logs"
+; dist-021（2026-09-24）：onedir 下两端的数据实际会落在 {app}\fps-host\、{app}\fps-viewer\
+; （common.data_dir() 在用户目录不可写时回退 exe_dir，且 _migrate_from_exe_dir 复制不删源），
+; 原清单只清 {app}\ 根，老用户升级/回退场景的凭据残渣会留在安装目录。下面按同一口径补两端
+; 的子目录，仍只删数据文件/目录（config.json / accounts.json / logs），不碰 exe 与 _internal。
+Type: files; Name: "{app}\fps-host\accounts.json"
+Type: files; Name: "{app}\fps-host\accounts.json.corrupt-*"
+Type: files; Name: "{app}\fps-host\config.json"
+Type: files; Name: "{app}\fps-host\config.json.corrupt-*"
+Type: filesandordirs; Name: "{app}\fps-host\logs"
+Type: files; Name: "{app}\fps-viewer\accounts.json"
+Type: files; Name: "{app}\fps-viewer\accounts.json.corrupt-*"
+Type: files; Name: "{app}\fps-viewer\config.json"
+Type: files; Name: "{app}\fps-viewer\config.json.corrupt-*"
+Type: filesandordirs; Name: "{app}\fps-viewer\logs"
 ; 第 13 条：安装目录不可写时 logger 回退到 %LOCALAPPDATA%\TeamVision\logs，一并清理。
 Type: filesandordirs; Name: "{localappdata}\TeamVision"

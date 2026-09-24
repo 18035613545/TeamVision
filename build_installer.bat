@@ -98,10 +98,41 @@ if not defined ISCC (
     exit /b 1
 )
 echo 检测到 ISCC：%ISCC%
+rem dist-024（2026-09-24）：installer.iss 的 ArchitecturesInstallIn64BitMode=x64compatible 由
+rem Inno Setup 6.3 引入；6.0–6.2 的 ISCC 不识别该值、直接报错退出，而 :failed 只回一句
+rem "安装包编译失败"，看不出根因。ISCC.exe 自身没有版本资源（本机实测 VersionInfo 全 0.0.0.0），
+rem 版本只能从卸载注册表项的 DisplayVersion 读（本机实测 6.7.3）：先机器级（含 32 位视图），
+rem 再用户级安装（第 101 条那种 %LOCALAPPDATA%\Programs 装法）。
+set "ISCC_VER="
+for /f "tokens=2,*" %%A in ('reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1" /v DisplayVersion 2^>nul ^| findstr /i "DisplayVersion"') do set "ISCC_VER=%%B"
+if not defined ISCC_VER for /f "tokens=2,*" %%A in ('reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1" /v DisplayVersion 2^>nul ^| findstr /i "DisplayVersion"') do set "ISCC_VER=%%B"
+if not defined ISCC_VER for /f "tokens=2,*" %%A in ('reg query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1" /v DisplayVersion 2^>nul ^| findstr /i "DisplayVersion"') do set "ISCC_VER=%%B"
+rem 版本形如 "6.7.3"；只取前两段数字，非数字/畸形值按"未能确定"处理（只对确定 <6.3 的硬失败）。
+set "ISCC_MAJOR=0"
+set "ISCC_MINOR=0"
+if defined ISCC_VER for /f "tokens=1,2 delims=." %%A in ("%ISCC_VER%") do (
+    set "ISCC_MAJOR=%%A"
+    if not "%%B"=="" set "ISCC_MINOR=%%B"
+)
+echo(%ISCC_MAJOR%%ISCC_MINOR%|findstr /r "^[0-9][0-9]*$" >nul || set "ISCC_VER="
+if not defined ISCC_VER echo [警告] 未能从注册表确定 Inno Setup 版本；若下方编译报 "Unknown directive: ArchitecturesInstallIn64BitMode"，即为 6.3 以下，请升级后重试。
+if defined ISCC_VER if %ISCC_MAJOR% LSS 6 goto :iscc_too_old
+if defined ISCC_VER if %ISCC_MAJOR% EQU 6 if %ISCC_MINOR% LSS 3 goto :iscc_too_old
+if defined ISCC_VER echo 检测到 Inno Setup 版本 %ISCC_VER%（installer.iss 要求 6.3+）。
 echo.
 
 rem ===== [3/4] 编译安装包 =====
 echo [3/4] 编译安装包 installer.iss ...
+rem dist-025（2026-09-24）：dist\ 会累积历史版本的安装包（本机实测存有 1.3.0 与 1.4.0），
+rem 而 sign_exe.ps1 的默认清单是通配 dist\TeamVision-Setup-*.exe，手工上传也常按目录全选——
+rem 陈旧包会被一并签名/误发。编译前删掉"非当前版本"的旧包：当前版本这一份保留，即使本次
+rem 编译失败也不会提前删掉上一份可用产物（比"先清空 dist\ 全部安装包"风险更小）。
+for %%F in ("dist\TeamVision-Setup-*.exe") do (
+    if /i not "%%~nxF"=="%SETUP_BASE%.exe" if exist "%%~F" (
+        echo 清理陈旧安装包：%%~nxF
+        del /q "%%~F"
+    )
+)
 "%ISCC%" installer.iss
 if errorlevel 1 goto :failed
 echo.
@@ -139,15 +170,18 @@ if %SETUP_SIZE% LSS %SETUP_LO% (
 if %SETUP_SIZE% GTR %SETUP_HI% (
     echo [警告] 安装包体积 %SETUP_SIZE% 字节高于目标带上限 %SETUP_HI% 字节（111MiB 基线 +10 个百分点）。
 )
-if exist "%SETUP_EXE%" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1" ^
-        -Files "%SETUP_EXE%"
-    if errorlevel 1 (
-        echo [警告] 安装包签名失败，产物仍可用。
-    )
-) else (
-    echo [警告] 未找到 %SETUP_EXE%，跳过签名。
+rem dist-023（2026-09-24）：原 if exist "%SETUP_EXE%" 的 else 是永不执行的死代码（上面
+rem 的产物守卫已对缺失 exit /b 1），去掉恒真判断与"未找到…跳过签名"假分支，直接进入签名。
+rem dist-016（2026-09-24）：签名失败不再降格为 [警告]——sign_exe.ps1 失败即 exit 1，
+rem 调用方必须升级为失败退出；未签名安装包不得带着 exit 0 出门（与本文件其它守卫同款）。
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign_exe.ps1" ^
+    -Files "%SETUP_EXE%"
+if errorlevel 1 (
+    echo [错误] 安装包签名失败（sign_exe.ps1 返回非零）——未签名产物不得作为成功构建出门。
+    if not defined CI if not defined NOPAUSE pause
+    exit /b 1
 )
+echo 安装包签名完成。
 echo.
 echo ============================================
 if "%HAS_FRPC%"=="1" (
@@ -165,5 +199,13 @@ exit /b 0
 :failed
 echo.
 echo [错误] 安装包编译失败，请检查上方日志后重试。
+if not defined CI if not defined NOPAUSE pause
+exit /b 1
+
+:iscc_too_old
+echo.
+echo [错误] 检测到 Inno Setup 版本 %ISCC_VER%，低于 installer.iss 要求的 6.3。
+echo        ArchitecturesInstallIn64BitMode=x64compatible 由 Inno 6.3 引入，6.0–6.2 的 ISCC 只会报未知指令。
+echo        请升级 Inno Setup 后重试：https://jrsoftware.org/isdl.php
 if not defined CI if not defined NOPAUSE pause
 exit /b 1
