@@ -3,6 +3,16 @@ __pycache__/
 *.py[cod]
 .conda-pkgs/
 
+# ---- 工具缓存（2026-10-09 推送前隐私审计补）----
+# mypy/pytest/ruff 各自会在缓存目录内生成 .gitignore（内容为 *）从而自忽略，
+# 但那属于工具的附带行为、不是本仓库的显式约定：删掉重建前的空目录、
+# 或换用不生成该文件的工具版本，缓存就会变成待提交文件被 git add -A 卷进去。
+# 其中 .mypy_cache 的 *.json 记录**绝对路径**，若哪天在含用户名的目录下跑过
+# （如 C:\Users\<用户名>\...），就会随提交泄露到公开仓库。
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
 # ---- IDE / 编辑器 ----
 .trae/
 .idea/
