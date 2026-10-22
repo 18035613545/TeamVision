@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 import common
-from common import Act, MSG_CTRL, MSG_FRAME, MSG_VIDEO, message_pump
+from common import MSG_CTRL, MSG_FRAME, MSG_VIDEO, Act, message_pump
 
 _ACTIONS = {"auth_result", "req_keyframe", "watch_reject", "watch", "unshare",
             "register", "login", "probe", "ping", "pong", "peers", "cap",
@@ -25,7 +25,7 @@ def _scan(path):
     for node in ast.walk(tree):
         # 规则 1：{"action": <必须 Act.X>}
         if isinstance(node, ast.Dict):
-            for k, v in zip(node.keys, node.values):
+            for k, v in zip(node.keys, node.values, strict=True):
                 if isinstance(k, ast.Constant) and k.value == "action":
                     # 只禁"裸协议字面量"；`{"action": action}` 这类运行期变量的
                     # 取值源头（登录框返回值）由规则 2 + 替换点保证已是 Act.X
@@ -90,13 +90,14 @@ class TestActionSinglePoint(unittest.TestCase):
         self.assertEqual(Act.REG_PROOF, "reg_proof")
 
     def test_protocol_version_is_single_carrier(self):
-        # C2：PROTOCOL_VERSION 是唯一的版本载体；2.3 = proof 绑定用户名（auth-002）
+        # C2：PROTOCOL_VERSION 是唯一的版本载体；2.3 = proof 绑定用户名（auth-002），
+        # 2.4 = 视频帧带单调递增帧序号（net-045）
         self.assertEqual(Act.__dict__.get("AUTH_RESULT"), "auth_result")
-        self.assertEqual(common.PROTOCOL_VERSION, (2, 3))
+        self.assertEqual(common.PROTOCOL_VERSION, (2, 4))
         self.assertEqual(common.MAGIC_CLIENT, b"FS02")
 
 
-class _FakeSock(object):
+class _FakeSock:
     """按脚本喂 recv 块的假 socket：块序列耗尽后 EOF 或抛 OSError。"""
 
     def __init__(self, chunks, tail="eof"):

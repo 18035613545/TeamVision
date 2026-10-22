@@ -24,11 +24,17 @@ import time
 
 import cv2
 
-import logger
 import codec as codec_mod
+import logger
 from common import safe_float, safe_int
-from screen import (CaptureManager, calc_output_size, downsample_frame, encode_bgr,
-                    motion_changed, still_gate_update)
+from screen import (
+    CaptureManager,
+    calc_output_size,
+    downsample_frame,
+    encode_bgr,
+    motion_changed,
+    still_gate_update,
+)
 
 log = logger.get_logger()
 
@@ -76,6 +82,26 @@ class FrameEncoder:
         self._enc_fps = 0
         self._retry_at = 0.0
         self._backoff = 1.0
+        # 第 11 轮：分辨率档位（显示分辨率/采集区域的几何在运行中变化时，target_width
+        # 会随地调整）。与 set_fps 同一种保护——成败都按返回值落账，失败落负缓存退避，
+        # 换实例复位。几何变化是偶发的，但一次 1080p↔4K 切换就会让每帧都付一次
+        # 完整编码器重建（硬件编码器拆装 93–110ms），不设节流等于开一个瞬间的 CPU 尖峰。
+        self._enc_w = 0
+        self._enc_h = 0
+        self._size_retry_at = 0.0
+        self._size_backoff = 1.0
+        self._size_retry_enc_id = None
+        # R8-capture-01（2026-10-10）：`set_fps` 失败的重试节流，与构造退避彻底分开。
+        # 两者语义不同：`_retry_at`/`_backoff` 管的是"没有可用编码器 → 重建一个"，
+        # 共用会让一次 set_fps 失败顺带推迟一次真正需要的重建（该状态下 available
+        # 恒 True，永不回退 JPEG，链路会被永久钉在 JPEG 上）。
+        # 成因：codec-012 有意在 set_fps 失败时回滚 `_fps` 让下一帧仍重试这一档
+        # （codec.py:334-337，那个决定是对的），缺的是**重试频率**约束——旧实现
+        # 下一帧条件 `fps != self._enc_fps` 仍成立，于是每帧一次完整 `_create_ctx_with`
+        # 重建（源码自述硬件编码器拆装 93–110ms，而 30fps 每帧预算只有 33ms）。
+        self._fps_retry_at = 0.0
+        self._fps_backoff = 1.0
+        self._fps_retry_enc_id = None   # 上次落账的编码器身份（换实例即复位退避）
 
     # ---------- 只读状态 ----------
 
@@ -91,6 +117,11 @@ class FrameEncoder:
     def backoff(self):
         """当前编码器构造退避秒数（测试与诊断用）。"""
         return self._backoff
+
+    @property
+    def fps_backoff(self):
+        """当前"帧率档切换失败"退避秒数（诊断用；与 `backoff` 互不影响）。"""
+        return self._fps_backoff
 
     def _tag(self):
         return ("频道[%s] 共享" % self._name) if self._name else ""
@@ -109,13 +140,59 @@ class FrameEncoder:
         """确保有可用的视频编码器；不可用（含退避期）时静默返回，由调用方走 JPEG。"""
         if self._encoder is not None and not self._encoder.available:
             self._drop_encoder()   # 编码器失效（如 GPU 驱动错误）：下次重建/回退
+        if id(self._encoder) != self._fps_retry_enc_id:
+            # R8-capture-01：换过实例（刚重建出来，或旧实例已 drop）——旧实例改不掉
+            # 帧率不能推出新实例也改不掉，退避必须复位，否则一次失败会连累重建后的
+            # 新编码器，把"可重试"退化成"整段退避窗口内都不试"。
+            self._fps_retry_enc_id = id(self._encoder)
+            self._fps_retry_at = 0.0
+            self._fps_backoff = 1.0
+        if id(self._encoder) != self._size_retry_enc_id:
+            self._size_retry_enc_id = id(self._encoder)
+            self._size_retry_at = 0.0
+            self._size_backoff = 1.0
+            if self._encoder is None:
+                # 尺寸记录只在"换了实例"时作废：新实例的尺寸要到构造路径
+                # （或下一次 set_size 成功）才重新落账。旧实现保留失败实例的尺寸，
+                # 下一帧的 encode() 会按旧尺寸再缩/丢帧——与新实例实际按新尺寸建
+                # 出来的上下文对不上
+                self._enc_w, self._enc_h = 0, 0
         if self._encoder is not None:
+            if (w, h) != (self._enc_w, self._enc_h) and (self._enc_w, self._enc_h) != (0, 0):
+                # 第 11 轮：几何/缩放变化 → 重建到新尺寸。旧实现只在首次构造时按尺寸建，
+                # 之后的尺寸变化只被底层"锁内重建"兜住——每帧同步拆装一次硬件编码器
+                # （93–110ms，实测一帧预算 33ms），且失败后不回滚、画幅与码流尺寸对不上。
+                # 这里按返回值落账、失败退避，与 set_fps 同一套契约。
+                now = time.monotonic()
+                if now >= self._size_retry_at:
+                    try:
+                        ok = self._encoder.set_size(w, h)
+                    except Exception as e:
+                        log.debug("%s分辨率档切换异常: %s", self._tag(), e)
+                        ok = False
+                    if ok:
+                        self._enc_w, self._enc_h = w, h
+                        self._size_retry_at = 0.0
+                        self._size_backoff = 1.0
+                    else:
+                        self._size_retry_at = now + self._size_backoff
+                        self._size_backoff = min(30.0, self._size_backoff * 2)
             if fps is not None and fps != self._enc_fps:
                 # codec-012（2026-09-20）：旧实现无条件 `self._enc_fps = fps`，而
                 # set_fps 构造失败时会回滚自己的 _fps —— 两侧于是各存一份"已生效"的
                 # 假账，这一档再也不被重试。改为按返回值落账。
-                if self._encoder.set_fps(fps):
-                    self._enc_fps = fps   # 帧率档变化重建
+                # R8-capture-01（2026-10-10）：失败要落负缓存退避（1→2→4→…→30s 封顶），
+                # 否则下一帧条件依旧成立、每帧重试一次完整上下文重建；窗口到期后仍会
+                # 重试这一档（不退化）——间隔由 `_fps_retry_at` 单独记录。
+                now = time.monotonic()
+                if now >= self._fps_retry_at:
+                    if self._encoder.set_fps(fps):
+                        self._enc_fps = fps   # 帧率档变化重建（已生效才落账）
+                        self._fps_retry_at = 0.0
+                        self._fps_backoff = 1.0
+                    else:
+                        self._fps_retry_at = now + self._fps_backoff
+                        self._fps_backoff = min(30.0, self._fps_backoff * 2)
             # codec-006（2026-09-18）：码率参数不能静默忽略——旧实现把 bitrate 记进
             # self._bitrate 就完事，已存在的编码器只在"下次重建"时才采用，调用方
             # （配置热更等）以为已生效。带 ±15% 迟滞，重复同值调用只做一次比较。
@@ -144,7 +221,13 @@ class FrameEncoder:
             return
         self._encoder = enc
         self._enc_fps = fps or self._fps
+        self._enc_w, self._enc_h = w, h
         self._backoff = 1.0
+        # 新实例：帧率档切换的退避作废（上面的身份比对也会在下一帧复位，这里显式
+        # 落定，避免"构造成功但下一帧才复位"的中间态）。
+        self._fps_retry_enc_id = id(enc)
+        self._fps_retry_at = 0.0
+        self._fps_backoff = 1.0
         if self._on_build is not None:
             try:
                 self._on_build(enc, w, h, bitrate)
@@ -171,6 +254,16 @@ class FrameEncoder:
             if (w, h) != (bgr.shape[1], bgr.shape[0]):
                 frame = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
             if self._encoder is not None:
+                # 第 11 轮：帧按**编码器实际尺寸**送出。set_size 失败（退避中）时编码器
+                # 仍按旧尺寸出包，本帧要么按旧尺寸再缩一次（画质无损、画幅一致），
+                # 要么丢弃——绝不能把新尺寸的帧喂给旧上下文（PyAV 会静默缩放回去，
+                # 或直接抛错后被当成编码失败计数）。
+                ew, eh = self._enc_w, self._enc_h
+                if (ew, eh) not in ((0, 0), (w, h)):
+                    if frame.shape[0] < eh or frame.shape[1] < ew:
+                        return None       # 上采样没有信息可补，丢弃到下一档重试
+                    frame = cv2.resize(frame, (ew, eh), interpolation=cv2.INTER_AREA)
+                    w, h = ew, eh
                 res = self._encoder.encode(frame, raw_ts=ts_us, force_key=force_key)
                 if res is None:
                     return None

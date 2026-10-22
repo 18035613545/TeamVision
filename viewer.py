@@ -11,6 +11,7 @@ import argparse
 import base64
 import ctypes
 import ctypes.wintypes
+import html as html_mod
 import json
 import math
 import os
@@ -21,12 +22,12 @@ import struct
 import sys
 import threading
 import time
+import tkinter as tk
 from collections import deque
+from tkinter import messagebox, ttk
 
 import win32con
 import win32gui
-import tkinter as tk
-from tkinter import ttk, messagebox
 
 # A3（第 133 条）：重依赖改为 main() 里极简 splash 上屏后由 _load_heavy() 加载。
 # onedir 冷启动时 cv2.pyd（~86MB）是导入大头；win32*/tkinter 是 Tk 系最轻的
@@ -47,54 +48,62 @@ def _load_heavy():
         return
     import cv2 as _cv2
     import numpy as _np
-    from PIL import Image as _Image, ImageTk as _ImageTk
-    import share as _share
+    from PIL import Image as _Image
+    from PIL import ImageTk as _ImageTk
+
     import codec as _codec
+    import share as _share
     cv2, np, Image, ImageTk = _cv2, _np, _Image, _ImageTk
     share_mod, codec_mod = _share, _codec
 
+import diag
 import logger
 import splash
-import diag
 import ui_common
 import update_check
 from common import (
+    APP_COPYRIGHT,
     APP_NAME,
     APP_VERSION,
-    APP_COPYRIGHT,
-    load_config,
-    save_config,
-    client_handshake,
-    send_msg,
-    recv_msg,
-    parse_addr,
-    exe_dir,
-    app_dirs,
-    data_dir,
-    enable_dpi_awareness,
-    tune_socket,
-    parse_message,
-    message_pump,
-    parse_video,
-    MSG_FRAME,
-    MSG_VIDEO,
-    VIDEO_FLAG_KEY,
     CODEC_H264,
     CODEC_HEVC,
-    # C1（优化方案 2026-09-17）：原 _cfg_int/_cfg_float 私有副本并入 common。
-    safe_float,
-    safe_int,
-    # C2（实现方案 §7）：action 常量表单点来源
-    Act,
-    # C2 §7 第 3 步：认证期 CTRL 随带协议版本
-    PROTOCOL_VERSION,
+    KDF_SALT_HEX_LEN,
+    MSG_FRAME,
+    MSG_VIDEO,
     # D1（实现方案 §10）：挑战-应答认证公共件（口令不再过网）
-    PBKDF2_ITERATIONS, derive_dk, challenge_mac, b64e, b64d,
-    # auth-002（2026-09-18）：挑战参数校验（salt 形态/长度）
-    _is_hex_str, KDF_SALT_HEX_LEN,
+    PBKDF2_ITERATIONS,
     # auth-002/auth-003（2026-09-18，协议 v2.3）：proof 绑定用户名；仅与支持该版本的
     # 共享端走挑战-应答（旧版明确拒绝，不再降级明文口令）
     PROTO_CHAL_MIN_MINOR,
+    # C2 §7 第 3 步：认证期 CTRL 随带协议版本
+    PROTOCOL_VERSION,
+    VIDEO_FLAG_KEY,
+    # net-045（2026-10-09）：视频帧载荷带单调递增序号的协议次版本门槛（v2.4）
+    VIDEO_SEQ_MINOR,
+    # C2（实现方案 §7）：action 常量表单点来源
+    Act,
+    # auth-002（2026-09-18）：挑战参数校验（salt 形态/长度）
+    _is_hex_str,
+    app_dirs,
+    b64d,
+    b64e,
+    challenge_mac,
+    client_handshake,
+    data_dir,
+    derive_dk,
+    enable_dpi_awareness,
+    exe_dir,
+    load_config,
+    message_pump,
+    parse_addr,
+    parse_video_auto,
+    recv_msg,
+    # C1（优化方案 2026-09-17）：原 _cfg_int/_cfg_float 私有副本并入 common。
+    safe_float,
+    safe_int,
+    save_config,
+    send_msg,
+    tune_socket,
 )
 
 #: 模块级日志（logger.setup_logger(cfg) 幂等初始化后生效）
@@ -103,6 +112,11 @@ log = logger.get_logger()
 #: T-16（2026-09-24）：延迟样本环上限。测试必须引用本常量而不是自造 900——
 #: 旧用例自己建 deque(maxlen=900)，把生产值改成 90000 仍会绿（假绿）。
 _LATENCY_RING_MAX = 900
+
+#: R8-UI-02（2026-10-10）：视频帧序号缺口的告警阈值。取 8 ≈ 一个 GOP 量级
+#: （默认 GOP 30 帧，但 8 帧的丢包已足够让参考链明显断裂），低于它对网络抖动
+#: 告警没有意义，高于它则用户已经在花屏了才留痕。
+_GAP_WARN_THRESHOLD = 8
 
 #: 品牌标题（面板标题/悬浮窗占位文字共用）
 APP_TITLE = "%s v%s" % (APP_NAME, APP_VERSION)
@@ -156,8 +170,16 @@ HOTKEY_NAMES = {
 
 #: 控制台面板深色主题配色（第 136 条 C3：色板单一来源在 ui_common，此处仅重导出）
 from ui_common import (  # noqa: E402
-    COL_BG, COL_CARD, COL_CTRL, COL_FG, COL_DIM, COL_ACCENT,
-    COL_ONLINE, COL_CONNECTING, COL_OFFLINE, COL_ACTIVE_ROW,
+    COL_ACCENT,
+    COL_ACTIVE_ROW,
+    COL_BG,
+    COL_CARD,
+    COL_CONNECTING,
+    COL_CTRL,
+    COL_DIM,
+    COL_FG,
+    COL_OFFLINE,
+    COL_ONLINE,
 )
 
 #: 频道状态 -> 中文文本 / 状态色
@@ -173,6 +195,46 @@ STATUS_COLOR = {
     "disconnected": COL_OFFLINE,
     "auth": COL_ACCENT,
 }
+#: 悬浮窗布局预设（第 9 轮）：(展示名, 目标宽度, 透明度)。宽度还会被屏幕余量夹紧
+#: （见 fit_display_width），透明度不低于 ALPHA_MIN——Windows 上 alpha=0 的窗口等于
+#: "消失且点不到"，手动滑块本来就限在 30%~100%，预设不能借一键操作绕过这条线。
+#: standard 与 DEFAULT_CONFIG.viewer 的默认值同源（480 / 0.9），换"大宽屏"之后
+#: 点「标准」即可回到出厂形态，不必再去拖两个滑块。
+LAYOUT_PRESETS = {
+    "wide":     ("大宽屏", 960, 1.0),
+    "standard": ("标准",   480, 0.9),
+    "minimap":  ("小地图", 320, 0.7),
+}
+
+#: 悬浮窗显示宽度下限（第 88 条：target_width=1 曾算出宽 0，观看端同族也不允许退到 0）
+WIDTH_MIN = 160
+WIDTH_MAX = 960
+#: 透明度可调区间。下界 30% 不是审美选择：Windows 上 alpha=0 的置顶穿透窗既看不见
+#: 也点不到，用户只能靠热键盲操作；上界 1.0 不设限制。
+ALPHA_MIN = 0.30
+ALPHA_MAX = 1.00
+#: 悬浮窗贴边余量（px）：给"大宽屏"预设夹屏时从可用宽度里扣除，留出面板让位的缝
+WIDTH_MARGIN = 400
+
+
+def fit_display_width(screen_w, preferred, margin=WIDTH_MARGIN):
+    """把想要的显示宽度夹到 [WIDTH_MIN, WIDTH_MAX] 且不超过屏幕可用宽度。
+
+    screen_w 不可用（headless / 取屏失败 / 非数字）时不夹屏，只做区间夹紧；
+    preferred 不可用时退回默认 480（与 DEFAULT_CONFIG.viewer.display_width 同值）。
+    """
+    try:
+        want = int(preferred)
+    except (TypeError, ValueError):
+        want = 480
+    want = max(WIDTH_MIN, min(WIDTH_MAX, want))
+    try:
+        room = int(screen_w) - int(margin)
+    except (TypeError, ValueError):
+        return want
+    if room < WIDTH_MIN:
+        return WIDTH_MIN
+    return min(want, room)
 
 
 def _dpapi_encrypt(text):
@@ -287,6 +349,15 @@ class Channel:
         # D1（实现方案 §10）：服务端是否支持挑战-应答（None=未知，首次登录前用 probe
         # 回包里的 proto 字段判定；老服务端无该字段 → False → 走旧版直发口令路径）。
         self._chal_capable = None
+        # net-045（2026-10-09）：共享端 proto 次版本。>= VIDEO_SEQ_MINOR 时视频帧
+        # 载荷带单调递增序号；低于则按 v2.3 的 10 字节头解。随 probe 结果一并定下。
+        self._host_minor = None
+        self._expect_seq = False
+        self._last_video_seq = None
+        self._video_seq_gaps = 0
+        #: R8-UI-02（2026-10-10）：本连接的缺口告警是否已发过。一次性标志，
+        #: 换连接/切源时复位——一连接一条，避免同一因由的告警刷屏。
+        self._gap_warned = False
         # 网络/稳定性参数（从 viewer 配置读取，缺省用安全默认值）
         viewer_cfg = (owner.cfg if owner is not None else {}).get("viewer", {}) or {}
         net_cfg = viewer_cfg.get("net", {}) or {}
@@ -377,6 +448,111 @@ class Channel:
             self.last_frame = None
         self._reset_stats()   # ui-010：断线/重连即作废旧路径的帧率与延迟样本
         self._note_no_media()
+        # net-045：连接换了，序号空间重新开始，必须清基线，
+        # 否则新连接的序号会被误判成"巨大缺口"。
+        # R8-UI-02：一次性告警标志一并复位——否则新连接再也报不出缺口告警。
+        self._last_video_seq = None
+        self._video_seq_gaps = 0
+        self._gap_warned = False
+
+    def _apply_probe_proto(self, reply):
+        """从服务端回包提取 `proto`，定下 `_host_minor` / `_expect_seq` / `_chal_capable`。
+
+        net-045 引入、net-046（2026-10-10）抽成共用方法：三条回包路径都必须过它——
+        带凭据的 probe（LOGIN/REGISTER）、挑战应答、以及**准入关闭部署**走的
+        `Act.PROBE` 分支。旧实现只在前两条上赋值，准入关闭这一整类部署因此从未
+        协商过 v2.4。
+
+        `_expect_seq` 要求 `proto[1]` 是真 int 且不是 bool 才采信：`isinstance(True,
+        int)` 为 True，漏判会把 `true` 当成次版本 1 而错开 v2.4 布局。`_chal_capable`
+        则**沿用原公式**（只比大小、不查类型）——收窄它会翻转既有部署的判定，那是
+        与本条无关的行为变化。
+
+        R8-UI-01（2026-10-10）：公式不变但必须包住 TypeError。服务端回包写成
+        `[2, "4"]` / `[2, null]` 时 `proto[1] >= PROTO_CHAL_MIN_MINOR` 抛 TypeError，
+        会逃穿本方法被 `_authenticate` 的 except 记成「认证通信失败: '>=' not
+        supported between instances of 'str' and 'int'」——用户看不到登录框，每次
+        重连复现；而且该次调用是**半更新**的（`_host_minor`/`_expect_seq` 已覆盖、
+        `_chal_capable` 停在旧值），三种状态不再自洽。
+        用 try 而不是收窄条件：收窄（改成 `host_minor is not None and ...`）会把
+        JSON 里的 float 次版本（如 `4.0`）从 True 翻成 False，那是既有部署的判定
+        变化；try 只把"不可比类型"归到"能力未知"，其余判定逐字不变。
+        非可比类型（str/None/容器）一律视为能力未知 → False，既不抛异常也不误判为
+        「不支持挑战-应答」。
+
+        属性访问走 getattr：测试里大量 `Channel.__new__(Channel)` 绕过 `__init__`。
+        """
+        proto = reply.get("proto") if isinstance(reply, dict) else None
+        valid = (isinstance(proto, list | tuple) and len(proto) >= 2
+                 and proto[0] == PROTOCOL_VERSION[0])
+        host_minor = None
+        if valid and isinstance(proto[1], int) and not isinstance(proto[1], bool):
+            host_minor = proto[1]
+        self._host_minor = host_minor
+        self._expect_seq = bool(
+            host_minor is not None and host_minor >= VIDEO_SEQ_MINOR)
+        try:
+            self._chal_capable = bool(valid and proto[1] >= PROTO_CHAL_MIN_MINOR)
+        except TypeError:
+            self._chal_capable = False
+
+    def _note_video_seq(self, seq):
+        """net-045（2026-10-09）：登记收到的帧序号，统计丢帧缺口。
+
+        序号为 None 表示对端是 v2.3（无序号）或该帧经回退按旧布局解出——两种情况
+        都无法判断丢帧，直接忽略。
+
+        增量用 `(seq - last) & 0xFFFFFFFF` 算，因此 32 位回绕（4.29e9 帧，按 30fps
+        约 4 天不断流）不会误报成巨大缺口。
+
+        **本函数目前只做遥测**（R8-UI-02，2026-10-10）：累计缺口唯一的消费者是
+        "跨过一个 GOP 量级（`_GAP_WARN_THRESHOLD`）时打一条一次性 warning"，
+        序号**不参与**解码决策——net-045 声称的"把整段重置降级为丢弃到下一个
+        可解码点"尚未实现。为什么现在不做：最小可解码点的判定需要知道"这一批帧里
+        从哪一帧起参考链还完整"，而批次已经进了 `_decode_video_batch` 的逐帧循环，
+        要做就得把批次切成"可解前缀 + 待丢弃后缀"并让解码器状态与之对齐，属独立设计
+        （涉及 `_got_key`、`_resync`、`needs_keyframe` 三处门控的交互）。在那之前
+        不改解码路径，避免把网络抖动升级成整段花屏。
+
+        告警按**每条连接只报一次**落地：一旦累计缺口跨过 `_GAP_WARN_THRESHOLD` 就置位
+        一次性标志，直到换连接（`_invalidate_media`）或切源（`switch_source`）才复位。
+        为什么不用"缺口比上次告警时又多了阈值"那种可重复触发的口径：一次链路抖动
+        （一次重传风暴）能让缺口在几帧内连跨多个量级，那样会按量级刷出多条同因告警，
+        而它们对排查的价值完全相同——留第一条、带上是时的累计值就够。
+        """
+        if seq is None:
+            return
+        last = getattr(self, "_last_video_seq", None)
+        if last is not None:
+            delta = (seq - last) & 0xFFFFFFFF
+            # delta==0 是重传（同一序号又来一遍），delta 极大说明回绕/换流，都不算丢帧
+            if 1 < delta < 0x80000000:
+                self._video_seq_gaps = getattr(self, "_video_seq_gaps", 0) + delta - 1
+                self._maybe_warn_video_seq_gaps()
+        self._last_video_seq = seq
+
+    def _maybe_warn_video_seq_gaps(self):
+        """累计缺口跨过阈值时告警一次（带频道名与累计值），每条连接至多一条。
+
+        R8-UI-02（2026-10-10）：修前 `_video_seq_gaps` 全仓**零读取点**——既不进
+        日志也不进状态栏，序号信息解包后即被丢弃，丢帧/错序对上层完全不可观测。
+        这里给出最小消费者（告警是**唯一**消费点，序号仍不参与解码决策，见
+        `_note_video_seq` 的 docstring）。
+
+        阈值与标志都按"替身也能取到"的方式访问：阈值是**模块级常量**（与
+        `_LATENCY_RING_MAX` 同款，不是实例属性），标志走 `getattr(..., False)`——
+        测试里大量 `Channel.__new__(Channel)` 绕过 `__init__`，只在 `__init__` 里
+        存在的属性会让这些替身炸掉（见 `_apply_probe_proto` 的 docstring 口径）。
+        """
+        if getattr(self, "_gap_warned", False):
+            return
+        gaps = getattr(self, "_video_seq_gaps", 0)
+        if gaps < _GAP_WARN_THRESHOLD:
+            return
+        self._gap_warned = True
+        log.warning("频道[%s] 视频帧序号缺口累计 %d 帧——链路丢帧或错序，"
+                    "画面可能出现参考链断裂后的花屏/冻结",
+                    self.name, gaps)
 
     def _receiver_loop(self):
         """接收线程主循环：解析地址 → 连接 → 握手 → 实时收帧；异常时指数退避重连。
@@ -416,7 +592,7 @@ class Channel:
                         "%s · TCP 已连通但未收到服务端握手：通常是内网穿透/端口映射没有"
                         "指向共享端的监听端口（樱花 frpc 日志会写「连接映射目标 "
                         "[tcp://localhost:PORT] 失败」），也可能共享端未启动、或只监听了"
-                        "另一地址族（如 IPv4 回环而 frpc 走 ::1）" % e)
+                        "另一地址族（如 IPv4 回环而 frpc 走 ::1）" % e) from e
                 # auth-017（2026-09-20）：探测标记必须**按连接**复位。旧实现它是频道级
                 # 且只置一次，于是"上一次输错口令"之后的重连把 `_ask_credentials()`
                 # 当成该连接的**首条消息**——而 host 的首消息档只有 30 秒
@@ -562,9 +738,17 @@ class Channel:
                     # 关键帧），故视频帧收集成有序列表逐帧喂解码器。
                     if kind == MSG_VIDEO:
                         try:
-                            ts, codec, flags, nal = parse_video(payload)
+                            # net-045（2026-10-09）：按协商布局解（末位 seq）。
+                            # 用 parse_video_auto 而不是 parse_video：布局无法自描述，
+                            # 而旧版 share.py 的共享者可能经新版 host 中继过来，
+                            # auto 会按 Annex-B 起始码强度自动回退，避免把 NAL 前 4 字节
+                            # 当序号吃掉、整帧变花屏且无任何报错。
+                            ts, codec, flags, nal, seq = parse_video_auto(
+                                payload,
+                                expect_seq=getattr(self, "_expect_seq", False))
                         except ValueError:
                             return None
+                        self._note_video_seq(seq)
                         video_batch.append((ts, codec, flags, nal))
                     elif kind == MSG_FRAME:
                         if len(payload) < 8:
@@ -1009,11 +1193,8 @@ class Channel:
                     send_msg(sock, {"action": Act.PROBE, "user": "", "pass": "",
                                     "proto": list(PROTOCOL_VERSION)})
                     probe = recv_msg(sock)
+                    self._apply_probe_proto(probe)
                     proto = probe.get("proto")
-                    self._chal_capable = bool(
-                        isinstance(proto, (list, tuple)) and len(proto) >= 2
-                        and proto[0] == PROTOCOL_VERSION[0]
-                        and proto[1] >= PROTO_CHAL_MIN_MINOR)
                     if probe.get("ok"):
                         reply = probe
                     elif self._chal_capable:
@@ -1043,6 +1224,15 @@ class Channel:
                     send_msg(sock, {"action": action, "user": user, "pass": password,
                                     "proto": list(PROTOCOL_VERSION)})
                     reply = recv_msg(sock)
+                    # net-046（2026-10-10）：本分支**只在 `action == Act.PROBE` 时可达**
+                    # ——`_anon_ok` 已确认准入关闭的重连（1048）与首次无凭据探测
+                    # （1053）是唯一两条落到 else 的路径，而这两条同样要在回包上定协商
+                    # （host 的 `_auth_optional_phase` 回包是带 proto 的，
+                    # host.py:2150-2152）。带凭据的 LOGIN/REGISTER 走不到这里：它们在
+                    # `_chal_capable is None` 时经 1086 分支的探针（1092）完成协商，
+                    # 已知能力时走 1109 的挑战-应答或 1111 的明确拒绝。
+                    # 旧注释把这条分支说成"准入关闭部署的带凭据登录"，可达路径写反了。
+                    self._apply_probe_proto(reply)
             except Exception as exc:
                 self.auth_msg = "认证通信失败: %s" % exc
                 log.warning("频道[%s] 认证通信失败: %s", self.name, exc)
@@ -1521,6 +1711,15 @@ class Channel:
             # ui-010：切源后旧源的帧率/延迟样本立即作废（避免混入两个源的统计）；
             # 此处已持 self.lock，必须走 *_locked 版本（Lock 不可重入）
             self._reset_stats_locked()
+            # net-045：切源同样是**序号空间换了一个**——host 的 local_seq 每进程从 1
+            # 起（host.py:3550），而每个 peer 的 share.py 各持独立 SeqCounter，也从 1
+            # 起但已随其共享时长增长。跳序基线不清的话，从 local(seq≈50) 切到已共享
+            # 很久的 peer(seq≈200001) 时 delta=199951，`_note_video_seq` 会凭空记
+            # 199950 帧丢失。与 `_invalidate_media` 同一不变式，那边只覆盖了换连接。
+            # R8-UI-02：告警标志同样复位，新源才可以重新报缺口。
+            self._last_video_seq = None
+            self._video_seq_gaps = 0
+            self._gap_warned = False
             self._resync = False
         sock = self._active_sock
         if sock is None:
@@ -1778,8 +1977,9 @@ class ViewerApp:
         viewer_cfg = cfg["viewer"]
         # 第 100 条：显示宽度/透明度来自配置，手改成 0/负数/字符串时不应让每帧
         # resize 抛异常被吞成"永久占位文字"。这里与 set_display_width 同口径夹紧。
-        self.display_width = safe_int(viewer_cfg.get("display_width", 480), 480, 1, 4096)
-        self.alpha = safe_float(viewer_cfg.get("alpha", 0.9), 0.9, 0.0, 1.0)
+        self.display_width = safe_int(viewer_cfg.get("display_width", 480), 480,
+                                      WIDTH_MIN, WIDTH_MAX)
+        self.alpha = safe_float(viewer_cfg.get("alpha", 0.9), 0.9, ALPHA_MIN, ALPHA_MAX)
         self.click_through = bool(viewer_cfg.get("click_through", True))
         self.panel_topmost = bool(viewer_cfg.get("panel_topmost", True))
 
@@ -1826,9 +2026,12 @@ class ViewerApp:
         self._float_left = None       # 悬浮窗当前左缘（面板让位定位用）
         self._panel_auto_xy = None    # 面板上次自动定位结果（用于检测用户手动挪动）
         self._panel_auto_spec = None  # 上次下发的几何串（L5：未变则跳过冗余 Tcl 调用）
+        self._panel_auto_size = None  # 上次下发后的实际宽高（ui-042 缓存比位置时补比尺寸）
         self._panel_user_moved = False
         # B4（实现方案 §6）：更新提示后缀，拼在面板底部状态标签的默认文本后
+        # 第 9 轮：提示里带 release 页面地址，由 _on_update_click 打开浏览器
         self._update_hint = ""
+        self._update_url = None
         self._share_toggle_busy = False  # 第 60 条：共享开关异步执行期间的重入护栏
         self._save_after_id = None  # 第 64 条：viewer 配置去抖落盘的 root.after 句柄
         self._share_alive_check_at = 0.0  # B8：共享会话存活巡检的节流时刻
@@ -2146,20 +2349,37 @@ class ViewerApp:
 
     # ---------- 设置方法（供面板调用） ----------
 
+    # ---------- 设置方法（供面板调用） ----------
+
     def set_display_width(self, v):
-        self.display_width = max(1, int(v))
+        self.display_width = max(WIDTH_MIN, min(WIDTH_MAX, int(v)))
         self.cfg["viewer"]["display_width"] = self.display_width
         self._schedule_save()  # 第 64 条：拖动滑块时去抖落盘，画面重绘仍即时
         self._refresh_overlay()
 
     def set_alpha(self, v):
-        self.alpha = max(0.0, min(1.0, float(v)))
+        self.alpha = max(ALPHA_MIN, min(ALPHA_MAX, float(v)))
         try:
             self.root.attributes("-alpha", self.alpha)
         except Exception:
             pass
         self.cfg["viewer"]["alpha"] = self.alpha
         self._schedule_save()  # 第 64 条：拖动滑块时去抖落盘，透明度调整仍即时
+
+    def apply_layout_preset(self, key, screen_w=None):
+        """一键切换悬浮窗布局预设（大宽屏 / 标准 / 小地图）；未知档位返回 False。
+
+        宽度在屏幕余量内夹紧：用户在 1366 窄屏上点「大宽屏」不该得到一个伸到屏幕外、
+        右侧被裁掉的悬浮窗。两步都走既有 set_* 通道（去抖落盘 + 即时重绘），
+        滑块与数字标签由面板回调 _on_layout_preset 同步。
+        """
+        preset = LAYOUT_PRESETS.get(key)
+        if preset is None:
+            return False
+        _, width, alpha = preset
+        self.set_display_width(fit_display_width(screen_w, width))
+        self.set_alpha(alpha)
+        return True
 
     def set_click_through(self, b):
         self.click_through = bool(b)
@@ -2337,7 +2557,18 @@ class ViewerApp:
         ttk.Label(scard, text="设置", style="Section.TLabel").pack(anchor="w",
                                                                   padx=10, pady=(8, 2))
 
-        # 显示宽度 160~960
+        # 布局预设（第 9 轮）：一键同时设宽度与透明度——游戏里被打断时没空拖两个滑块
+        row0 = ttk.Frame(scard, style="Card.TFrame")
+        row0.pack(fill="x", padx=10, pady=4)
+        ttk.Label(row0, text="布局预设", style="Card.TLabel").pack(side="left")
+        self._preset_btns = {}
+        for _key, (_label, _w, _a) in LAYOUT_PRESETS.items():
+            _b = ttk.Button(row0, text=_label, style="Panel.TButton",
+                            command=lambda k=_key: self._on_layout_preset(k))
+            _b.pack(side="left", padx=(8, 0))
+            self._preset_btns[_key] = _b
+
+        # 显示宽度 WIDTH_MIN~WIDTH_MAX（第 9 轮：与 set_display_width 共用常量）
         row1 = ttk.Frame(scard, style="Card.TFrame")
         row1.pack(fill="x", padx=10, pady=4)
         ttk.Label(row1, text="显示宽度", style="Card.TLabel").pack(side="left")
@@ -2345,20 +2576,20 @@ class ViewerApp:
         self._width_val = ttk.Label(row1, text=str(int(self.display_width)),
                                     style="CardDim.TLabel", width=5, anchor="e")
         self._width_val.pack(side="right", padx=(8, 0))
-        ttk.Scale(row1, from_=160, to=960, variable=self._width_var,
+        ttk.Scale(row1, from_=WIDTH_MIN, to=WIDTH_MAX, variable=self._width_var,
                   style="Panel.Horizontal.TScale",
                   command=self._on_display_width).pack(side="left", fill="x",
                                                        expand=True, padx=10)
 
-        # 透明度 30%~100%（对应悬浮窗 alpha 0.30~1.00）
+        # 透明度 ALPHA_MIN~ALPHA_MAX（对应悬浮窗 alpha 0.30~1.00；第 9 轮起常量单一来源）
         row2 = ttk.Frame(scard, style="Card.TFrame")
         row2.pack(fill="x", padx=10, pady=4)
         ttk.Label(row2, text="透明度", style="Card.TLabel").pack(side="left")
-        self._alpha_var = tk.DoubleVar(value=self.alpha * 100.0)
-        self._alpha_val = ttk.Label(row2, text="%d%%" % int(self.alpha * 100.0),
+        self._alpha_var = tk.DoubleVar(value=round(self.alpha * 100.0, 1))
+        self._alpha_val = ttk.Label(row2, text="%d%%" % round(self.alpha * 100.0),
                                     style="CardDim.TLabel", width=5, anchor="e")
         self._alpha_val.pack(side="right", padx=(8, 0))
-        ttk.Scale(row2, from_=30, to=100, variable=self._alpha_var,
+        ttk.Scale(row2, from_=ALPHA_MIN * 100.0, to=ALPHA_MAX * 100.0, variable=self._alpha_var,
                   style="Panel.Horizontal.TScale",
                   command=self._on_alpha).pack(side="left", fill="x",
                                                expand=True, padx=10)
@@ -2385,6 +2616,9 @@ class ViewerApp:
                    command=self.quit).pack(side="right", padx=(8, 0))
         ttk.Button(footer, text="关于", style="Panel.TButton",
                    command=self._show_about).pack(side="right", padx=(8, 0))
+        # 第 9 轮：仅在发现新版时出现——把"有新版"提示变成一步可点的入口
+        self._update_btn = ttk.Button(footer, text="下载新版", style="Accent.TButton",
+                                      command=self._on_update_click)
         self._diag_btn = ttk.Button(footer, text="一键诊断", style="Panel.TButton",
                                     command=self._run_diagnostics)
         self._diag_btn.pack(side="right", padx=(8, 0))
@@ -2925,18 +3159,56 @@ class ViewerApp:
 
     def _panel_default_status_text(self):
         base = "就绪"
-        return base + (" · " + self._update_hint if self._update_hint else "")
+        if not self._update_hint:
+            return base
+        # 第 9 轮：状态栏是一行（左右都有按钮挤着），只放"有新版"这一句；
+        # 地址交给旁边的「下载新版」按钮，不再把整段提示拼上去。
+        return base + " · " + update_check.hint_headline(self._update_hint)
 
     def _set_update_hint(self, msg):
-        """B4（实现方案 §6）：状态栏追加一行更新提示（不弹窗、不打断其他临时消息）。"""
-        self._update_hint = msg
+        """B4（实现方案 §6）：状态栏追加一行更新提示（不弹窗、不打断其他临时消息）。
+
+        第 9 轮：同时记下页面地址并让「下载新版」按钮出现；msg 为空 = 收起按钮。
+        """
+        self._update_hint = msg or ""
+        self._update_url = update_check.extract_url(self._update_hint)
+        btn = getattr(self, "_update_btn", None)
+        if btn is not None:
+            try:
+                if self._update_hint:
+                    btn.pack(side="right", padx=(8, 0))
+                else:
+                    btn.pack_forget()
+            except Exception as e:
+                log.debug("更新按钮显隐失败：%s", e)
         if self._status_after_id is None:
             try:
                 self._status_label.configure(text=self._panel_default_status_text())
             except Exception:
                 pass
 
+    def _on_update_click(self):
+        """打开 release 页面；浏览器拉不起来时把地址复制到剪贴板并说明（不让按钮点空）。"""
+        url = self._update_url or update_check.release_url()
+        if update_check.open_url(url):
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self._panel_set_status("无法自动打开浏览器，下载地址已复制到剪贴板", error=True)
+        except Exception as e:
+            log.info("复制更新地址失败：%s", e)
+            self._panel_set_status("无法打开浏览器，请手动访问 %s" % url, error=True)
+
     # ---------- 关于窗口 ----------
+
+    @staticmethod
+    def _link_label(parent, text, url):
+        """可点击的链接标签：左键打开浏览器，悬停变手型（Tk 无真正链接控件）。"""
+        lb = tk.Label(parent, text=text, bg=COL_CARD, fg=COL_ACCENT, cursor="hand2",
+                      font=("Microsoft YaHei", 9, "underline"))
+        lb.bind("<Button-1>", lambda _e: update_check.open_url(url))
+        return lb
 
     def _show_about(self):
         """弹出深色主题"关于"窗口（产品名/版本/版权/简介/官方文档链接）。"""
@@ -2958,8 +3230,13 @@ class ViewerApp:
                  font=("Microsoft YaHei", 9)).pack(pady=(8, 0))
         tk.Label(body, text="通过樱花内网穿透实时观看队友 FPS 画面",
                  bg=COL_CARD, fg=COL_FG, font=("Microsoft YaHei", 10)).pack(pady=(12, 0))
-        tk.Label(body, text="https://doc.natfrp.com/", bg=COL_CARD, fg=COL_ACCENT,
-                 font=("Microsoft YaHei", 9)).pack(pady=(4, 0))
+        # 第 9 轮：部署入口。两行原本都是纯文字 Label，用户想查文档/拿新版得自己
+        # 抄地址；改成可点击链接（悬停手型光标），与「下载新版」共用 open_url 的安全口径。
+        link_row = tk.Frame(body, bg=COL_CARD)
+        link_row.pack(pady=(6, 0))
+        for text, url in (("部署文档", "https://doc.natfrp.com/"),
+                          ("检查新版", update_check.release_url())):
+            self._link_label(link_row, text, url).pack(side="left", padx=8)
         tk.Label(body, text="全局热键", bg=COL_CARD, fg=COL_FG,
                  font=("Microsoft YaHei", 10, "bold")).pack(pady=(14, 2))
         for line in (
@@ -3287,9 +3564,33 @@ class ViewerApp:
             except Exception:
                 pass
 
+        html = ("<html><head><meta charset='utf-8'></head><body style='font-family:Microsoft YaHei;"
+                "font-size:10pt;color:#e6e6ef;background:#14141f;margin:12px'>"
+                "<h2 style='color:#8a70ff'>%s · 一键诊断报告</h2>"
+                "<pre style='font-size:9pt;line-height:1.4'>%s</pre></body></html>"
+                % (APP_TITLE, html_mod.escape(report)))
+
+        def _copy_html():
+            # 第 9 轮：诊断报告最常见的去向是"发给队友/贴上群聊"——按富文本复制，
+            # 粘贴后不会在聊天工具里折成一团。**先写纯文本再追加 HTML**：Tk 的
+            # clipboard_append 每次都会重写整个剪贴板，正常路径下剪贴板里最终只剩
+            # text/html，粘贴到不支持富文本的地方会是空的——所以文本必须先落进去，
+            # 且 HTML 通道不可用时不清理（纯净文本原样保留）。
+            win.clipboard_clear()
+            win.clipboard_append(report)
+            try:
+                win.clipboard_append(html, type="text/html")
+                self._panel_set_status("富文本已复制（可直接粘贴到聊天工具）")
+            except Exception as e:
+                log.debug("HTML 剪贴板不可用，保留纯文本：%s", e)
+                self._panel_set_status("该环境下无法复制富文本，已复制纯文本", error=True)
+
         tk.Button(btns, text="复制报告", bg=COL_CTRL, fg=COL_FG, relief="flat",
                   activebackground="#3a3a52", activeforeground=COL_FG,
                   padx=14, pady=4, command=_copy).pack(side="right")
+        tk.Button(btns, text="复制富文本", bg=COL_CTRL, fg=COL_FG, relief="flat",
+                  activebackground="#3a3a52", activeforeground=COL_FG,
+                  padx=14, pady=4, command=_copy_html).pack(side="right", padx=(0, 8))
         tk.Button(btns, text="导出 zip", bg=COL_CTRL, fg=COL_FG, relief="flat",
                   activebackground="#3a3a52", activeforeground=COL_FG,
                   padx=14, pady=4,
@@ -3364,14 +3665,31 @@ class ViewerApp:
     # ---------- 面板：设置项回调 ----------
 
     def _on_display_width(self, v):
-        val = max(160, min(960, int(float(v))))
+        val = max(WIDTH_MIN, min(WIDTH_MAX, int(float(v))))
         self._width_val.configure(text=str(val))
         self.set_display_width(val)
 
     def _on_alpha(self, v):
-        val = max(30.0, min(100.0, float(v)))
+        val = max(ALPHA_MIN * 100.0, min(ALPHA_MAX * 100.0, float(v)))
         self._alpha_val.configure(text="%d%%" % int(val))
         self.set_alpha(val / 100.0)
+
+    def _on_layout_preset(self, key):
+        """布局预设按钮（第 9 轮）：按屏幕宽度夹紧后应用，并把两个滑块同步到新值。"""
+        try:
+            screen_w = self.root.winfo_screenwidth()
+        except Exception:
+            screen_w = None
+        if not self.apply_layout_preset(key, screen_w=screen_w):
+            return
+        try:
+            self._width_var.set(self.display_width)
+            self._width_val.configure(text=str(int(self.display_width)))
+            self._alpha_var.set(round(self.alpha * 100.0, 1))
+            self._alpha_val.configure(text="%d%%" % round(self.alpha * 100.0))
+        except Exception as e:
+            log.debug("同步布局滑块失败：%s", e)
+        self._panel_set_status("已切换到布局：%s" % LAYOUT_PRESETS[key][0])
 
     def _on_click_through(self):
         self.set_click_through(self._click_var.get())
@@ -3470,10 +3788,9 @@ class ViewerApp:
         except Exception:
             return None, None
         reqh = int(getattr(panel, "winfo_reqheight", lambda: 0)() or 0)
-        try:
-            screen_w = int(self.root.winfo_screenwidth() or 0)
-        except Exception:
-            screen_w = 0
+        # ui-023（2026-10-09）：这里原先还读了一个 `screen_w` 却从不使用（ruff F841）。
+        # 它是横向钳制逻辑被移除后的残留——留着会让后来者误以为存在横向边界保护。
+        # 现状确实只做纵向钳制（见下方 ④ 与 y 的钳位），故按实际行为删除读取。
         try:
             screen_h = int(self.root.winfo_screenheight() or 0)
         except Exception:
@@ -3498,9 +3815,37 @@ class ViewerApp:
                     y = below
         if w != reqw and reqh > 0:
             spec = "%dx%d+%d+%d" % (w, reqh, x, y)
-        else:
-            spec = "+%d+%d" % (x, y)
+            return spec, (x, y)
+        spec = "+%d+%d" % (x, y)
         return spec, (x, y)
+
+    def _panel_geom_unchanged(self, xy):
+        """同一位置串下，面板的宽高是否也没变（第 9 轮）。
+
+        ui-042 的缓存只比位置串——位置不变而**高度**变了（新增行、状态文本换行）时
+        它会跳过 geometry 下发，面板被钉在旧高度上；宽度变窄后高度变小则底部留空白。
+        没有记过上次尺寸（首轮）时按"未变"处理，保持 ui-042 的跳过行为。
+        """
+        last = getattr(self, "_panel_auto_size", None)
+        panel = getattr(self, "panel", None)
+        if last is None or panel is None:
+            return True
+        try:
+            now = (int(panel.winfo_width()), int(panel.winfo_height()))
+        except Exception:
+            return True
+        return now == last
+
+    def _remember_panel_geom(self):
+        """geometry 下发后记下实际宽高（下一拍比对用）。"""
+        panel = getattr(self, "panel", None)
+        if panel is None:
+            return
+        try:
+            self._panel_auto_size = (int(panel.winfo_width()),
+                                     int(panel.winfo_height()))
+        except Exception:
+            self._panel_auto_size = None
 
     def _on_panel_configure(self, event):
         """面板被内容撑大/缩小时重新让位。
@@ -3556,11 +3901,16 @@ class ViewerApp:
             if spec == getattr(self, "_panel_auto_spec", None):
                 # L5/ui-042（2026-09-24）：几何未变即跳过 update_idletasks+geometry
                 # 的冗余 Tcl 下发（状态文本一变就走本函数，与解码/贴图抢主线程）。
+                # 第 9 轮：收紧的"未变"判据——宽度/高度任一变了都要重新下发，否则
+                # 位置没变但高度变了（新增行、换行）时面板会被钉在旧高度上；内容变窄
+                # 后高度变小、旧高度保留会在底部留一段空白。
                 self._panel_auto_xy = xy
-                return
+                if self._panel_geom_unchanged(xy):
+                    return
             self._panel_auto_spec = spec
             self._panel_auto_xy = xy
             panel.geometry(spec)
+            self._remember_panel_geom()
         except Exception:
             log.debug("面板定位失败", exc_info=True)
 

@@ -48,6 +48,16 @@ import numpy as np
 import common
 import viewer
 
+# 依赖声明（task-9，2026-10-10）：本文件建真实 `viewer.Channel`，其 `__init__`
+# （viewer.py:332）会取 `codec_mod.VideoDecoder()`——而 `viewer.codec_mod` 是**惰性
+# 模块全局**（viewer.py:35 哨兵 None，只有 `viewer._load_heavy()` 才赋值）。
+# 全量 discover 时 pipeline.py / share.py 的模块级 `from screen import …` 会在收集期
+# 顺带触发加载，于是本文件"看起来不需要"；**单跑**（`python -m unittest
+# tests.test_bugfix_20260920_t05_viewer`）则 codec_mod 仍是 None → 12/15 例报
+# AttributeError。显式声明依赖后两种跑法一致。
+# 不用 try/except 包加载：环境装不上重依赖时必须**明确报错**，静默跳过比顺序依赖更难发现。
+viewer._load_heavy()
+
 
 def _unreachable_addr():
     """一个在**解析期**就报错的地址：本轮接收循环必然走 except → finally 两次跃迁。

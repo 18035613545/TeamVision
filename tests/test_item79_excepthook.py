@@ -18,8 +18,8 @@ import subprocess
 import sys
 import unittest
 
-import viewer
 import ui_common
+import viewer
 
 
 def _top_level_excepthook_assigns(module):

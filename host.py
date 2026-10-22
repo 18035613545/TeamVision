@@ -22,8 +22,8 @@ import hmac
 import json
 import os
 import queue
-import select
 import secrets
+import select
 import socket
 import subprocess
 import sys
@@ -64,27 +64,70 @@ def _load_heavy():
 # 注（C9）：MSG_CTRL 属协议常量，本模块只在注释里提到它；保留导入以便
 # `host.MSG_CTRL` 这类既有引用不失效（pyflakes F401 已知无害）。
 from common import (  # noqa: F401
-    load_config, save_config, server_handshake, pack_frame, pack_video, exe_dir, app_dirs,
-    APP_NAME, enable_dpi_awareness, accounts_path, register_policy,
-    recv_msg, send_msg, tune_socket, parse_message, parse_message_raw, message_pump, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
-    VIDEO_FLAG_KEY, CODEC_H264, parse_video, _MSG_HDR, MAGIC_CLIENT, MAGIC_SERVER,
-    AUTH_TIMEOUT_DEFAULT_S, AUTH_TIMEOUT_MIN_S,
-    # C2（实现方案 §7）：action 常量表单点来源
-    Act,
-    # C2 §7 第 3 步：握手版本字段（先只加不启用）
-    PROTOCOL_VERSION, PROTO_ENFORCE, proto_compatible,
+    _MSG_HDR,
+    APP_NAME,
+    AUTH_TIMEOUT_DEFAULT_S,
+    AUTH_TIMEOUT_MIN_S,
+    CODEC_H264,
+    KDF_ITER_MAX,
+    # auth-002/auth-006（2026-09-18）：KDF 参数与凭据长度的校验口径
+    KDF_ITER_MIN,
+    KDF_SALT_HEX_LEN,
+    MAGIC_CLIENT,
+    MAGIC_SERVER,
+    MSG_CTRL,
+    MSG_FRAME,
+    MSG_VIDEO,
+    # D1（实现方案 §10）：挑战-应答认证公共件（PBKDF2/HMAC/base64 单一真源）
+    PBKDF2_ITERATIONS,
     # auth-016（2026-09-20）：host 侧也要看次版本
     PROTO_CHAL_MIN_MINOR,
-    # D1（实现方案 §10）：挑战-应答认证公共件（PBKDF2/HMAC/base64 单一真源）
-    PBKDF2_ITERATIONS, derive_dk, challenge_mac, b64e, b64d,
-    # auth-002/auth-006（2026-09-18）：KDF 参数与凭据长度的校验口径
-    KDF_ITER_MIN, KDF_ITER_MAX, KDF_SALT_HEX_LEN, _is_hex_str,
-    # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
-    # 各有一套 clamp），share.py 不再反向 import host。
-    normalize_region, safe_float, safe_int,
-    acquire_file_lock, release_file_lock,
+    PROTO_ENFORCE,
+    # net-047：拒绝文案与"能否解 v2.4 序号布局"的判据都在协议层，两端共用一份
+    PROTO_SEQ_REJECT_MSG,
+    # C2 §7 第 3 步：握手版本字段（先只加不启用）
+    PROTOCOL_VERSION,
+    VIDEO_FLAG_KEY,
+    # net-047（2026-10-10，产品决策"明确拒绝旧观看端"）：次版本低于该值的观看端
+    # 会把序号当 NAL 前导解，改为在认证期明确拒绝，见 _legacy_viewer_seq_reason
+    VIDEO_SEQ_MINOR,
+    # C2（实现方案 §7）：action 常量表单点来源
+    Act,
+    # net-045（2026-10-09）：视频帧单调递增序号发生器（协议 v2.4）
+    SeqCounter,
+    _is_hex_str,
+    accounts_path,
+    acquire_file_lock,
+    app_dirs,
+    b64d,
+    b64e,
     # ui-022 / auth-022 / ui-030（2026-09-20）：配置子节判型的单点收口
     cfg_section,
+    challenge_mac,
+    derive_dk,
+    enable_dpi_awareness,
+    exe_dir,
+    load_config,
+    message_pump,
+    # C1（优化方案 2026-09-17）：配置工具单点定义在 common（原先 host/viewer/share
+    # 各有一套 clamp），share.py 不再反向 import host。
+    normalize_region,
+    pack_frame,
+    pack_video,
+    parse_message,
+    parse_message_raw,
+    peek_video_header,
+    proto_compatible,
+    recv_msg,
+    register_policy,
+    release_file_lock,
+    safe_float,
+    safe_int,
+    save_config,
+    send_msg,
+    server_handshake,
+    tune_socket,
+    video_seq_capable,
 )
 
 # 采集/静止检测公共件（CaptureManager、encode_bgr 等 screen 转发名）由
@@ -167,7 +210,7 @@ class AccountManager:
             self._users = {}
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
+            with open(self._path, encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("顶层不是对象")
@@ -203,7 +246,7 @@ class AccountManager:
         快照整表覆盖（另一方刚注册的账户被静默抹掉、已删除的账户复活）。
         """
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
+            with open(self._path, encoding="utf-8") as f:
                 data = json.load(f)
             users = data.get("users") if isinstance(data, dict) else None
             return users if isinstance(users, dict) else None
@@ -977,7 +1020,7 @@ class FrpManager:
 
         for path in candidates:
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     data = json.load(f)
             except (OSError, ValueError):
                 continue
@@ -989,7 +1032,7 @@ class FrpManager:
                 for item in ids:
                     if isinstance(item, bool):
                         continue
-                    if isinstance(item, (int, float)):
+                    if isinstance(item, int | float):
                         id_list.append(str(int(item)))
                     elif isinstance(item, str) and item.strip().isdigit():
                         id_list.append(item.strip())
@@ -1643,7 +1686,9 @@ def _forward_upstream_frame(runtime, sock, info, kind, payload, addr, raw=None):
         raw = _MSG_HDR.pack(kind, len(payload)) + payload
     if kind == MSG_VIDEO:
         try:
-            _ts, _codec, flags, _nal = parse_video(payload)
+            # net-045：中继只取关键帧位做门控，且不转发重打包（raw 直通），因此用
+            # 布局无关的 peek_video_header——不解析 NAL，也就不需要猜 seq 在不在。
+            _ts, _codec, flags = peek_video_header(payload)
         except ValueError:
             log.warning("客户端 %s 上行视频帧损坏，忽略", addr)
             return
@@ -1876,6 +1921,11 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
         sock.close()
         return False, None
 
+    # net-047（2026-10-10）：次版本过旧的观看端一律拒绝，不再放行。
+    # 拒绝只做一次即返回——去重标志在这里没有意义（旧实现只告警，认证阶段会
+    # 收到多条带 proto 的消息故需按连接去重；现在第一条就断连，没有第二条）。
+    # no-nonlocal：下面 while 循环里只读不写。
+
     try:
         while True:
             msg = recv_msg(sock, msg_deadline)
@@ -1897,6 +1947,11 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                             addr, msg.get("proto"), PROTOCOL_VERSION)
                 if PROTO_ENFORCE:
                     return _reject_and_close("协议版本不匹配，请更新观看端")
+            legacy_reason = _legacy_viewer_seq_reason(addr, msg)
+            if legacy_reason:
+                # net-047：拒绝文案走 AUTH_RESULT，与同函数内其余拒绝同款——
+                # 观看端据此弹框而不是把断连当成"网络故障"反复重连。
+                return _reject_and_close(legacy_reason)
             raw_user, ok_user = _str_field(msg, "user")
             raw_pass, ok_pass = _str_field(msg, "pass")
             if not ok_user:
@@ -1931,7 +1986,7 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                 # host 校验必然失败 → 命中观看端"口令错误"分支，**清空已存凭据并写回
                 # config**：老客户端既登不上、又丢了保存的口令，界面还只显示套话。
                 pr = msg.get("proto")
-                if (isinstance(pr, (list, tuple)) and len(pr) >= 2
+                if (isinstance(pr, list | tuple) and len(pr) >= 2
                         and isinstance(pr[1], int) and pr[1] < PROTO_CHAL_MIN_MINOR):
                     return _reject_and_close(
                         "观看端版本过旧，请更新后重试",
@@ -2049,7 +2104,7 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
                 msg_deadline = min(deadline, time.monotonic() + AUTH_DIALOG_WINDOW_S)
                 continue
             return _reject_and_close("不支持的认证请求")
-    except socket.timeout:
+    except TimeoutError:
         log.warning("客户端 %s 未在 %.0f 秒内完成登录，已断开", addr, auth_timeout)
         sock.close()
         return False, None
@@ -2057,6 +2112,44 @@ def _auth_required_phase(sock, addr, runtime, auth_cfg):
         log.warning("客户端 %s 认证异常: %s", addr, e)
         sock.close()
         return False, None
+
+
+def _legacy_viewer_seq_reason(addr, msg):
+    """net-047（2026-10-10，产品决策"明确拒绝旧观看端"）：是否该拒绝这个观看端。
+
+    返回拒绝文案（`common.PROTO_SEQ_REJECT_MSG`），或 None 表示放行。
+
+    第 8 轮审查（2026-10-10）实测的故障链：显式声明次版本 < `VIDEO_SEQ_MINOR`
+    的观看端收到 v2.4 帧时，它那条老的 10 字节头解析路径既没有起始码判据也没有
+    回退，`nal = payload[10:]` 会把 4 字节序号当成 NAL 前导。序号落在
+    `[256, 511]` 区间时这 4 字节恰好构成 `00 00 01 XX` 的合法起始码 + NAL 头，
+    `XX & 0x1F ∈ [1,5]` 的 40 个取值被解码器当成切片 NAL，参考链断裂后每 GOP
+    末段 6~10 帧解不出——表现为**悬浮窗周期性冻结，而两端日志都正常**（本地
+    实测 libx264/H.264 520 帧里 28 帧完全解不出；hevc_nvenc 与 libx265 各 0
+    损伤）。
+
+    第 8 轮当时的处置是"只告警"：发送侧无条件带序号（`seq=None` 的 v2.3 出口在
+    生产代码里不可达），改成按订阅者分桶打包要牵动认证期记录、`ClientInfo` 与
+    `route_frame` 的中继零重拷贝优化。用户选择另一条路——**明确拒绝**：既然这条
+    链路上的损伤无法在发送侧消除且对用户完全不可见，就不让它发生。与
+    `PROTO_CHAL_MIN_MINOR` 的既有口径同构（都是"用明确拒绝替代静默降级"），
+    但**刻意用不同字面量**：viewer 端按文案区分"升级到挑战-应答版本"与
+    "升级到帧序号版本"，前者会复位能力缓存重试，后者必须让用户去换观看端。
+
+    判据本体在 `common.video_seq_capable`（协议层单一真源，两端共用）。本函数
+    只负责"判定 + 留一条指名道姓的日志"，不自己 send、不自己 close——三个调用
+    点的收尾方式各不相同（`_reject_and_close` / 裸 send / `_reply_ctrl`），
+    收尾留在调用点，避免在这里造第四种断连路径。
+    """
+    present, capable = video_seq_capable(msg)
+    if not present or capable:
+        return None
+    proto = msg["proto"]
+    log.warning("拒绝观看端 %s：协议次版本 %r < %d（服务端 %s）——该版本的视频帧"
+                "解析路径会把帧序号当 NAL 前导，在软件编码（libx264）链路上必然"
+                "出现周期性画面冻结且无任何日志线索，请升级观看端",
+                addr, proto, VIDEO_SEQ_MINOR, PROTOCOL_VERSION)
+    return PROTO_SEQ_REJECT_MSG
 
 
 def _auth_optional_phase(sock, addr):
@@ -2097,6 +2190,14 @@ def _auth_optional_phase(sock, addr):
                                 "msg": "协议版本不匹配，请更新观看端"})
                 sock.close()
                 return False, None
+        # net-047：本条路径只处理一条可选 auth 消息，不需要按连接去重——
+        # 命中即拒绝断开，不会走到第二条。
+        legacy_reason = _legacy_viewer_seq_reason(addr, msg)
+        if legacy_reason:
+            send_msg(sock, {"action": Act.AUTH_RESULT, "ok": False,
+                            "msg": legacy_reason})
+            sock.close()
+            return False, None
         # B1：非字符串 user 不再抛 AttributeError（那会被下面 except 记成"可选 auth 解析
         # 失败"并断开连接）；这里忽略该字段继续放行，只留一条明确日志。
         user, ok_user = _str_field(msg, "user")
@@ -2246,6 +2347,21 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
         # 已把本连接按"旧客户端"放行，此后到达的 probe/login 若无人应答，观看端会把
         # 下一条 roster/pong 当认证回复 → 在"无需登录"的服务端上反复弹登录框、最后报
         # "需要登录"。这里补一个明确答复（两种准入状态下都安全）。
+        # net-047（2026-10-10）：**第 100 条的这条兜底路径是"拒绝旧观看端"的第三
+        # 个入口，不能漏**。高延迟/隧道场景下 probe/login 可能晚于那 2 秒窗口才
+        # 到达（此时 `_auth_optional_phase` 已按旧客户端放行、连接进了接收循环），
+        # 旧实现只在这里回"需要登录"/"无需登录"而不看 proto——于是慢 probe 的旧
+        # 观看端绕过了认证期的拒绝检查，继续收 v2.4 帧并周期性冻结。同族检查
+        # （第 7 轮硬性动作）在三条路径上都做了 grep：`host.py` 内认证期读 proto
+        # 的入口只有 `_auth_required_phase` / `_auth_optional_phase` / 本分支。
+        legacy_reason = _legacy_viewer_seq_reason(addr, msg)
+        if legacy_reason:
+            if not _reply_ctrl(sock, info, {"action": Act.AUTH_RESULT, "ok": False,
+                                            "msg": legacy_reason}, addr):
+                return "控制消息写入失败（连接已损坏）"
+            # 返回致命原因 → 统一收尾关闭连接；否则旧观看端会每 2 秒重连一次，
+            # 把 host 的未认证名额与日志刷满。
+            return "观看端版本过旧（proto=%r），已断开" % (msg.get("proto"),)
         late_user, ok_late_user = _str_field(msg, "user")
         if not ok_late_user:
             # B1：{"user": 123} 不再抛 AttributeError 打断连接；忽略该字段即可
@@ -2652,7 +2768,7 @@ def _as_server_list(server):
     """把单个监听 socket 或 socket 列表统一成列表（A0 回环双栈会同时监听 v4/v6）。"""
     if server is None:
         return []
-    if isinstance(server, (list, tuple)):
+    if isinstance(server, list | tuple):
         return [s for s in server if s is not None]
     return [server]
 
@@ -2831,7 +2947,7 @@ def _has_frp_tunnel(cfg):
     tids = frp.get("tunnel_ids")
     if isinstance(tids, str):
         return bool(tids.strip())
-    if isinstance(tids, (list, tuple)):
+    if isinstance(tids, list | tuple):
         return any(str(t).strip() for t in tids)
     return bool(str(frp.get("public_addr") or "").strip())
 
@@ -3508,6 +3624,9 @@ def _send_loop(runtime):
     """
     last_sent_video_ts = -1  # 已发送的最后一帧视频时间戳
     last_sent_jpeg_ts = -1   # 已发送的最后一帧 JPEG 时间戳
+    # net-045（2026-10-09）：本地屏幕这一路视频的单调递增帧序号。
+    # 每条流一个计数器——共享者各自成流，序号只在同一路流内比较才有意义。
+    local_seq = SeqCounter()
     # 1 秒滑动窗口：元素为 (完成时刻, 发送耗时毫秒)
     send_window = []
     while not runtime.stop_event.is_set():
@@ -3524,7 +3643,8 @@ def _send_loop(runtime):
             try:
                 delivered = route_frame(
                     runtime, "local",
-                    pack_video(video, video_ts, is_key, codec=video_codec),
+                    pack_video(video, video_ts, is_key, codec=video_codec,
+                               seq=local_seq.next()),
                     is_key=is_key, send_timeout=2.0)
                 last_sent_video_ts = video_ts  # 仅发送成功后才视为已发送
             except Exception as e:
@@ -3908,6 +4028,7 @@ def main():
     if not args.console:
         try:
             import tkinter as tk
+
             import splash as splash_mod
             splash_root = tk.Tk()
             splash_mod.show_fast_splash(splash_root)

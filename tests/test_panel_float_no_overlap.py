@@ -189,12 +189,37 @@ class TestPanelAvoidsFloat(unittest.TestCase):
                 app = _app(label_reqw=label_w, panel_reqw=panel_w, screen_w=screen_w)
                 app.position()
                 px1, py1, px2, py2 = _panel_rect(app)
-                fx1, fy1, fx2, _ = _float_rect(app)
+                # T-14/R8-D-02：第 4 个值（悬浮窗**底缘**）此前被解成 `_`，而判据里
+                # 又引用了 `fy2`——F821 未定义名。本机 7 个组合里项 1 `px2 <= fx1`
+                # 恒为真（面板右缘按定义停在悬浮窗左侧 `_PANEL_GAP` 处），`or` 短路
+                # 使第 4 项一次都没求值，于是"矩形不相交"实际只判了水平轴。
+                # 接上真实底缘后纵向判据才真正生效，负向对照见
+                # `test_overlap_judgement_is_not_masked_by_shortcircuit`。
+                fx1, fy1, fx2, fy2 = _float_rect(app)
                 overlap = not (px2 <= fx1 or px1 >= fx2 or py2 <= fy1 or py1 >= fy2)
                 self.assertFalse(
                     overlap,
                     "面板与悬浮窗相交（小窗画面被盖）：panel=%s float=%s"
-                    % ((px1, py1, px2, py2), (fx1, fy1, fx2)))
+                    % ((px1, py1, px2, py2), (fx1, fy1, fx2, fy2)))
+
+    def test_overlap_judgement_is_not_masked_by_shortcircuit(self):
+        """R8-D-02 负向对照：不相交判据必须真的能判出「相交」。
+
+        构造必然相交的一对矩形，断言 `overlap` 为 True。若将来又有人把某个判据项
+        写回未定义名/改成永远为真，短路会把相交判成不相交，本用例即变红——上面
+        `test_no_overlap_invariant` 自身的矩形在本机几何下永远由项 1 短路命中，
+        单靠它区分不了"求值"与"短路"。
+        """
+        panel = (0, 600, 500, 1000)
+        float_ = (450, 620, 900, 900)        # 纵向必然相交（[620,900] ⊂ [600,1000]）
+        px1, py1, px2, py2 = panel
+        fx1, fy1, fx2, fy2 = float_
+        overlap = not (px2 <= fx1 or px1 >= fx2 or py2 <= fy1 or py1 >= fy2)
+        self.assertTrue(overlap, "不相交判据把必然相交的矩形判成了不相交")
+        # 只改纵向一项（px2 <= fx1 仍为真 → 仍然短路），横向分离时不得报相交
+        px1, py1, px2, py2 = (0, 600, 400, 1000)
+        overlap = not (px2 <= fx1 or px1 >= fx2 or py2 <= fy1 or py1 >= fy2)
+        self.assertFalse(overlap, "横向已分离却判成相交")
 
     def test_overlay_wider_than_photo_counts(self):
         """叠加行/占位文字比画面宽时，悬浮窗实际更宽，面板须按最宽者让位（ui-014 同源）。"""

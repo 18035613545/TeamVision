@@ -37,6 +37,18 @@ net-041｜RTT 改单调钟配对（墙钟回拨不再把读数永久锁在旧值
 net-042｜_resync/_resync_at 随重连复位（新连接第一个巡检窗口不再误判）｜—
 net-043｜外部托管改实探 SakuraFrpService（2 秒缓存），服务退出即复位 latch｜tests/test_item62_frp.py
 net-044｜main 尾部单一 try/finally：frp.start() 之后的失败也走 runtime.shutdown()（不留孤儿 frpc）｜—
+net-045｜视频帧载荷加 4 字节单调递增帧序号（协议 v2.4）：可识别丢帧/错序，把"整体重置解码器"降级为"丢弃到下一个可解码点"；载荷布局不自描述故按 proto 次版本协商，并按 Annex-B 起始码对混合版本自动回退｜tests/test_net045_frame_seq.py
+net-046｜代码审查两处遗漏：① `switch_source` 漏清帧序号基线（`_invalidate_media` 只覆盖换连接），切到已共享更久的队友会凭空记 199950 帧丢失；② 准入关闭（`auth.enabled=false`）部署全程走 `Act.PROBE` 分支，该分支从不读回包 `proto`，`_expect_seq` 终身为 False——抽出 `_apply_probe_proto` 让三条回包路径共用｜tests/test_net045_frame_seq.py
+
+第 8 轮（2026-10-10，`docs/audit/round8/`）：
+
+net-047｜帧序号 v2.4 的向后兼容**只存在于测试里**：生产三个打包点（`host.py` 本地流 / `share.py` 两条出帧路径）全部无条件带 seq，`seq=None` 的 v2.3 出口在生产代码里不可达；旧观看端（1.4.0）那条老解析路径无起始码判据、无回退，每帧都拿到 4 字节序号前缀，libx264/H.264 实测 520 帧里 **28 帧完全解不出**（每 GOP 末段 6~10 帧，悬浮窗周期性冻结；hevc_nvenc 与 libx265 零损伤）。**处置（用户产品决策"明确拒绝旧观看端"）**：发送侧不改为按订阅者分桶打包（那要牵动认证期记录、ClientInfo 与 `route_frame` 的中继零重拷贝优化），改为在**认证期按对端自报的 `proto` 次版本直接拒绝**并给出可执行文案——判据 `common.video_seq_capable` 提到协议层两端共用，拒绝文案 `common.PROTO_SEQ_REJECT_MSG` 与 `PROTO_CHAL_MIN_MINOR` 那条**刻意不同**（viewer 按字面量分流：前者复位能力缓存重试即可连上，后者是终态必须换观看端）；三条认证入口全部接线，含 `_dispatch_ctrl` 的迟到认证分支（高延迟/隧道下 probe 晚于 2 秒窗口才到，漏它等于留了一条每 2 秒重连一次的后门）；**不带 proto 字段的对端刻意仍放行**（host 无法区分 1.3.x 旧观看端与只发帧不解码的旧 `share.py` 中继 peer，打死后者等于废掉 MultiView）｜tests/test_round8_host_compat.py + tests/test_d1_challenge_auth.py
+
+net-048｜`parse_video_auto` 的布局判据与布局**不是一一映射**：`expect_seq=False` 时按 v2.3 解出的 `nal` 前 4 字节正是 seq 自己，`seq=1` 与 `seq ∈ [256,511]` 共 **257 个取值**让 Annex-B 判据"成立"而不回退（穷举实证），其中 40 个被解码器当成切片 NAL 头、破坏参考链——与 net-047 同款损伤（精确模拟复现同一批 28 帧）。改为"两种布局都产出候选、按起始码强度（4 字节 > 3 字节）择优、强度与协商方向都打平时回到先到先得以保住既有行为"｜tests/test_round8_net_ui.py
+
+net-049｜`_expect_seq` 只在首次探测时确定：`_chal_capable` 是跨连接持久缓存，一旦置位后续重连走挑战-应答分支不再读回包，共享端升级/换址后观看端长期按旧次版本解帧。**本轮只登记**：修它要让 host 的 9 个 `AUTH_RESULT` 发送点统一带 `proto`，且必须保证失败回包也带——否则会把 `_chal_capable` 误刷成 False 从而**永久拒绝明文口令**（比现状更糟）；而 net-048 修好后它的唯一后果已降级为"序号遥测字段不更新"｜—
+
+net-050｜`_video_seq_gaps` 全仓**只写不读**，且接收路径的唯一接线零覆盖：用 spy 跑全量 874 例显示 `_note_video_seq` 被调 17 次、**0 次来自 viewer.py**——删掉那行测试仍全绿。现接一个最小消费者（累计缺口跨过 `_GAP_WARN_THRESHOLD=8` 时每条连接报一次 warning，三处复位点同步清 `_gap_warned`），并把"选择性恢复（丢弃到下一个可解码点）尚未实现"如实写进 docstring——net-045 的登记口径此前超前于实现｜tests/test_round8_net_ui.py
 
 ## 历史（旧编号，冻结）
 

@@ -21,7 +21,7 @@ log = logger.get_logger()
 #: 旧实现把标记挂在 CaptureManager 实例上（`self._pick_warned`），而 `_rebuild()`
 #: 每次都新建实例 → 注释写着"只报一次"、实际每次重建都重报一条，静止/独占全屏下
 #: 约每 1.5 秒一条把 5MB 滚动日志冲刷干净。模块级集合跨实例生效（同 codec 侧口径）。
-_PICK_WARNED = set()
+_PICK_WARNED: set = set()
 _PICK_WARNED_MAX = 32
 
 
@@ -78,6 +78,13 @@ def ensure_vendor_on_path():
         except Exception:
             continue
 
+
+#: capture-012（2026-10-10）：几何漂移探测的调用间隔（秒）。
+#:
+#: 漂移检测的判据不是"画面是否可疑"而是"几何是否变了"，探针本身很便宜，但不必
+#: 每帧都跑：mss 一帧 1920x1080 约 16ms，而探针约 2.4μs，1 秒一次的间隔相当于
+#: 把开销压到每帧 1.5e-5 量级，同时把"检测到漂移"的最大延迟限定在 1 秒内。
+GEOMETRY_PROBE_INTERVAL_S = 1.0
 
 #: 静止检测抽稀步长（2K 下约 183x103 采样点，开销 <1ms）
 STILL_STEP = 14
@@ -162,6 +169,128 @@ def encode_bgr(bgr, scale, quality, target_width=0):
     return buf.tobytes(), encode_ms
 
 
+#: capture-012：几何探针的模块级缓存与去重标记。
+#: 缓存键是屏幕列表的元组形态（hashable），探针本身无状态，多实例共用是安全的。
+_PROBE_STATE: dict = {"cached": None}
+
+
+def probe_geometry(force=False, interval_s=GEOMETRY_PROBE_INTERVAL_S):
+    """枚举当前显示器几何，返回 mss 语义的 monitors 列表；不可用时返回 None。
+
+    capture-012（2026-10-10）：mss 的 `monitors` 是**每实例只算一次**的缓存
+    （`mss/base.py:346-350`），上游明确把它当缓存用且从未提供刷新入口
+    （https://python-mss.readthedocs.io/v10.2.0/api.html）。显示设置变更后旧矩形
+    继续被传给 `grab()`，而 GDI 的 `BitBlt` 在源矩形完全离屏时**返回成功却
+    根本不写目标 DIB**（`mss/windows/gdi.py:380`）——既有判据因此全部落空：
+    不抛异常（不触发 pipeline.py:387 的异常重建）、不返回 None（不触发空帧重建）、
+    后端一直 `working()`。实测下共享端会安静地重复发送分辨率变更前的最后一帧。
+
+    本探针绕开 mss 的缓存直接问 Win32，构造口径与 `mss.windows.gdi.MSSImplGdi.
+    monitors()` 完全一致（索引 0 = 虚拟桌面并集，取自 GetSystemMetrics 76/77/78/79；
+    索引 1..N = EnumDisplayMonitors 逐块枚举），因此返回值可与配置里的显示器
+    序号一一对应，不引入新的语义。
+
+    非 Windows 平台或 user32 不可用时返回 None，调用方沿用 mss 的路径，不新增
+    失败模式。
+    """
+    now = time.monotonic()
+    cached = _PROBE_STATE.get("cached")
+    if (not force and cached is not None
+            and now - cached[0] < interval_s):
+        return cached[1]
+    mons = _probe_geometry_uncached()
+    if mons is None:
+        # 探测失败不做缓存：让下次调用立刻重试，而不是把失败钉住 interval_s
+        return None
+    _PROBE_STATE["cached"] = (now, mons)
+    return mons
+
+
+def _probe_geometry_uncached():
+    """真正调用 Win32 枚举显示器；任何异常都归为"几何不可用"。"""
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetSystemMetrics.restype = ctypes.c_int
+
+        gsm = user32.GetSystemMetrics
+        virtual = {"left": int(gsm(76)),    # SM_XVIRTUALSCREEN
+                   "top": int(gsm(77)),     # SM_YVIRTUALSCREEN
+                   "width": int(gsm(78)),   # SM_CXVIRTUALSCREEN
+                   "height": int(gsm(79))}  # SM_CYVIRTUALSCREEN
+        monitors = [virtual]
+        found = []
+
+        proc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, wt.HMONITOR, wt.HDC,
+            ctypes.POINTER(wt.RECT), ctypes.c_void_p)
+
+        @proc_type
+        def _cb(_hmon, _hdc, rect, _data):
+            r = rect.contents
+            found.append({"left": int(r.left), "top": int(r.top),
+                          "width": int(r.right) - int(r.left),
+                          "height": int(r.bottom) - int(r.top)})
+            return True
+
+        if not user32.EnumDisplayMonitors(0, None, _cb, 0):
+            return None
+        if not found:
+            return None
+        monitors.extend(found)
+        return monitors
+    except Exception as e:
+        log.debug("几何探针不可用（%s），沿用 mss 的显示器几何", e)
+        return None
+
+
+def geometry_changed(cached, current):
+    """比对两份 mss 语义 monitors 列表是否等价（只看位置与尺寸）。
+
+    capture-012：只比 `left/top/width/height`，忽略 mss 10.2 新增的 `is_primary`/
+    `name`/`unique_id` 等元数据——那些字段不参与采集，且本探针不枚举设备名。
+    任一侧不可用（None/空）时返回 False，避免把“探测失败”当成“几何变了”而触发
+    无谓重建。
+
+    长度不等直接判 True：显示器被插拔时 mss 的索引表长度必然变化，这是真实的
+    拓扑变化，不是损坏。逐条比对只处理长度相等的情形。
+    """
+    if not cached or not current:
+        return False
+    if len(cached) != len(current):
+        return True
+    keys = ("left", "top", "width", "height")
+    for a, b in zip(cached, current, strict=True):
+        try:
+            if any(int(a[k]) != int(b[k]) for k in keys):
+                return True
+        except Exception:
+            # 单条记录不可解析时交给调用方走“几何不可用”路径，不误判为漂移
+            return False
+    return False
+
+
+def reset_geometry_probe():
+    """清空几何探针缓存（测试与显式强制刷新用）。"""
+    _PROBE_STATE["cached"] = None
+
+
+def _geometry_summary(monitors):
+    """把几何列表压成一句人话，供一次性告警使用。"""
+    try:
+        parts = ["全部屏幕 %dx%d@(%d,%d)" % (m["width"], m["height"],
+                                            m["left"], m["top"])
+                 for m in monitors[:1]]
+        parts += ["#%d %dx%d@(%d,%d)" % (i, m["width"], m["height"],
+                                         m["left"], m["top"])
+                  for i, m in enumerate(monitors[1:], 1)]
+        return "，".join(parts)
+    except Exception:
+        return "几何不可用"
+
+
 class CaptureManager:
     """采集后端封装：mss（GDI）与 dxgi（dxcam）双后端，支持动态切换显示器/区域/后端。
 
@@ -176,6 +305,7 @@ class CaptureManager:
         self._camera = None
         self._effective = backend  # 回退后的实际后端
         self._errors = 0           # 连续采集异常次数（成功一帧即清零，capture-002）
+        self._geometry = None      # 上次探测到的几何（capture-012，用于漂移比对）
         self._open()
 
     def _open(self):
@@ -270,8 +400,22 @@ class CaptureManager:
         """把配置区域换算成 dxcam 的"显示器内相对坐标"（capture-003，2026-09-18）。
 
         mss 的 region 是**虚拟桌面绝对坐标**，dxcam 的 region 是**所选输出内**的
-        相对坐标：副屏上的区域直接透传给 dxcam 时越界 → 永久黑屏（dxcam 返回 None）。
-        返回 (region 或 None, 是否越界)：越界（区域跨出所选显示器）时交由调用方回退 mss。
+        相对坐标：副屏上的区域直接透传给 dxcam 会越界。
+        返回 (region 或 None, 是否越界)：越界（区域跨出所选显示器，或所选显示器的
+        几何本身取不到）时交由调用方回退 mss。
+
+        capture-011（2026-10-10）：旧实现对"显示器几何取不到"这一支既不换算也不判
+        越界，把虚拟桌面绝对坐标原样当成输出内相对坐标递下去，同时报
+        `out_of_range=False` 阻止回退。vendored dxcam 0.3.0 的 `_validate_region`
+        （vendor/dxcam/dxcam.py:782-787）对这种坐标抛 `ValueError`，而不是本
+        docstring 旧版描述的"返回 None"（那是更早版本 dxcam 的行为）。异常经
+        `grab` 上抛 → `CaptureSource._errors` 累加 → 连续 5 次触发 `_rebuild` →
+        `_open()` 重建 mss/dxcam；几何若依旧取不到则整轮重来（每轮 `dxcam.create`
+        内含一次 `time.sleep(0.1)`，vendor/dxcam/__init__.py:163），形成重建循环。
+
+        几何取不到时唯一安全的动作是回退 mss：换算的前提不成立，"照常递下去"的
+        任何猜测都不可能对。若 mss 同时不可用，`_grab_mss()` 返回 None，由
+        `CaptureSource` 的空帧判据接管（不会退化成上面的重建循环）。
         """
         mon = self._monitor_rect(self.monitor)
         left = int(self.region["left"])
@@ -279,8 +423,10 @@ class CaptureManager:
         w = int(self.region["width"])
         h = int(self.region["height"])
         if mon is None:
-            # 拿不到显示器几何：不做换算（保持旧行为，避免误截）
-            return (left, top, left + w, top + h), False
+            _warn_pick_once("region-rect-missing-%d" % self.monitor,
+                            "显示器 #%d 的矩形不可用（mss 初始化失败，或配置序号超出"
+                            "枚举范围），区域采集改用 mss 采集", self.monitor)
+            return None, True
         ml, mt, mw, mh = mon
         if (left < ml or top < mt or left + w > ml + mw or top + h > mt + mh):
             return None, True
@@ -288,12 +434,126 @@ class CaptureManager:
         y0 = top - mt
         return (x0, y0, x0 + w, y0 + h), False
 
-    def _monitor_rect(self, idx):
-        """mss 语义的显示器矩形 (left, top, width, height)；不可用时 None。"""
+    def _refresh_geometry(self, force=False):
+        """探测当前几何；相对上次结果发生变化时作废 mss 的显示器缓存。
+
+        capture-012（2026-10-10）：显示设置变更后 mss 的 `monitors` 不会刷新，
+        旧矩形会被继续传给 `grab()`。这里在检测到漂移时把 mss 的实例级缓存置空
+        （`base.py:347` 的 `if self._monitors is None` 随即重新枚举），使下一帧
+        拿到新矩形。
+
+        只作废几何缓存而不重建整个 mss 实例：屏幕 DC（`gdi.py:207` 的
+        `_srcdc = GetWindowDC(0)`）在模式变更后依然有效，`BitBlt` 只是不写入而非
+        失效；而一次 `mss.MSS()` 构造在本机要 22.5–36.7ms（≈1.4–2.2 帧），周期
+        重建会造成静止画面下的周期性卡顿。绑定到"几何确实变了"这个条件后，
+        这笔开销只在真正需要时支付一次。
+
+        返回是否检测到几何漂移：**True = 本帧检出了漂移**（两个出口同义），False =
+        没漂移、或探测不可用。它**不是**"需要重建采集器"的信号——曾经有代码把它当
+        重建信号用（R8-capture-02，2026-10-10 订正），但清空 mss 缓存失败时清空的
+        其实是 `probe_geometry` 的模块级缓存（独立于 mss），而重新枚举的开关本来
+        就在 mss 自己的 `_monitors`；重建 mss 实例对那条 except 的成因（上游改了
+        私有字段名/结构）**无效**，所以这里既没有消费者、也不该有。
+        """
+        # `__new__` 构造的实例没有 __init__ 跑过（既有单测大量这么用），
+        # getattr 兜底避免 AttributeError 打穿采集路径
+        prev = getattr(self, "_geometry", None)
+        current = probe_geometry(force=force)
+        if current is None:
+            return False
+        if not geometry_changed(prev, current):
+            self._geometry = current
+            return False
+        self._geometry = current
+        # key 必须含 monitor 序号：同进程内可能有多路采集（host/share 各自持有
+        # CaptureManager），只按 len(prev) 去重会让第二路的告警被第一路压制成
+        # debug，用户只看到一条"屏幕变了"却不知道是哪一路在跟进。与同文件
+        # `region-rect-missing-%d` 的口径保持一致。
+        _warn_pick_once("geometry-drift-%d-%s" % (self.monitor, prev and len(prev)),
+                        "显示器 #%d 的几何已变化（%s），采集区域自动跟进",
+                        self.monitor, _geometry_summary(current))
         try:
-            mons = getattr(self._mss, "monitors", None)
-        except Exception:
-            mons = None
+            if getattr(self, "_mss", None) is not None:
+                # mss 的 monitors 是每实例只算一次的缓存，置空后下次访问重新枚举
+                getattr(self, "_mss", None)._monitors = None
+        except Exception as e:
+            # 私有字段不可用（上游改名/结构变化）：唯一有效的处置是**不再依赖它的
+            # 缓存**——几何一律走 probe_geometry，而 `_monitor_rect` 本来就是探针
+            # 优先（探针也不可用时 mss 陈旧缓存是既有的安全回退）。旧文案写"改用
+            # 重建采集器"，但本模块没有那个消费者，且重建出的 mss 实例同样没有该
+            # 字段、对这条成因无效（R8-capture-02）。只记 debug，不改行为。
+            log.debug("作废 mss 显示器缓存失败（%s），几何改由探针提供", e)
+        return True
+
+    def _fit_region_to_desktop(self, region):
+        """把采集区域夹回当前虚拟桌面；探针不可用时原样返回（不新增失败模式）。
+
+        capture-014（2026-10-10）：区域矩形的取值来自用户配置，但它**在虚拟桌面里
+        是否还有效**完全由当前几何决定。分辨率改小后旧区域会越出桌面，而 `BitBlt`
+        对离屏源矩形是"成功且不写入"（`mss/windows/gdi.py:380`）——本机实测同尺寸
+        离屏抓取返回上一次抓帧的逐字节副本，部分越界时越屏部分写入全零。
+
+        三种处置：
+          - 完全在桌面内 → 原样返回，不产生任何额外开销（探针是 1 秒节流的缓存读）；
+          - 部分越界 → 夹到可见交集继续抓，画面缩小但**是真实内容**，不再冻结；
+          - 完全在桌面外 → 已无任何可采内容，退回整屏而不是丢帧——丢帧会被 host 侧
+            `none_rebuild_requires_dead=True` 吞掉，画面永久黑且不自愈。
+        """
+        probed = probe_geometry()
+        if not probed:
+            return region
+        try:
+            virtual = probed[0]
+            vl, vt = int(virtual["left"]), int(virtual["top"])
+            vr, vb = vl + int(virtual["width"]), vt + int(virtual["height"])
+            rl, rt = int(region["left"]), int(region["top"])
+            rr, rb = rl + int(region["width"]), rt + int(region["height"])
+        except Exception as e:
+            log.debug("采集区域与桌面对齐失败（%s），按配置矩形抓取", e)
+            return region
+        nl, nt = max(rl, vl), max(rt, vt)
+        nr, nb = min(rr, vr), min(rb, vb)
+        if (nl, nt, nr, nb) == (rl, rt, rr, rb):
+            return region                      # 区域仍在桌面内，行为不变
+        if nr > nl and nb > nt:
+            _warn_pick_once("region-clamped-%d" % self.monitor,
+                            "采集区域 (%d,%d %dx%d) 超出现有桌面 %dx%d，已夹到 %dx%d；"
+                            "分辨率或显示器布局可能已变更",
+                            rl, rt, rr - rl, rb - rt, vr - vl, vb - vt, nr - nl, nb - nt)
+            return {"left": nl, "top": nt, "width": nr - nl, "height": nb - nt}
+        _warn_pick_once("region-offscreen-%d" % self.monitor,
+                        "采集区域 (%d,%d %dx%d) 完全在现有桌面 %dx%d 之外，"
+                        "已退回整屏采集；请重新框选采集区域",
+                        rl, rt, rr - rl, rb - rt, vr - vl, vb - vt)
+        return {"left": vl, "top": vt,
+                "width": int(virtual["width"]), "height": int(virtual["height"])}
+
+    def _monitor_rect(self, idx, force=False, stale_ok=False):
+        """mss 语义的显示器矩形 (left, top, width, height)；不可用时 None。
+
+        capture-012：几何优先取自 `probe_geometry`（会检测漂移），探针不可用时
+        退回 mss 的 `monitors`——保持既有语义与既有降级路径不变。
+
+        `stale_ok=True` 时**只用探针**，探针不可用直接返回 None，不回退 mss 的
+        陈旧缓存。调用方据此区分两种"拿不到矩形"：
+
+        - 探针可用但 idx 越界 → 配置点的显示器**已经不存在**（被拔除）。此时退回
+          mss 缓存等于把刚刚发现的拓扑变化又捡回来，继续抓一块离屏的显示器 ——
+          `BitBlt` 会成功且不写入，画面永久冻结。这正是 capture-012 要消灭的形态。
+        - 探针不可用 → 只是"这次没测到"，mss 缓存仍是当前有效几何，退回是安全的。
+
+        默认 `stale_ok=False` 保持既有行为：仅在**探针不可用**时才回退 mss 缓存。
+        `_dxgi_region` / `_pick_output_idx` 只需要知道"有没有矩形"，两种"拿不到"
+        （探针坏了 / 配置的屏不存在）对它们是同一件事——都拿不到可用矩形。
+        真正需要区分的是 `_grab_mss`：那里"屏没了"必须放弃本帧，"没测到"才退回。
+        """
+        self._refresh_geometry(force=force)
+        mons = probe_geometry()
+        if not mons and not stale_ok:
+            try:
+                mons = getattr(self._mss, "monitors", None)
+            except Exception:
+                mons = None
         if not mons or idx < 0 or idx >= len(mons):
             return None
         try:
@@ -320,9 +580,19 @@ class CaptureManager:
         """
         if self.monitor <= 0:
             return None      # 0 = 全部屏幕（虚拟桌面）：单输出无法表达，回退 mss
+        # capture-012：mss 句柄缺失直接判"几何枚举不可用"，不再依赖
+        # `_monitor_rect()` 返回 None——几何探针独立于 mss 工作，mss 死掉时它
+        # 照样能返回矩形，旧判据因此永远等不到触发，"mss 初始化失败"会从日志里
+        # 彻底消失。矩形本身仍可能因序号越界而取不到（配置了不存在的屏），
+        # 那属于"没有几何一致项"，由下面的 no-match 分支报。
+        if getattr(self, "_mss", None) is None:
+            _warn_pick_once("mss-handle-missing-%d" % self.monitor,
+                            "显示器 #%d 的 mss 句柄缺失（初始化失败？），几何无基准，"
+                            "按序号回退 dxgi", self.monitor)
+            return (0, self.monitor - 1)
         rect = self._monitor_rect(self.monitor)
         if rect is None:
-            _warn_pick_once("rect-missing",
+            _warn_pick_once("rect-missing-%d" % self.monitor,
                             "显示器 #%d 的矩形不可用（mss 初始化失败？），按序号回退 dxgi",
                             self.monitor)
             return (0, self.monitor - 1)
@@ -382,8 +652,8 @@ class CaptureManager:
     def _grab_once(self):
         if self._effective == "dxgi" and self._camera is not None:
             if self.region:
-                # capture-003：mss 语义的绝对坐标 → dxcam 需要的显示器内相对坐标；
-                # 区域跨出所选显示器时本帧回退 mss（dxcam 会返回永久黑屏）
+                # capture-003/capture-011：mss 语义的绝对坐标 → dxcam 需要的显示器内
+                # 相对坐标；区域跨出所选显示器、或显示器几何取不到时本帧回退 mss
                 reg, out_of_range = self._dxgi_region()
                 if out_of_range:
                     return self._grab_mss()
@@ -392,20 +662,77 @@ class CaptureManager:
         return self._grab_mss()
 
     def _grab_mss(self):
-        """mss 抓帧（区域为虚拟桌面绝对坐标；也是 dxgi 区域越界时的回退路径）。"""
-        if self._mss is None:
+        """mss 抓帧（区域为虚拟桌面绝对坐标；也是 dxgi 区域越界时的回退路径）。
+
+        capture-012（2026-10-10）：整屏分支原本直接读 `self._mss.monitors[idx]`，
+        那是每实例只算一次的缓存；显示设置变更后旧矩形继续被传给 `grab()`，
+        而 GDI 的 `BitBlt` 在源矩形完全离屏时返回成功却不写入目标 DIB
+        （`mss/windows/gdi.py:380`）——于是既不抛异常也不返回 None，共享端安静地
+        重复发送旧画面。这里改为先过一遍几何探针（`_monitor_rect` 内部已做漂移
+        检测与 mss 缓存作废），探针不可用时按 mss 语义回落到 `self._mss.monitors`。
+
+        区域分支原先也直接透传配置矩形，理由是"区域不是显示器枚举结果"。**这个理由
+        是错的**：区域矩形的**取值**来自配置没错，但它在虚拟桌面里**是否还有效**完全
+        取决于当前几何。用户把分辨率从 1920x1080 改到 1280x720，原来框住整屏的区域
+        就有一部分跑到了桌面外——而 mss 对离屏源矩形同样是"成功且不写入"
+        （`mss/windows/gdi.py:380`）。实测（`grab` 同尺寸离屏源）返回的是上一次抓帧
+        的**逐字节副本**，部分越界时越屏部分是全零：同样不抛异常、不返回 None，画面
+        冻结或出现黑边。判据与整屏分支同源，因此这里也过一遍探针把区域夹回桌面内。
+        """
+        if getattr(self, "_mss", None) is None:
             return None
         if self.region:
             mon = {"left": int(self.region["left"]), "top": int(self.region["top"]),
                    "width": int(self.region["width"]), "height": int(self.region["height"])}
+            mon = self._fit_region_to_desktop(mon)
         else:
-            idx = self.monitor if 0 <= self.monitor < len(self._mss.monitors) else 1
-            mon = self._mss.monitors[idx]
+            # capture-012：探针可用时只信探针——它说"这块屏不存在了"就必须放弃，
+            # 绝不能退回 mss 的陈旧缓存去抓一块已拔除的显示器：BitBlt 在离屏源上
+            # 会"成功且不写入"，画面永久冻结，那正是本条要消灭的形态。探针不可用
+            # 才退回（此时 mss 缓存仍是当前有效几何）。
+            probed = probe_geometry()
+            if probed:
+                idx = self.monitor if self.monitor > 0 else 0
+                # 必须在 `_monitor_rect` 之前取：它内部会跑 `_refresh_geometry`
+                # 把 `_geometry` 刷成新值，之后再取就分不出"本来就越界"和
+                # "刚被拔掉"了。
+                prev = getattr(self, "_geometry", None)
+                rect = self._monitor_rect(idx, stale_ok=True)
+                if rect is None:
+                    # 序号越界。要分清是"屏被拔了"还是"配置本来就写错了"——
+                    # 两者都表现为取不到矩形，但后果相反：
+                    #   - 上一次探测时这个序号**有效** → 屏是真被拔掉的。抓它会
+                    #     让 BitBlt 在离屏源上"成功且不写入"，画面永久冻结。
+                    #   - 上一次探测时就**已越界**（或首次探测，从未有效）→ 配置
+                    #     错误，不是硬件变化。丢掉这一帧会黑屏且不会自愈
+                    #     （host 侧 none_rebuild_requires_dead=True 会跳过空帧重建），
+                    #     比降级出图糟糕得多。
+                    was_valid = bool(prev) and idx < len(prev)
+                    if was_valid:
+                        _warn_pick_once("monitor-gone-%d" % self.monitor,
+                                        "显示器 #%d 已不存在（被拔除或几何变更），"
+                                        "本帧不出图", self.monitor)
+                        return None
+                    # 降级目标与告警里的块数必须同一口径：探针保证"并集 + ≥1 块"
+                    # 至少两项（`_probe_geometry_uncached` 在 found 为空时返回 None），
+                    # 这里的 else 只是防御。
+                    n_monitors = max(len(probed) - 1, 1)
+                    _warn_pick_once("monitor-out-of-range-%d" % self.monitor,
+                                    "配置的显示器序号 #%d 超出当前范围（共 %d 块），"
+                                    "已回退到第 1 块；请修正 host.capture.monitor",
+                                    self.monitor, n_monitors)
+                    mon = dict(probed[1] if len(probed) > 1 else probed[0])
+                else:
+                    mon = {"left": rect[0], "top": rect[1],
+                           "width": rect[2], "height": rect[3]}
+            else:
+                idx = self.monitor if 0 <= self.monitor < len(getattr(self, "_mss", None).monitors) else 1
+                mon = self._mss.monitors[idx]
         img = np.asarray(self._mss.grab(mon))  # BGRA
         return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     def close(self):
-        if self._mss is not None:
+        if getattr(self, "_mss", None) is not None:
             try:
                 self._mss.close()
             except Exception:

@@ -16,10 +16,18 @@ import time
 
 import logger
 import pipeline
+
 # B5：配置数值转换与区域归一复用公共实现，避免观看端上传路径继续用裸 int()/float()。
 # C1（优化方案 2026-09-17）：这三个工具已从 host 下沉到 common——原先反向 import host
 # 会把整个共享端巨模块拖进观看端进程，且 host/viewer/share 三套 clamp 互为副本。
-from common import normalize_region, pack_frame, pack_video, safe_float, safe_int
+from common import (
+    SeqCounter,
+    normalize_region,
+    pack_frame,
+    pack_video,
+    safe_float,
+    safe_int,
+)
 
 log = logger.get_logger()
 
@@ -77,6 +85,9 @@ class ScreenShareSession:
             target_width=self._target_width, quality=self._quality, name=name,
             on_build=self._on_encoder_built)
         self._thread = None
+        # net-045（2026-10-09）：本路上行视频的单调递增帧序号（协议 v2.4）。
+        # 每条流一个计数器——序号只在同一路流内比较，跨流共用会把缺口算错。
+        self._seq = SeqCounter()
         # B8：会话自行终止的原因。Channel 检测到 not alive 时据此在状态栏说明原因，
         # 而不是让用户以为"还在共享"（原实现既不通知对端也不通知本端 UI）。
         self.exit_reason = None
@@ -239,7 +250,12 @@ class ScreenShareSession:
         if ef is None:
             return None
         if ef.is_video:
-            msg = pack_video(ef.data, ef.ts, ef.is_key, codec=ef.codec_id)
+            # getattr 兜底：测试里大量 `ScreenShareSession.__new__(...)` 绕过 __init__
+            # 造实例（仓库既有约定），缺 _seq 时按 v2.3 无序号布局出包——本就向后兼容，
+            # 好过 AttributeError 打断采集线程。
+            _seq = getattr(self, "_seq", None)
+            msg = pack_video(ef.data, ef.ts, ef.is_key, codec=ef.codec_id,
+                             seq=_seq.next() if _seq is not None else None)
         else:
             msg = pack_frame(ef.data, ts_us)
         if not self._send_msg(msg):
@@ -282,8 +298,10 @@ class ScreenShareSession:
             if not is_key:
                 # codec-004 同款：强制 IDR 未生效（编码器返回 P 帧）时不发，保留请求重试
                 return False
+            _seq = getattr(self, "_seq", None)
             if self._send_msg(pack_video(nal, out_ts, True,
-                                         codec=self._fe.encoder.codec_id)):
+                                         codec=self._fe.encoder.codec_id,
+                                         seq=_seq.next() if _seq is not None else None)):
                 log.info("频道[%s] 静止期响应关键帧请求（%d 字节）",
                          self._name, len(nal))
                 return True

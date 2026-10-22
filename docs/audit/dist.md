@@ -32,6 +32,18 @@ dist-023｜删除恒真的 if exist "%SETUP_EXE%" 与不可达 else｜—（构�
 dist-024｜Inno 版本检测读卸载注册表 DisplayVersion，<6.3 明确报原因｜—（构建脚本）
 dist-025｜编译前清理非当前版本的 dist\TeamVision-Setup-*.exe；fps-host.spec 硬校验 dxcam/comtypes（见修复记录 §7.4）｜—（构建脚本/打包）
 
+第 8 轮（2026-10-10，`docs/audit/round8/`）：
+
+dist-026｜**ruff 门禁不覆盖 `tests/`**：`ruff check *.py` 只扫根目录，实测 `ruff check tests` 积 **89 处**违规，其中 `F821 Undefined name`（就是 T-21 的 `fy2`）与 `F823` **正是本轮把 ruff 从"三个核心文件"扩到"全部根模块"时要防的那两类**——见 `pyproject.toml` 顶部那段"窄范围换来的全绿没有防护力"的自述。也就是说同一类失误在扩范围之后又发生了一次，只是换到了 `tests/`。现把口径改为 `ruff check *.py tests`（CI 与本地同一条命令），89 处清零｜—（CI 自身）
+
+第 9 轮（2026-10-10 后，"部署与更新"增量）：
+
+dist-027｜**"最新标签"不等于"本机这一端有新版本"**：一旦共享端/观看端拆成两个安装包分别发版，`releases/latest` 只会是其中一端的新版本，另一端的 `latest` 停在更旧的 tag 上——按标签判定的 `check_update` 从此对该端**永不提示**。新增 `update_check.check_release(role, ...)`：在第一页发布里按资产文件名（Host/Viewer，按独立词匹配）挑出本机角色的最高版本；一条角色都认不出时退回标签口径，认得出却没有本端包时返回"无更新"（不把对端的包装给用户）；API 失败返回 `source="none"`、预发布标签跳过、24h 缓存按角色区分。**当前不接线**（现发布形态仍是单包），拆包落地时由它接管文案生成｜tests/test_round10_release_check.py
+
+dist-028｜安装链两处口径缺口：(a) `installer.iss` 的 AppVersion / OutputBaseFilename / 文件头是手抄版本，漏改一处就产出"陈旧版本号"的安装包（第 67 条同族），且整条链在 CI 之外；(b) `[UninstallDelete]` 用 `filesandordirs` 整目录删除 `%LOCALAPPDATA%\TeamVision`——那是同机两端**共用**的数据目录，卸掉一端会静默清空另一端（拆包后必现，与"卸载要清凭据"的要求也不是同一件事）。现 (a) 三处纳入单测与 `common.APP_VERSION` 逐条比对；(b) 改为 `UninstallablePathsDataFiles`（Inno Setup 6.3+，卸载前逐项询问）｜tests/test_round9_installer.py
+
+dist-029｜**mypy 门禁的存量红登记**：`pyproject.toml` 的 4 模块清单（第 8 轮未提交改动）带来 5 条存量错误——`codec.py` 的 av 可选导入把模块/类型名赋 None（3 条）、`_WARNED_ONCE: set` 与 `_PICK_WARNED: set` 缺类型实参（2 条）；按 HEAD 的 pyproject（只查 common.py）为绿，说明这是清单扩面时没跑过的红。本轮写范围不动这些行，改为在 `pyproject.toml` 里按错误类别 `disable_error_code` 显式放行并写明修法——**代价是 `assignment`/`misc`/`var-annotated` 三类在 CI 里整体不可见**，修掉 5 处后必须删掉这三行｜—（CI 自身）
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 dist 的条目。一行一条 `第 N 条｜简述`。

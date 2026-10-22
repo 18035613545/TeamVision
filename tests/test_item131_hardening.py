@@ -196,7 +196,7 @@ class TestLegacyConfigUpgrade(unittest.TestCase):
         self.assertEqual(cfg["host"]["fps"], 20)
         self.assertEqual(cfg["viewer"]["display_width"], 300)
         # 磁盘上也写回了，并打上版本号（只迁移一次）
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             on_disk = json.load(f)
         self.assertEqual(on_disk["config_version"], common.CONFIG_VERSION)
         self.assertEqual(on_disk["host"]["listen_host"], "127.0.0.1")

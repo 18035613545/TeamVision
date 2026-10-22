@@ -9,7 +9,7 @@ from unittest import mock
 import splash
 
 
-class _FakeWin(object):
+class _FakeWin:
     """假 Toplevel：记录 destroy 是否被调用；其余配置方法为 no-op。"""
 
     def __init__(self):

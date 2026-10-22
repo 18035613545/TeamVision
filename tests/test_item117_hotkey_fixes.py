@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """第 117 条回归：热键注册结果上屏、频道步进回绕、穿透样式不抛、退出释放热键。"""
-import threading
 import unittest
 from unittest import mock
 

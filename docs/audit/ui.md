@@ -53,6 +53,22 @@ ui-044｜HostConsole 构造失败时销毁已建的 Tk root（回退命令行不
 ui-045｜账户面板 refresh 加异常保护（手改 created 不再让面板永久空白且零提示）｜—
 ui-046｜删除死接口：FrameEncoder(width,height)、VideoEncoder(rate_control) 及 cbr 死分支、frame_sent/_rebuilt_at_frame；palette/mask_secret 经复核保留（见修复记录 §7）｜tests/test_optimize_stage2.py + tests/test_ui_common.py
 
+第 8 轮（2026-10-10，`docs/audit/round8/`）：
+
+ui-047｜`_apply_probe_proto` 的 `_chal_capable` 对 `proto[1]` **缺类型保护**：同一函数第 426 行已按"真 int 且非 bool"把次版本收进 `host_minor`，第 431 行却仍拿原始 `proto[1]` 比大小——服务端回包写成 `[2, "4"]` / `[2, null]` 时抛 `TypeError`，被 `_authenticate` 的 except 记成「认证通信失败: '>=' not supported…」，每次重连复现，且这次调用的状态是**半更新**的（`_host_minor`/`_expect_seq` 已覆盖、`_chal_capable` 保持旧值）。改成 `try/except TypeError → False`——**刻意不收窄判据**，否则会把 JSON 里的 `[2, 4.0]`（float）从 True 翻成 False，而那与本条无关｜tests/test_round8_net_ui.py
+
+ui-048｜net-046 新增调用点的注释把**可达路径写反**：注释声称它服务"带凭据的 LOGIN/REGISTER"，实际只有 `Act.PROBE` 分支（`_anon_ok` 重连与首次无凭据探测）能走到；带凭据的登录在 `_chal_capable is None` 时必先经 1086 分支的探针。调用点本身**必要且正确**，只订正注释——否则下一位维护者按注释推理会改错地方｜tests/test_round8_net_ui.py
+
+第 9 轮（2026-10-10 后，"部署与更新 / 观看端体验"增量）：
+
+ui-049｜更新提示只有一句话、没有出口：`check_update` 的返回文案不带地址，「关于」窗口的文档链接是不可点的纯 Label——用户知道有新版，还得自己搜仓库。现文案带 release 页面地址、两端发现新版时出现「前往下载 / 下载新版」按钮（`update_check.open_url` 只放行 http(s)），浏览器拉不起来时自动复制地址；顺带修掉一个同族缺口：共享端取消勾选「检查更新」时，状态栏里刚发现的提示会被"更新检查已关闭"直接覆盖｜tests/test_round9_update_links.py
+
+ui-050｜悬浮窗宽度/透明度只能拖两个滑块；且启动时的配置夹紧口径（宽度 1~4096、alpha 0~1）与滑块口径（160~960、30%~100%）不同，手改过的配置能绕过滑块下界。新增「大宽屏 / 标准 / 小地图」布局预设（按屏幕可用宽夹紧、透明度守 30% 下限），并把四处字面量收成 `WIDTH_MIN/MAX`、`ALPHA_MIN/MAX`｜tests/test_round9_layout_presets.py
+
+ui-051｜观看端「一键诊断」只能复制纯文本，贴进聊天工具后折成一团。新增「复制富文本」（CF_HTML），不支持时退回纯文本并在状态栏说明｜—（纯 UI，Tk 剪贴板依赖；未进 CI）
+
+ui-052｜ui-042 的"几何未变即跳过"只比位置串：位置不变而**高度**变了（新增行、状态文本换行）时面板被钉在旧高度、底部留空白。现在同位置下补比实际宽高（`_panel_auto_size`），记过尺寸之前保持 ui-042 的跳过行为｜tests/test_panel_float_no_overlap.py（原用例仍绿，未新增专测——现有夹具的宽高恒定，钉不住"高度变化"这一面）
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 ui 的条目。一行一条 `第 N 条｜简述`。

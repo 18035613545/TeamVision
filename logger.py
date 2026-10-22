@@ -55,6 +55,28 @@ _initialized = False
 _init_lock = threading.Lock()
 
 
+def _bootstrap_note(msg, *args):
+    """在**还没有任何 handler 挂上**的阶段输出一次提示（dist-020，2026-10-09）。
+
+    这里不能用 `logging.getLogger(...)`：`_DateRotatingFileHandler.__init__` 里就会调
+    `_prune_old`，此时全局 logger 还没挂上文件/控制台 handler，走它等于把信息丢掉；
+    而 `_prune_old` 也可能被 `emit` 在跨天时调用，从 handler 内部再回灌全局 logger
+    会形成"打日志 → 触发 emit → 再打日志"的自反馈。
+
+    dist-019 的跳过分支原本写的是 `log.debug(...)`，而 `log` 在本模块从未定义
+    （ruff F821）：只要真有一个删不掉的文件，这行就抛 NameError，从 `__init__`
+    一路冒到 `setup_logger` 的 `except Exception: pass` 被吞掉，结果是文件 handler
+    根本没挂上——而 README 恰恰引导用户提交 `logs\\app_*.log` 排障。
+    因此这里退到唯一此时可用的通道：stderr。windowed exe 下 stderr 为 None，一并挡住。
+    """
+    text = (msg % args) if args else msg
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write("[sakura] %s\n" % text)
+    except Exception:
+        pass   # 提示本身失败绝不能反过来影响主流程
+
+
 class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """按日期滚动的文件日志 handler：跨午夜自动切换到新日期的日志文件。
 
@@ -148,7 +170,8 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
                     # ——首个删不掉的文件（被占用：同机另一端正在写的当日文件、只读、
                     # 杀软/索引器持句柄，实测 WinError 32）就让"绝对上界 120 文件/64MiB"
                     # 整轮失效、回到它要根治的膨胀。改为跳过该文件继续处理其余候选。
-                    log.debug("日志清理跳过 %s（被占用/只读？）", name)
+                    # dist-020（2026-10-09）：这行原本是 `log.debug(...)`，`log` 未定义（F821）。
+                    _bootstrap_note("日志清理跳过 %s（被占用/只读？）", name)
                     continue
             # ③ dist-018（2026-09-24）：诊断包（TeamVision-diag-*.zip）也落在 logs 目录，
             #    而本函数的筛选口径只认 `app_*` + `.log` → 多次导出（崩溃排障常连点几次）
@@ -167,7 +190,7 @@ class _DateRotatingFileHandler(logging.handlers.RotatingFileHandler):
                 try:
                     os.remove(os.path.join(self._log_dir, name))
                 except OSError:
-                    log.debug("诊断包清理跳过 %s（被占用？）", name)
+                    _bootstrap_note("诊断包清理跳过 %s（被占用？）", name)
         except OSError:
             pass
 
@@ -311,8 +334,11 @@ def _setup_logger_locked(logger, level):
                 )
                 logger.addHandler(file_handler)
             except Exception:
-                # 文件日志不可用（权限/占用）：降级为仅控制台，绝不让 import 期崩溃
-                pass
+                # 文件日志不可用（权限/占用）：降级为仅控制台，绝不让 import 期崩溃。
+                # dist-020（2026-10-09）：原来是 `pass`，失败完全静默——用户看到"日志没了"
+                # 却查不到任何原因。现在走 stderr 记一条（此刻 logger 还没有 handler 可用）。
+                _bootstrap_note("文件日志 handler 构造失败，本次仅输出到控制台：%s",
+                                sys.exc_info()[1])
 
         # 控制台 handler：windowed 打包（sys.stdout 为 None）时跳过，仅保留文件日志；
         # 从带管道的终端启动 windowed exe 时 stdout 句柄可能无效（flush 抛 OSError），一并吞掉

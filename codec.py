@@ -57,7 +57,7 @@ _SW_PRESETS = frozenset({
 })
 
 #: 一次性告警集（codec-019 等）：同一 key 只报一条
-_WARNED_ONCE = set()
+_WARNED_ONCE: set = set()
 
 
 def _warn_once(key, msg, *args):
@@ -342,8 +342,45 @@ class VideoEncoder:
             self._install_ctx(ctx, name, bitrate)
             return True
 
+    def set_size(self, width, height):
+        """分辨率档位变化（显示分辨率/缩放变化）时重建编码器到新尺寸；返回是否生效。
+
+        第 11 轮：`_encode_locked` 里原本"尺寸不符就地重建"是**锁内同步**的，且失败
+        时会按新尺寸落账再自毁——一次 1080p↔4K 切换要每帧付一次完整拆装（93–110ms）。
+        这里按 set_fps 的同一套契约重做：锁外构造、锁内切换、失败回滚尺寸并让调用方
+        落负缓存退避。pipeline.FrameEncoder 按返回值记账，不再每帧重试。
+        """
+        width, height = int(width), int(height)
+        with self._lock:
+            if self._closed or self._permafailed or self._ctx is None:
+                return False
+            if (width, height) == (self._ctx.width, self._ctx.height):
+                return True
+            if self._reconfiguring:
+                return False          # 另一次重建正在锁外构造（codec-017 同口径）
+            self._reconfiguring = True
+            prev = (self._w, self._h)
+            self._w, self._h = width, height
+            bitrate = self._last_bitrate
+            names = self._pick_encoder()
+        try:
+            ctx, name = self._create_ctx_with(names, bitrate)
+        finally:
+            with self._lock:
+                self._reconfiguring = False
+        if ctx is None:
+            with self._lock:
+                self._w, self._h = prev     # 回滚：旧上下文仍按旧尺寸出帧
+            return False
+        with self._lock:
+            if self._closed or self._permafailed:
+                self._retire_ctx(ctx)
+                return False
+            self._install_ctx(ctx, name, bitrate)
+            return True
+
     def encode(self, bgr, raw_ts=None, force_key=False):
-        """编码一帧 BGR 图像（线程安全：与 set_bitrate/set_fps 串行执行）。
+        """编码一帧 BGR 图像（线程安全：与 set_bitrate/set_fps/set_size 串行执行）。
 
         返回 (annexb_bytes, is_keyframe, encode_ms, out_ts)；
         编码器不可用/尺寸不匹配重建失败时返回 None。
@@ -352,7 +389,7 @@ class VideoEncoder:
 
         强制关键帧通过 NVENC 的 forced-idr=1 选项 + frame.pict_type=I 在既有上下文上
         原地产生真 IDR（实测支持），无需重建编码器；软件编码器（x264/x265）同样用
-        pict_type=I 兜底。重建只发生在帧尺寸变化或码率调整超阈值时。
+        pict_type=I 兜底。帧尺寸变化由 set_size 在锁外重建（见其 docstring）。
         """
         with self._lock:
             return self._encode_locked(bgr, raw_ts, force_key)
@@ -363,8 +400,9 @@ class VideoEncoder:
         if bgr is None or bgr.size == 0:
             return None
         h, w = bgr.shape[:2]
-        # 帧尺寸变化（自适应缩放）时重建编码器：先更新目标尺寸再重建，
-        # 否则重建仍沿用旧尺寸，导致编码分辨率不随缩放变化（PyAV 静默缩放回原尺寸）
+        # 帧尺寸变化（自适应缩放）时重建编码器：通常已由 set_size 在锁外处理；
+        # 这里只兜"调用方没先 set_size"的路径，仍保持锁内重建（失败即丢上下文，
+        # 由 pipeline 的重建/退避接管），不会把旧尺寸的包发出去。
         if (w, h) != (self._ctx.width, self._ctx.height):
             self._w, self._h = w, h
             self._recreate(self._last_bitrate)

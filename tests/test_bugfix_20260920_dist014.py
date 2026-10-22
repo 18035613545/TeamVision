@@ -268,6 +268,133 @@ class TestProductionCallSitesPassPid(unittest.TestCase):
         self.assertEqual(seen["thread"], "diag-export")
 
 
+class TestHostUiExportFailurePath(unittest.TestCase):
+    """ui-023：导出**失败**路径必须真的把错误送回主线程（原来一直是假绿）。
+
+    同文件 `test_host_ui_actually_passes_pid_at_runtime` 用
+    `_post_ui = lambda fn: posted.append(fn)`（只登记不执行）且 mock 的
+    `build_report_zip` 从不抛异常 —— 于是 `except` 分支一次都没进过，
+    "回调能不能活到主线程"这件事根本没人验证。
+
+    旧实现是：
+        except Exception as e:
+            self._post_ui(lambda: self._finish_export(None, "", e))
+    `except ... as e` 块尾会隐式解绑 `e`，而 `_post_ui` 走
+    `ui_common.post_to_ui` 的 `root.after(0, fn)` 延迟执行，回调真正跑到时 `e`
+    早已不存在 → NameError。后果：失败弹框永不出现，且 `_finish_export` 是
+    `_diag_exporting = False` 的唯一复位点，回调一崩重入守卫永久停在 True。
+    """
+
+    def _console(self, posted):
+        console = host_ui.HostConsole.__new__(host_ui.HostConsole)
+        console._diag_exporting = False
+        console.root = None
+        console.runtime = _SnapshotRuntime()
+        console._set_status = lambda *a: None
+        # 只登记，**绝不**就地执行 —— 这是复现缺陷的关键。
+        # 若在 except 块内同步执行，`e` 此刻仍然绑定，回调一定能跑通，
+        # 缺陷就被夹具自己遮住了。真实的 `_post_ui` 走 ui_common.post_to_ui 的
+        # `root.after(0, fn)`，回调必然发生在 except 块退出**之后**。
+        console._post_ui = posted.append
+        return console
+
+    @staticmethod
+    def _settle(gate, timeout=5.0):
+        """等工作线程真正跑完（= except 块已退出，`e` 已被解绑）。
+
+        这是唯一能稳定复现的时序：等到线程结束再执行回调，等价于 Tk 事件循环
+        在工作线程退出之后才处理 root.after 排队的那一批。
+        """
+        if not gate.wait(timeout):
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not any(t.name == "diag-export" and t.is_alive()
+                       for t in threading.enumerate()):
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_failure_callback_survives_and_resets_guard(self):
+        posted = []
+        console = self._console(posted)
+        gate = threading.Event()
+
+        def boom(*a, **kw):
+            gate.set()
+            raise RuntimeError("磁盘写满了")
+
+        tmp = tempfile.mkdtemp(prefix="tv-diag-fail-")
+        with mock.patch.object(host_ui.diag, "build_report_zip", boom), \
+                mock.patch.object(host_ui.diag, "build_report_text",
+                                  lambda *a, **kw: "report"), \
+                mock.patch.object(host_ui, "data_dir", lambda: tmp), \
+                mock.patch.object(host_ui, "messagebox", mock.Mock()) as mb:
+            console._on_export_diag()
+            self.assertTrue(self._settle(gate), "导出工作线程从未跑完")
+
+            self.assertTrue(posted, "失败路径没有回调投回主线程")
+            # 旧实现在这里抛 NameError：lambda 捕获的 e 已在 except 块尾被解绑
+            for fn in posted:
+                fn()   # ← 相当于 Tk 事件循环执行 root.after 队列
+
+        self.assertFalse(
+            console._diag_exporting,
+            "导出失败后 _diag_exporting 没复位（ui-008 重入守卫永久卡死，"
+            "此后每次点击只得到「上一次诊断包仍在导出中」）")
+        self.assertTrue(mb.showerror.called, "导出失败没有弹错误框")
+        self.assertIn("磁盘写满了", mb.showerror.call_args[0][1],
+                      "弹框里没有真正的失败原因（except 变量被解绑后拿到的是别的）")
+
+    def test_failure_then_second_export_is_not_blocked(self):
+        """失败之后必须还能再导出一次（守卫复位的可观测证据）。"""
+        posted = []
+        console = self._console(posted)
+        tmp = tempfile.mkdtemp(prefix="tv-diag-fail2-")
+        calls = []
+        gates = [threading.Event(), threading.Event()]
+
+        def make_recorder(fn):
+            def rec(*a, **kw):
+                calls.append(fn)
+                gates[min(len(calls) - 1, 1)].set()
+                return fn(*a, **kw)
+            return rec
+
+        def first_boom(*a, **kw):
+            raise RuntimeError("第一次失败")
+
+        def ok(dest_dir, **kwargs):
+            return os.path.join(dest_dir, "second.zip")
+
+        with mock.patch.object(host_ui, "data_dir", lambda: tmp), \
+                mock.patch.object(host_ui, "messagebox", mock.Mock()):
+            with mock.patch.object(host_ui.diag, "build_report_text",
+                                  lambda *a, **kw: "report"), \
+                    mock.patch.object(host_ui.diag, "build_report_zip",
+                                      make_recorder(first_boom)):
+                console._on_export_diag()
+                self.assertTrue(self._settle(gates[0]),
+                                "第一次导出工作线程从未跑完")
+                for fn in posted:
+                    fn()                       # 第一次：执行失败回调
+                posted.clear()
+
+            self.assertFalse(console._diag_exporting, "第一次失败后守卫未复位")
+            # 第二次：压缩这次成功
+            console.root = mock.Mock()
+            with mock.patch.object(host_ui.diag, "build_report_zip",
+                                  make_recorder(ok)):
+                console._on_export_diag()
+                self.assertTrue(self._settle(gates[1]),
+                                "失败后再点一次没起新的导出（守卫卡死）")
+                for fn in posted:
+                    fn()                       # 第二次：执行成功回调
+                posted.clear()
+
+        self.assertEqual(len(calls), 2)
+
+
 class _SnapshotRuntime:
     """host_ui._on_export_diag 要的两个面：get_snapshot() 与 cfg（都是真实读法）。"""
 

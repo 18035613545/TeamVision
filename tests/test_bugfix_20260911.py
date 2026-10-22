@@ -36,6 +36,7 @@ import types
 import unittest
 from unittest import mock
 
+import codec as codec_mod
 import common
 import host
 import logger as logger_mod
@@ -43,8 +44,6 @@ import pipeline
 import screen as screen_mod
 import share as share_mod
 import viewer
-import codec as codec_mod
-
 
 # ------------------------------------------------------------------ 公共替身
 
@@ -341,7 +340,7 @@ class TestA3CredentialWait(unittest.TestCase):
     def test_eviction_wakes_evicted_waiter(self):
         owner = _CredOwner()
         stale = []
-        for i in range(4):
+        for _ in range(4):
             done = threading.Event()
             box = {}
             owner._cred_requests.put((object(), done, box))
@@ -842,7 +841,10 @@ class TestB10AuthTimeout(unittest.TestCase):
     def test_floor_clamps_small_value(self):
         sock = FakeSock()
         warned = []
-        with mock.patch.object(host, "recv_msg", side_effect=socket.timeout("超时")), \
+        # 超时用 socket.timeout（= py3.10 的 TimeoutError 别名）：这里复刻的是调用点
+        # 的原始异常类型，改成别名写法会让"调用方靠 except OSError 接住"这条前提失真。
+        timeout_exc = socket.timeout("超时")  # noqa: UP041
+        with mock.patch.object(host, "recv_msg", side_effect=timeout_exc), \
                 mock.patch.object(host.log, "warning",
                                   side_effect=lambda *a, **kw: warned.append(a)):
             ok, user = host._auth_required_phase(

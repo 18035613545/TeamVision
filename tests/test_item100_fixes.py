@@ -18,7 +18,6 @@
 13) display_width/alpha 未校验 → 构造时夹紧（viewer.py）
 14) region 缺键 → _region_text 不再 KeyError（host_ui.py）
 """
-import ast
 import copy
 import inspect
 import socket
@@ -30,11 +29,10 @@ from unittest import mock
 
 import common
 import host
-import screen
-import viewer
 import host_ui
+import screen
 import ui_common
-
+import viewer
 
 # ---------------------------------------------------------------- 1) dxgi 色彩
 
@@ -260,7 +258,7 @@ class _TimeoutSock:
     def sendall(self, data):
         self.timeout_during_send.append(self._timeout)
         if self.fail:
-            raise socket.timeout("模拟发送超时")
+            raise socket.timeout("模拟发送超时")  # noqa: UP041 — 断言的是别名语义（如下一行）
 
 
 class _PlainSock:
@@ -515,15 +513,19 @@ class TestViewerDisplayClamp(unittest.TestCase):
             return viewer.ViewerApp(cfg)
 
     def test_zero_width_is_clamped(self):
-        self.assertEqual(self._app(display_width=0).display_width, 1)
-        self.assertEqual(self._app(display_width=-50).display_width, 1)
+        # 第 9 轮：宽度下限从"非正数兜到 1"收紧为与滑块/预设同一条线 WIDTH_MIN——
+        # 宽 1 时 calc_output_size 算出 0 宽仍会抛错（第 88 条同族），
+        # 而面板滑块本就提供不了 1~159 之间的值，构造期没有理由放进来
+        self.assertEqual(self._app(display_width=0).display_width, viewer.WIDTH_MIN)
+        self.assertEqual(self._app(display_width=-50).display_width, viewer.WIDTH_MIN)
         self.assertEqual(self._app(display_width="abc").display_width, 480)
         self.assertEqual(self._app(display_width="361").display_width, 361)
 
     def test_alpha_is_clamped(self):
         self.assertEqual(self._app(alpha="abc").alpha, 0.9)
         self.assertEqual(self._app(alpha=5).alpha, 1.0)
-        self.assertEqual(self._app(alpha=-1).alpha, 0.0)
+        # 第 9 轮：下限 0 → ALPHA_MIN（alpha=0 的置顶穿透窗在 Windows 上等于"消失"）
+        self.assertEqual(self._app(alpha=-1).alpha, viewer.ALPHA_MIN)
 
 
 if __name__ == "__main__":

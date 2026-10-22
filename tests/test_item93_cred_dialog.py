@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """第 93 条回归：认证对话框不得嵌套，且结果不得跨请求串。
 
 旧路径两处隐患：
@@ -25,7 +25,6 @@ import threading
 import unittest
 
 import viewer
-
 
 _VIEWER_PY = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viewer.py")
@@ -145,7 +144,7 @@ class TestPerRequestBoxNoCrossing(unittest.TestCase):
 class TestSharedSlotRemoved(unittest.TestCase):
     def test_no_cred_result_attribute_anywhere(self):
         # 第 93 条：共享结果槽 _cred_result 已彻底移除；任何 ._cred_result 属性读写都算回归。
-        with open(_VIEWER_PY, "r", encoding="utf-8") as f:
+        with open(_VIEWER_PY, encoding="utf-8") as f:
             tree = ast.parse(f.read(), filename=_VIEWER_PY)
         hits = [node.lineno for node in ast.walk(tree)
                 if isinstance(node, ast.Attribute) and node.attr == "_cred_result"]

@@ -13,6 +13,14 @@ _handle_ctrl 新增 watch_reject 分支，被拒源仍等于当前源时回落 l
 
 hermetic：__new__ 构造 Channel，patch viewer.send_msg 与 codec 模块的 VideoDecoder，
 stub _notify_share_error，绕开真实 socket/解码器/Tk。
+
+依赖声明（task-8，2026-10-10）：本文件 patch 的 `viewer.codec_mod` 是 viewer 的**惰性
+模块全局**（viewer.py:35 的哨兵初值，只有 `_load_heavy()` 才赋值，见 viewer.py:38-56）。
+此前本文件只 `import viewer`，单条跑法（`python -m unittest tests.test_item9_source_reject`）
+下 `codec_mod is None` → 11 例全红；全量 discover 时靠 `test_bugfix_20260924_round7.py` 等
+邻居先触发加载才绿——即回归保护**只在某种执行顺序下存在**。这里显式声明依赖，与
+`test_optimize_stage0/1.py`、`test_item91_panel_guard.py` 同款做法。
+不用 try/except 包加载：环境装不上重依赖时用例必须**明确报错**，静默跳过比顺序依赖更难发现。
 """
 import json
 import threading
@@ -20,6 +28,10 @@ import unittest
 from unittest import mock
 
 import viewer
+
+# `_load_heavy()` 在生产里由 main() 在 splash 之后调一次；这里补同一调用，把"本文件
+# 需要 viewer 的重依赖已就位"变成文件自身的前提，而不是指望别的模块先跑。
+viewer._load_heavy()
 
 
 class _FakeDecoder:
@@ -54,7 +66,12 @@ class _Recorder:
         return _FakeDecoder()
 
 
-def _channel(rec, peers, watch_source="local", sock=object()):
+# sock 默认值：模块级单例，语义等价于原来的内联 `sock=object()`（"没传 socket"标记），
+# 但避开 ruff B008（函数调用作默认值）。用单例而非字面量能让身份比较也稳定。
+_NO_SOCK = object()
+
+
+def _channel(rec, peers, watch_source="local", sock=_NO_SOCK):
     ch = viewer.Channel.__new__(viewer.Channel)
     ch.name = "test"
     ch.lock = threading.Lock()

@@ -79,7 +79,7 @@ class TestEncodeLoopGuard(unittest.TestCase):
         for path, _ in self._TARGETS:
             if path in self.parsed:
                 continue
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 self.parsed[path] = ast.parse(f.read(), filename=path)
         self.parents = {p: _parent_map(t) for p, t in self.parsed.items()}
         self.funcs = []

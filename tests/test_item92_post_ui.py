@@ -29,7 +29,6 @@ from unittest import mock
 
 import viewer
 
-
 _VIEWER_PY = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viewer.py")
 
@@ -103,7 +102,7 @@ class TestPostUiGuards(unittest.TestCase):
 # ============ Fix 2/3: 热键/诊断改走 _post_ui（AST 结构断言）============
 
 def _module_tree():
-    with open(_VIEWER_PY, "r", encoding="utf-8") as f:
+    with open(_VIEWER_PY, encoding="utf-8") as f:
         return ast.parse(f.read(), filename=_VIEWER_PY)
 
 
