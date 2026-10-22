@@ -25,12 +25,13 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
-; 第 9 轮（部署与更新）：用户数据（%LOCALAPPDATA%\TeamVision 下的配置/账户）在卸载时
-; **逐项询问**再删。旧版本靠 [UninstallDelete] 直接整目录抹掉——而该目录由同机两端共用，
-; 卸掉一端等于静默清空另一端的频道与账户。这里交给 Inno Setup 6.3+ 的标准询问机制：
-; 用户选"是"才删这两份数据文件（含 frp token / 口令哈希），选"否"则原样保留。
-; 安装目录内的残渣仍由下方 [UninstallDelete] 清理。
-UninstallablePathsDataFiles={localappdata}\TeamVision\accounts.json,{localappdata}\TeamVision\config.json
+; 第 9 轮（部署与更新）：卸载**不再静默删除用户数据**。旧版本在 [UninstallDelete] 里对
+; {localappdata}\TeamVision 做整目录 filesandordirs——那是同机两端共用的数据目录，
+; 卸掉一端等于清空另一端的频道与账户，且没有任何确认。现在该目录完全不进卸载清单，
+; 安装目录内的残渣才由下方 [UninstallDelete] 清理（见那里的说明）。
+; 注：本仓库此前计划用 Inno 的 UninstallablePathsDataFiles，但 Inno Setup **没有这个
+; 指令**（6.7.3 实编译报 "Unrecognized [Setup] section directive"），已撤回——
+; 保留那份"会编译失败"的写法比不写更误导。
 
 [Tasks]
 Name: desktopicon; Description: 创建桌面快捷方式; GroupDescription: 附加任务
@@ -63,9 +64,8 @@ Filename: "{app}\fps-viewer\fps-viewer.exe"; Description: 运行队友视野观�
 ; `{localappdata}\TeamVision`（整目录 filesandordirs）——那是 common.data_dir() 的
 ; 数据目录，同一台机器上的共享端与观看端**共用**它；按"拆包分别安装"的形态，
 ; 卸掉共享端会把观看端的频道列表、账户与日志一起抹掉，而且没有任何确认。
-; 用户自己的数据交给安装向导的"删除数据"选项（UninstallablePathsDataFiles）：
-; 卸载前会明确询问，选"是"才清那一份。凭据残渣的要求不变——选择保留时
-; config.json 里的 frp token 仍可被用户在向导里点名删除。
+; 现在该目录不在卸载清单里（Inno 6.7 没有"逐项询问再删"的指令，见 [Setup] 段说明），
+; 用户数据原样保留；凭据残渣的口径见 docs/install.md 的卸载一节。
 Type: files; Name: "{app}\accounts.json"
 Type: files; Name: "{app}\accounts.json.corrupt-*"
 Type: files; Name: "{app}\config.json"

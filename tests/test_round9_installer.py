@@ -6,9 +6,12 @@
 注释仍是手抄，打 1.6.0 时漏改其中一个，产物名就会停在旧版本上——而这条件在 CI
 之外，只有人工能发现。这里把 iss 纳入单测：三处都必须等于 APP_VERSION。
 
-另钉两条安装体验（第 9 轮"部署与更新"）：
-- 卸载必须让用户在删除前确认用户数据（UninstallablePathsDataFiles，Inno 6.3+）；
-- 卸载不得整目录删除两端共用的 `%LOCALAPPDATA%\\TeamVision`。
+另钉一条安装体验（第 9 轮"部署与更新"）：
+- 卸载不得整目录删除两端共用的 `%LOCALAPPDATA%\\TeamVision`（用户数据原样保留）。
+
+注意：曾尝试用 Inno 的 `UninstallablePathsDataFiles` 做"卸载前逐项询问"，但 Inno Setup
+6.7.3 实编译报 `Unrecognized [Setup] section directive`——**不存在这个指令**。因此这里
+反过来钉住：iss 里不得再出现它，免得"看起来更安全"的写法在下一次打包时才炸。
 """
 
 import os
@@ -57,13 +60,12 @@ class TestInstallerUninstall(unittest.TestCase):
     def setUp(self):
         self.text = _read_iss()
 
-    def test_uninstall_can_ask_before_deleting_data(self):
-        # Inno Setup 6.3+：列出"数据文件路径"后，卸载器会在删除它们之前逐项询问；
-        # 没有这一条，卸载就只剩静默删除或完全保留两种选择。
-        m = re.search(r"^UninstallablePathsDataFiles=(.+)$", self.text, re.M)
-        self.assertIsNotNone(m)
-        self.assertIn("{localappdata}\\TeamVision\\accounts.json", m.group(1))
-        self.assertIn("{localappdata}\\TeamVision\\config.json", m.group(1))
+    def test_uninstall_never_uses_nonexistent_directive(self):
+        # 反着钉：Inno 6.7.3 没有 UninstallablePathsDataFiles（实编译报未知指令），
+        # 写了就等于整包编译失败；用户数据一律保留，不再提供"卸载时顺带删除"。
+        for line in self.text.splitlines():
+            self.assertFalse(line.lstrip().startswith("UninstallablePathsDataFiles"),
+                             "installer.iss 用了 Inno 不存在的指令：%s" % line.strip())
 
     def test_never_wipes_shared_data_dir(self):
         # 只认两端共用的数据目录；{app} 下的清理仍允许（那是本安装目录自己的残渣）

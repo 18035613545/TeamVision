@@ -29,8 +29,9 @@
   `tests/test_round10_release_check.py`。
 - **安装包版本真源与卸载安全（dist-028）**：`installer.iss` 的 AppVersion / OutputBaseFilename /
   文件头三处纳入单测，必须等于 `common.APP_VERSION`；卸载不再整目录删除两端共用的
-  `%LOCALAPPDATA%\TeamVision`，改为 `UninstallablePathsDataFiles`（Inno Setup 6.3+）逐项询问
-  后再删。用例见 `tests/test_round9_installer.py`。
+  `%LOCALAPPDATA%\TeamVision`（该目录原样保留，凭据不再随卸载清理）。
+  最初写的 `UninstallablePathsDataFiles` 是**不存在的 Inno 指令**（6.7.3 实编译报未知指令），
+  已撤回并用单测反向钉住。用例见 `tests/test_round9_installer.py`。
 
 **观看端体验**
 - **布局预设（ui-050）**：控制台「设置」区新增「大宽屏 / 标准 / 小地图」，一次改完宽度与
