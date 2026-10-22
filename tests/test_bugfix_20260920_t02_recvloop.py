@@ -287,8 +287,13 @@ class TestAccountingCallbacks(unittest.TestCase):
 
     def test_msg_timeout_floor_is_honoured(self):
         """runtime.msg_timeout 越界时按 safe_float 钳到下限 1.0（不是回退 15 秒）。"""
-        box, _info = _capture_closures(msg_timeout=0.1)   # 低于下限 1.0 → 钳到 1.0
+        box, info = _capture_closures(msg_timeout=0.1)   # 低于下限 1.0 → 钳到 1.0
         on_buf, on_idle = box["on_buf"], box["on_idle"]
+        # 时钟必须钉到"刚收到数据"：on_idle 先判空闲超时，而 ClientInfo 构造时
+        # last_rx_at 取的是 time.monotonic()——Windows 上是**开机以来的秒数**。
+        # 不钉的话 1000.9 相对它可能是"未来"（本机开机久了）也可能是"过去 62 秒以上"
+        # （CI 机器刚开机），后者会先撞空闲超时，用例在 CI 必红、本机永远绿。
+        info.last_rx_at = 1000.0
         buf = bytearray(_partial_header())
         on_buf("pre_empty", buf, 1000.0, 0)
         self.assertIsNone(on_idle(1000.9, buf))

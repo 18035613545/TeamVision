@@ -1,10 +1,12 @@
-﻿; 队友视野 TeamVision v1.4.0 安装脚本 (Inno Setup 6)
+﻿; 队友视野 TeamVision v1.5.0 安装脚本 (Inno Setup 6)
 ; 使用方法: 运行 build_installer.bat，或手动执行 ISCC.exe installer.iss
 
 [Setup]
 AppId={{A7D3F9E1-5B2C-4E8A-9D1F-6C4B0A2E8F11}
 AppName=队友视野 TeamVision
-AppVersion=1.4.0
+AppVersion=1.5.0
+; 版本真源是 common.APP_VERSION：改版本时本文件的文件头注释 / AppVersion /
+; OutputBaseFilename 三处必须同步（tests/test_round9_installer.py 会逐条比对）。
 AppPublisher=TeamVision Team
 ; 第 102 条：默认改为**用户级安装**（{localappdata}\Programs，无需管理员）。
 ; 原来装到 {autopf}（= C:\Program Files）时，非管理员运行时既写不了 config.json
@@ -16,13 +18,19 @@ DefaultDirName={localappdata}\Programs\TeamVision
 PrivilegesRequired=lowest
 DefaultGroupName=队友视野
 OutputDir=dist
-OutputBaseFilename=TeamVision-Setup-1.4.0
+OutputBaseFilename=TeamVision-Setup-1.5.0
 SetupIconFile=assets\app.ico
 UninstallDisplayIcon={app}\fps-viewer\fps-viewer.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
+; 第 9 轮（部署与更新）：用户数据（%LOCALAPPDATA%\TeamVision 下的配置/账户）在卸载时
+; **逐项询问**再删。旧版本靠 [UninstallDelete] 直接整目录抹掉——而该目录由同机两端共用，
+; 卸掉一端等于静默清空另一端的频道与账户。这里交给 Inno Setup 6.3+ 的标准询问机制：
+; 用户选"是"才删这两份数据文件（含 frp token / 口令哈希），选"否"则原样保留。
+; 安装目录内的残渣仍由下方 [UninstallDelete] 清理。
+UninstallablePathsDataFiles={localappdata}\TeamVision\accounts.json,{localappdata}\TeamVision\config.json
 
 [Tasks]
 Name: desktopicon; Description: 创建桌面快捷方式; GroupDescription: 附加任务
@@ -51,8 +59,13 @@ Filename: "{app}\fps-viewer\fps-viewer.exe"; Description: 运行队友视野观�
 
 [UninstallDelete]
 ; 第 24 条：卸载清理凭据/配置残渣，避免二手或共用机器上留下 frp token 与口令哈希。
-; 冻结运行的数据目录是 %LOCALAPPDATA%\TeamVision（见 common.data_dir），
-; 一并删除；同时兜底清理可能残留在安装目录的旧版配置。
+; 第 9 轮（部署与更新）：**只清本安装目录**。旧版本在这里还列了
+; `{localappdata}\TeamVision`（整目录 filesandordirs）——那是 common.data_dir() 的
+; 数据目录，同一台机器上的共享端与观看端**共用**它；按"拆包分别安装"的形态，
+; 卸掉共享端会把观看端的频道列表、账户与日志一起抹掉，而且没有任何确认。
+; 用户自己的数据交给安装向导的"删除数据"选项（UninstallablePathsDataFiles）：
+; 卸载前会明确询问，选"是"才清那一份。凭据残渣的要求不变——选择保留时
+; config.json 里的 frp token 仍可被用户在向导里点名删除。
 Type: files; Name: "{app}\accounts.json"
 Type: files; Name: "{app}\accounts.json.corrupt-*"
 Type: files; Name: "{app}\config.json"
@@ -72,5 +85,4 @@ Type: files; Name: "{app}\fps-viewer\accounts.json.corrupt-*"
 Type: files; Name: "{app}\fps-viewer\config.json"
 Type: files; Name: "{app}\fps-viewer\config.json.corrupt-*"
 Type: filesandordirs; Name: "{app}\fps-viewer\logs"
-; 第 13 条：安装目录不可写时 logger 回退到 %LOCALAPPDATA%\TeamVision\logs，一并清理。
-Type: filesandordirs; Name: "{localappdata}\TeamVision"
+

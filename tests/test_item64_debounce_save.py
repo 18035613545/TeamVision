@@ -46,7 +46,7 @@ class FakeRoot:
         """触发当前所有挂起回调（快照后清空，模拟 0.5s 到期）。"""
         snapshot = list(self.pending.items())
         self.pending = {}
-        for aid, (delay, fn, args) in snapshot:
+        for _aid, (_delay, fn, args) in snapshot:
             fn(*args)
 
 

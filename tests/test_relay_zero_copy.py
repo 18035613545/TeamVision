@@ -178,7 +178,8 @@ class TestRecvLoopEndToEnd(unittest.TestCase):
         msg_j = common.pack_frame(b"\xff\xd8" + bytes(range(256)) * 3, ts=98)
         frames = self._run_loop(msg_v + msg_j + msg_v)
         self.assertEqual(frames, [msg_v, msg_j, msg_v])
-        for got, want in zip(frames, (msg_v, msg_j, msg_v)):
+        # strict=True：三条期望帧与实收帧必须一一对应，长度不等要当场报错而不是静默少比
+        for got, want in zip(frames, (msg_v, msg_j, msg_v), strict=True):
             self.assertIsInstance(got, bytes)
             self.assertEqual(bytes(got), want)   # 逐字节相等
 

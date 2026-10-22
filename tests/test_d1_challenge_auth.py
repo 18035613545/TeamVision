@@ -274,12 +274,41 @@ class D1HostStateMachine(unittest.TestCase):
             self.addCleanup(c.close)
             self.assertEqual(
                 rt.cfg["host"]["auth"].get("chal_response", "require"), "require")
-            c.send({"action": action, "user": "alice", "pass": PW,
-                    "proto": [2, 2]})
+            # net-047（2026-10-10）：刻意**不带** proto 字段，而不是原来的
+            # `proto: [2, 2]`。本用例验的是认证层（require 拒直发口令），而
+            # `PROTO_CHAL_MIN_MINOR=3` 这道门验的是"声明了 proto 的老客户端"；
+            # net-047 新增的 `VIDEO_SEQ_MINOR=4` 门在认证层**之前**就把 `[2,2]`
+            # 拦掉并给出更精确的文案（"请更新到 1.5.0"），于是原写法再也走不到
+            # 这里，测的就不是它自己声称的东西了。
+            # 不带 proto 才是 `allow_legacy` 真正服务的对象：1.3.x 及更早的观看端
+            # 早于 C2 的 proto 字段，根本不会带这个字段（见 install.md §5.2）。
+            # 顺带把这条边界钉住——**没有 proto 的老观看端不会被 net-047 误杀**。
+            c.send({"action": action, "user": "alice", "pass": PW})
             res = c.recv()
             self.assertFalse(res.get("ok"))
             self.assertEqual(res.get("msg"), "观看端版本过旧，请更新后重试")
             self.assertTrue(c.wait_closed())
+
+    def test_old_proto_client_gets_seq_message_not_chal_message(self):
+        """net-047：带 proto 的老客户端先撞帧序号门，且文案比挑战-应答门更精确。
+
+        这是两条门控的**先后与分流**契约。`[2,2]` 同时低于 `PROTO_CHAL_MIN_MINOR`
+        (3) 与 `VIDEO_SEQ_MINOR` (4)，若顺序反了，用户会被告知"升级到挑战-应答
+        版本"（1.4.0），而 1.4.0 观看端恰恰**仍解不了** v2.4 帧——按提示升级完
+        还是会花屏。
+        """
+        rt = self._rt(chal_mode="allow_legacy")
+        self.assertTrue(rt.accounts.register("alice", PW)[0])
+        c = _Client(rt, self._cfg("allow_legacy"))
+        self.addCleanup(c.close)
+        c.send({"action": Act.LOGIN, "user": "alice", "pass": PW, "proto": [2, 2]})
+        res = c.recv()
+        self.assertFalse(res.get("ok"))
+        self.assertEqual(res.get("msg"), common.PROTO_SEQ_REJECT_MSG)
+        # allow_legacy 只放宽"直发口令"这一层，不再放宽版本门控
+        self.assertNotEqual(common.PROTO_SEQ_REJECT_MSG,
+                            "观看端版本过旧，请更新后重试")
+        self.assertTrue(c.wait_closed())
 
     def test_allow_legacy_mode_accepts_plaintext_with_warning(self):
         rt = self._rt(chal_mode="allow_legacy")
@@ -289,8 +318,8 @@ class D1HostStateMachine(unittest.TestCase):
         warned = []
         with mock.patch.object(host.log, "warning",
                                side_effect=lambda *a, **kw: warned.append(a)):
-            c.send({"action": Act.LOGIN, "user": "alice", "pass": PW,
-                    "proto": [2, 1]})
+            # 同上：1.3.x 形态（无 proto 字段），net-047 不得拦它
+            c.send({"action": Act.LOGIN, "user": "alice", "pass": PW})
             res = c.recv()
         self.assertTrue(res.get("ok"), res)
         text = " ".join(str(x) for w in warned for x in w)
@@ -302,7 +331,7 @@ class D1HostStateMachine(unittest.TestCase):
         c = _Client(rt, {"chal_response": "nonsense"})
         self.addCleanup(c.close)
         self.assertTrue(rt.accounts.register("alice", PW)[0])
-        c.send({"action": Act.LOGIN, "user": "alice", "pass": PW, "proto": [2, 2]})
+        c.send({"action": Act.LOGIN, "user": "alice", "pass": PW})
         res = c.recv()
         self.assertFalse(res.get("ok"))
         self.assertIn("版本过旧", res.get("msg", ""))
@@ -461,6 +490,14 @@ class D1ViewerIntegration(unittest.TestCase):
         return ch
 
     def _serve_phase(self):
+        """起一个后台线程跑 host 的认证阶段，返回 (tap, out, thread)。
+
+        **调用方必须在断言前 join**（见 `_await_served`）：`out["result"]` 是在
+        `_auth_required_phase` **返回之后**才写入的，而观看端的 `_authenticate`
+        读到回包即可返回——两者之间只隔一次 GIL 切换。旧实现不 join，于是全量跑
+        （线程多、GIL 切换频繁）时断言偶尔先跑到，`out.get("result")` 拿到 `None`，
+        CI 随机变红；单独跑该用例 20 次（子进程）与 80 次（进程内）都不复现。
+        """
         a, b = socket.socketpair()
         tap = _Tap(b)
         tap.settimeout(20.0)
@@ -473,28 +510,41 @@ class D1ViewerIntegration(unittest.TestCase):
             except Exception as e:      # pragma: no cover
                 out["error"] = e
 
-        threading.Thread(target=target, daemon=True).start()
-        return tap, out
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+        # 用例中途失败时也要收尾，别把线程漏给后面的用例
+        self.addCleanup(th.join, 20.0)
+        return tap, out, th
+
+    def _await_served(self, out, th):
+        """断言前必须调用：等服务端认证阶段真正收尾，并把线程里的异常翻出来。"""
+        th.join(timeout=20.0)
+        self.assertFalse(th.is_alive(), "host 认证阶段线程 20 秒未收尾")
+        if "error" in out:
+            # 不翻出来的话，断言只会显示 `None != (True, 'carol')`，真因丢失
+            raise out["error"]
 
     def test_login_via_challenge_success_and_no_password_on_wire(self):
         self.assertTrue(self.rt.accounts.register("alice", PW)[0])
-        sock, out = self._serve_phase()
+        sock, out, th = self._serve_phase()
         self.addCleanup(sock.close)
         ch = self._channel(username="alice", _password=PW)
         with mock.patch.object(viewer, "_dpapi_encrypt", return_value=None):
             self.assertTrue(ch._authenticate(sock), ch.auth_msg)
+        self._await_served(out, th)
         self.assertEqual(out.get("result"), (True, "alice"))
         self.assertEqual(ch._chal_capable, True)
         self.assertNotIn(PW.encode("utf-8"), b"".join(sock.data))
         self.assertEqual(ch.auth_msg, "")
 
     def test_register_via_dialog_uses_challenge(self):
-        sock, out = self._serve_phase()
+        sock, out, th = self._serve_phase()
         self.addCleanup(sock.close)
         ch = self._channel()
         ch._ask_credentials = lambda: ("register", "carol", PW)
         with mock.patch.object(viewer, "_dpapi_encrypt", return_value=None):
             self.assertTrue(ch._authenticate(sock), ch.auth_msg)
+        self._await_served(out, th)
         self.assertEqual(out.get("result"), (True, "carol"))
         self.assertNotIn(PW.encode("utf-8"), b"".join(sock.data))
         rec = self.rt.accounts._users["carol"]
@@ -502,10 +552,11 @@ class D1ViewerIntegration(unittest.TestCase):
 
     def test_wrong_password_maps_to_item133_behaviour(self):
         self.assertTrue(self.rt.accounts.register("alice", PW)[0])
-        sock, out = self._serve_phase()
+        sock, out, th = self._serve_phase()
         self.addCleanup(sock.close)
         ch = self._channel(username="alice", _password="wrong-" + PW)
         self.assertFalse(ch._authenticate(sock))
+        self._await_served(out, th)
         self.assertIn("用户名或密码错误", ch.auth_msg)
         self.assertEqual(ch._retry_delay, 0.0)
         self.assertEqual(ch.username, "")          # 凭据已清除（第 133 条）
@@ -545,8 +596,11 @@ class D1ViewerIntegration(unittest.TestCase):
 class D1ProtocolSurface(unittest.TestCase):
     def test_defaults_and_constants(self):
         # auth-002（2026-09-18）：2.3 = proof 绑定 user + 域分隔串
-        self.assertEqual(common.PROTOCOL_VERSION, (2, 3))
+        # net-045（2026-10-09）：2.4 = 视频帧载荷带单调递增帧序号
+        self.assertEqual(common.PROTOCOL_VERSION, (2, 4))
+        # 挑战-应答的准入门槛仍是 2.3（认证面未变），帧序号门槛另由 VIDEO_SEQ_MINOR 把关
         self.assertEqual(common.PROTO_CHAL_MIN_MINOR, 3)
+        self.assertEqual(common.VIDEO_SEQ_MINOR, 4)
         self.assertEqual(common.DEFAULT_CONFIG["host"]["auth"]["chal_response"],
                          "require")
         self.assertEqual(Act.CHAL, "chal")

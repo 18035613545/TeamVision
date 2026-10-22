@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """静止检测与输出尺寸计算的单元测试（不依赖真实屏幕/编码器）。"""
-import unittest
+import unittest  # noqa: I001 — 见下方 import host 处对顺序的说明
 
 import numpy as np
 
-import host  # A3（第 133 条）：host 重依赖惰性化，先触发加载再取转发名
+import host  # noqa: I001 — 刻意让它先于下面那行 `from host import ...` 落地
+# ↑ A3（第 133 条）：host 的重依赖是惰性加载的，必须先 `import host` 再 `_load_heavy()`
+#   再取转发名；把三条语句排成"标准 import 顺序"会让本条测试失去意义（I001 建议的
+#   正是那种重排），故按语句意图保留并在上行显式豁免 I001。
+
 host._load_heavy()
-from host import calc_output_size, downsample_frame, motion_changed
+from host import calc_output_size, downsample_frame, motion_changed  # noqa: E402
 
 
 def _img(w=640, h=360, val=100):

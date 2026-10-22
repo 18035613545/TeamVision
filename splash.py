@@ -20,6 +20,7 @@ import sys
 import tkinter as tk
 
 import common
+
 # A3（第 133 条）：PIL 不再顶层导入——viewer/host 在极简 splash 之后才惰性加载
 # 重依赖，import splash 本身必须保持"纯 tkinter"。_build 内函数级导入，
 # 失败按原有"静默降级"路径显示文字版启动画面。

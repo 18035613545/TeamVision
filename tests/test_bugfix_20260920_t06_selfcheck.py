@@ -42,11 +42,12 @@ import inspect
 import os
 import socket
 import sys
-import viewer
 import textwrap
 import threading
 import time
 import unittest
+
+import viewer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -256,7 +257,7 @@ class _TunnelHold(_Tunnel):
 
     def __init__(self, hold, gate):
         self._gate = gate
-        super(_TunnelHold, self).__init__(reply=True, hold=hold)
+        super().__init__(reply=True, hold=hold)
 
     def _serve(self):
         while True:
@@ -376,11 +377,15 @@ class TestOldThreadBodyShape(unittest.TestCase):
         delay = 3.0
 
         def _probe():
+            # 本负向对照**故意复刻缺陷形态**（缺 nonlocal）。这正是 F823
+            # "`delay` 在赋值前被引用"要报的那件事，ruff 报得对，只是这里的"错"
+            # 就是被测对象；行尾赋值那条 F841 是同一形态的另一面（缺陷代码本来就
+            # 写了个没人读的 delay）。改成 nonlocal 或删掉赋值都会让本对照失去意义。
             waited = 0.0
             while not stop_event.is_set():
-                stop_event.wait(max(0.0, delay - waited))   # ← 首次迭代在此抛
+                stop_event.wait(max(0.0, delay - waited))   # noqa: F823
                 waited = 0.0
-                delay = 600.0                                # 缺 nonlocal
+                delay = 600.0                                # noqa: F841 缺 nonlocal
         _probe()
 
     def test_old_shape_dies_on_first_iteration(self):

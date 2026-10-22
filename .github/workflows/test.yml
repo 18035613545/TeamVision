@@ -7,6 +7,17 @@
 # ruff/mypy 钉到本机实测版本（fps-screen 环境 ruff 0.16.8、base 环境 mypy 1.17.1）；mypy 配置
 # 在 pyproject.toml，E2 起配有但从未执行（G25），故新增执行步骤——随本批修复（common.py
 # 的 I001/B904/_msvcrt 赋值三处）后两道门在本机均为绿。
+#
+# P1-4/P1-5（2026-10-09）：ruff 的范围由「三个核心文件」扩到全部根模块。七轮自审漏掉的
+# 两处真 bug 都落在当时不检查的文件里（logger.py 的 F821、host_ui.py 的 except 晚绑定闭包），
+# 窄范围换来的"全绿"没有防护力。注意本机 PATH 上的 ruff 可能比这里钉的旧（0.12 vs 0.16），
+# 本地验收请用 `python -m ruff`（fps-screen 环境）为准。
+#
+# R8-D-03（2026-10-10）：同一类缺口在 `tests/` 复发——lint 清单一字未提该目录，实测
+# 89 处违规，含 `F821 Undefined name 'fy2'`（tests/test_panel_float_no_overlap.py 的
+# T-14 核心不变量，被 `or` 短路掩盖到从未求值）与 `F823 referenced before assignment`。
+# 范围扩到 `ruff check *.py tests`；`tests/` 只对 E702/E741 两类风格规则豁免，
+# 理由写在 pyproject.toml 的 per-file-ignores。
 name: tests
 
 on:
@@ -26,11 +37,11 @@ jobs:
           cache-dependency-path: requirements.txt
       - name: Install deps
         run: pip install -r requirements.txt
-      - name: Lint (E2 阶段范围：核心三文件)
+      - name: Lint (全仓根模块 + tests；范围见 pyproject.toml 顶部裁决)
         run: |
           pip install ruff==0.16.8
-          ruff check common.py codec.py screen.py
-      - name: Type check (mypy：common.py，配置见 pyproject.toml)
+          ruff check *.py tests
+      - name: Type check (mypy：4 个模块的符号面；函数体未注解故不在检查范围)
         run: |
           pip install mypy==1.17.1
           python -m mypy

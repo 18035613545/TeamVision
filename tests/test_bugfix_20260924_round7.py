@@ -43,7 +43,6 @@ import screen
 import share
 import viewer
 
-
 # --------------------------------------------------------------- net-038
 
 class TestPackMsgSurrogate(unittest.TestCase):
@@ -511,6 +510,10 @@ class TestCaptureFixes(unittest.TestCase):
         def _make():
             cap = screen.CaptureManager.__new__(screen.CaptureManager)
             cap.monitor = 1
+            # capture-012：`_pick_output_idx` 先判 `_mss is None`（几何无基准），
+            # 再取矩形与 DXGI 输出做几何匹配。本用例测的是后者——几何不匹配时
+            # 返回 None 且告警只报一次——所以必须给出可用的 mss 句柄。
+            cap._mss = object()
             cap._monitor_rect = lambda m: (0, 0, 1920, 1080)
             return cap
 
@@ -534,25 +537,85 @@ class TestCaptureFixes(unittest.TestCase):
 
 class TestLogPruning(unittest.TestCase):
     def test_prune_skips_undeletable_and_continues(self):
-        """dist-019：首个删不掉的文件不得让整轮清理退出。"""
+        """dist-019：首个删不掉的文件不得让整轮清理退出。
+
+        ui-023（2026-10-09，回归夹具修正）：原夹具把 125 个文件命名成
+        `app_20260901..28.log`，而 cutoff 是「今天往前推 _KEEP_DAYS-1 天」。
+        这些日期全部早于 cutoff，于是阶段①（按日期整组删）把它们一次删光，
+        阶段②（120 文件/64MiB 上界）**一个文件都没见过**——while 条件根本不成立，
+        dist-019 要守的那段 `except OSError: continue` 从未执行过一次。
+        同函数同日换一组"当天"日期即崩（NameError），说明这条用例一直是假绿。
+
+        这里改用当天日期，让文件真正进入阶段②；再用 mock 让指定文件删不掉，
+        保证错误分支在任何文件系统上都确定被执行（真实句柄锁依赖 Windows 语义）。
+        """
         logs = tempfile.TemporaryDirectory()
         self.addCleanup(logs.cleanup)
+        today = time.strftime("%Y%m%d")
+        created = logger_mod._KEEP_FILES + 5
         names = []
-        for i in range(logger_mod._KEEP_FILES + 5):
-            name = "app_202609%02d.log" % (i % 28 + 1)
-            p = os.path.join(logs.name, name)
-            with open(p, "w", encoding="utf-8") as f:
+        for i in range(created):
+            name = "app_%s_pid%03d.log" % (today, i)
+            with open(os.path.join(logs.name, name), "w", encoding="utf-8") as f:
                 f.write("x" * 16)
             names.append(name)
-        # 人为制造一个"被占用"的文件：Windows 下 os.remove 对已打开句柄抛 PermissionError
+        # 人为让排序最前的那个删不掉：阶段②按 (日期, 文件名) 排序后 pop(0)，
+        # 所以 names[0] 正是"第一个候选"。
         locked = os.path.join(logs.name, names[0])
-        handle = open(locked, "r", encoding="utf-8")
-        self.addCleanup(handle.close)
-        lg = logger_mod._DateRotatingFileHandler(logs.name)
-        lg._prune_old()
+        real_remove = os.remove
+
+        def remove_or_fail(path):
+            if os.path.abspath(path) == os.path.abspath(locked):
+                raise OSError(13, "Permission denied", path)
+            return real_remove(path)
+
+        # 构造 handler 本身就会调一次 _prune_old（logger.py 的 __init__），
+        # 所以这里只需等它构造完，无需再手动触发。
+        with mock.patch("logger.os.remove", remove_or_fail):
+            handler = logger_mod._DateRotatingFileHandler(logs.name)
+            self.addCleanup(handler.close)
+
         remaining = [f for f in os.listdir(logs.name) if f.endswith(".log")]
-        self.assertLessEqual(len(remaining), logger_mod._KEEP_FILES,
-                             "不可删文件让整轮清理失效（绝对上界被绕过）")
+        self.assertIn(names[0], remaining,
+                      "被占用的文件本就不该被删掉，测试夹具没生效")
+        deleted = created - len(remaining)
+        # R8-D-04（2026-10-10）：原来断言 `deleted >= 2`，比本夹具的确定值宽一倍——
+        # "删到 2 个就提前收工"这一整类改动照样绿，而 dist-019 要守的恰恰是"不能提前收工"。
+        # 确定值：created = _KEEP_FILES + 5 个当天文件进阶段②，其中 1 个被 mock 成删不掉，
+        # 阶段②保留上界 _KEEP_FILES → 应删 created - 1 - _KEEP_FILES = 4 个。
+        # （审查实测 `_tmp_audit_dist_prune_exact.py`：created=125、remaining=121、deleted=4。）
+        self.assertEqual(
+            deleted, created - 1 - logger_mod._KEEP_FILES,
+            "阶段②没删到确定值 %d 个（提前退出或多删）：created=%d remaining=%d deleted=%d"
+            % (created - 1 - logger_mod._KEEP_FILES, created, len(remaining), deleted))
+
+    def test_prune_reports_skip_without_crash(self):
+        """ui-023：阶段②跳过分支不得引用未定义名。
+
+        旧实现写的是 `log.debug(...)`，而 `log` 在 logger 模块从未定义（ruff F821）。
+        NameError 从 `_DateRotatingFileHandler.__init__` 一路冒到 setup_logger 的
+        `except Exception: pass` 被吞掉——文件 handler 根本没挂上，而 README 恰恰
+        引导用户提交 logs\\app_*.log 排障。此用例直接断言"跳过时构造不抛"。
+        """
+        logs = tempfile.TemporaryDirectory()
+        self.addCleanup(logs.cleanup)
+        today = time.strftime("%Y%m%d")
+        created = logger_mod._KEEP_FILES + 5
+        for i in range(created):
+            with open(os.path.join(logs.name, "app_%s_pid%03d.log" % (today, i)),
+                      "w", encoding="utf-8") as f:
+                f.write("x" * 16)
+        locked = os.path.join(logs.name, "app_%s_pid000.log" % today)
+        real_remove = os.remove
+
+        def remove_or_fail(path):
+            if os.path.abspath(path) == os.path.abspath(locked):
+                raise OSError(13, "Permission denied", path)
+            return real_remove(path)
+
+        with mock.patch("logger.os.remove", remove_or_fail):
+            handler = logger_mod._DateRotatingFileHandler(logs.name)  # 旧实现抛 NameError
+            handler.close()
 
     def test_diag_zips_are_pruned(self):
         """dist-018：logs 目录里的诊断包也在回收口径内。"""
@@ -612,7 +675,7 @@ class TestRunnerContract(unittest.TestCase):
                     offenders.append("%s::%s" % (os.path.basename(path), node.name))
         self.assertEqual(offenders, [],
                          "模块级 pytest 风格用例不会被 unittest discover 收集"
-                         "（run_tests.bat/CI 会静默假绿）；请写成 TestCase 方法：" + 
+                         "（run_tests.bat/CI 会静默假绿）；请写成 TestCase 方法：" +
                          ", ".join(offenders))
 
 

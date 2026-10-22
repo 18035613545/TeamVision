@@ -129,7 +129,7 @@ class TestCallersTolerateTimeout(unittest.TestCase):
         healthy = host.ClientInfo(("10.0.0.2", 2), "healthy")
 
         def boom(sock, obj, send_timeout=2.0):
-            raise socket.timeout("simulated stuck peer")
+            raise TimeoutError("simulated stuck peer")  # = socket.timeout（py3.10 别名）
 
         stuck.send_ctrl = boom
         delivered = []
@@ -147,7 +147,7 @@ class TestCallersTolerateTimeout(unittest.TestCase):
 
         def boom(s, obj, send_timeout=2.0):
             called.append(obj)
-            raise socket.timeout("simulated stuck sharer")
+            raise TimeoutError("simulated stuck sharer")  # 同上：socket.timeout 的等价写法
 
         info.send_ctrl = boom
         sock = FakeSocket()  # 必须与 dict 键同一对象：_send_ctrl_safe 按身份查 ClientInfo

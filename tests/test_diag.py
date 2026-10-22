@@ -179,7 +179,7 @@ class TestNetStatusPlumbing(unittest.TestCase):
         with mock.patch.object(host_ui.diag, "build_report_zip", fake_zip), \
                 mock.patch.object(host_ui, "data_dir",
                                   return_value=tempfile.gettempdir()), \
-                mock.patch.object(host_ui.messagebox, "showinfo") as info:
+                mock.patch.object(host_ui.messagebox, "showinfo"):
             console._on_export_diag()
             for _ in range(200):
                 if captured:

@@ -15,8 +15,15 @@ import struct
 import unittest
 
 from common import (
-    MAX_PAYLOAD, MSG_CTRL, MSG_FRAME, MSG_VIDEO,
-    parse_message, parse_video, pack_video, pack_frame, pack_msg,
+    MAX_PAYLOAD,
+    MSG_CTRL,
+    MSG_FRAME,
+    MSG_VIDEO,
+    pack_frame,
+    pack_msg,
+    pack_video,
+    parse_message,
+    parse_video,
 )
 
 
@@ -62,7 +69,7 @@ class TestPayloadIsAlwaysBytes(unittest.TestCase):
         # 会抛 TypeError。用 bytearray 缓冲取出的 payload 走完整再打包，断言往返一致。
         vid_raw = pack_video(b"\x00\x00\x00\x01KEY", ts=42, keyframe=True)
         _, _, vid_payload = parse_message(bytearray(vid_raw))
-        ts, codec, flags, nal = parse_video(vid_payload)
+        ts, codec, flags, nal, _seq = parse_video(vid_payload)
         repacked = pack_video(nal, ts=ts, keyframe=bool(flags & 1), codec=codec)
         self.assertEqual(repacked, vid_raw)
 

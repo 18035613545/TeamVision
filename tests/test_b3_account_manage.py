@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-import host
 import common
+import host
 
 
 class _MgrCase(unittest.TestCase):

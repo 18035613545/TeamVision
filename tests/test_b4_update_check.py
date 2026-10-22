@@ -76,7 +76,7 @@ class TestCheckUpdate(_TmpCache):
         self.assertIn("有新版 v99.0.0", msg)
         self.assertIn("GitHub Releases", msg)
         self.assertEqual(len(calls), 1)
-        with open(self.cache, "r", encoding="utf-8") as f:
+        with open(self.cache, encoding="utf-8") as f:
             cached = json.load(f)
         self.assertEqual(cached["tag"], "v99.0.0")
         self.assertEqual(cached["checked_at"], self.NOW)

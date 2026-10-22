@@ -29,3 +29,20 @@ T-16｜自造 deque(maxlen=900) 从未调生产代码：上限提为 viewer._LAT
 T-17｜约 17 个文件、39 处 inspect.getsource：已删 2 处与行为用例重叠的字面串断言、把 1 处字面串改为行为断言（spawn 炸弹）；残留为与行为用例配对的 AST/结构断言（如"还原在 finally 内""先 _load_heavy 后 import dxcam"），见修复记录 §7.1｜tests/test_item100_fixes.py + tests/test_item96_sock_timeout.py + tests/test_item131_hardening.py（本次改动的三处）
 T-18｜pytest/unittest 两套 runner 无交叉：新增守卫用例扫描模块顶层 test_* 函数并显式失败；CI 单测统一走 run_tests.bat｜tests/test_bugfix_20260924_round7.py
 T-19｜3 个 MSG_FRAME 用例依赖真实屏幕采集：host._capture_loop 加 capture_factory 注入缝，Hub 注入伪屏幕｜tests/test_multiview_integration.py
+T-20｜D1 挑战-应答三个用例在断言 `out["result"]` 前**不等后台认证线程**：`out["result"] = host._auth_required_phase(...)` 是先完整求值右侧再赋值，而 socket 回包在函数**内部**已写出，观看端 `_authenticate` 读到回包即可返回——两者只隔一次 GIL 切换。全量跑（线程多、切换频繁）时断言偶尔先跑到，`out.get("result")` 得 None，CI 随机变红；单独跑 20 次（子进程）+ 80 次（进程内）都不复现。`_serve_phase` 改为返回线程，断言前经 `_await_served` join（并把线程内异常翻出来，否则断言只显示 `None != (True, 'carol')`）｜tests/test_d1_challenge_auth.py
+
+### 第 8 轮（2026-10-10，`docs/audit/round8/`）
+
+本轮的 T 条目集中在**同一件事的四个面**：测试"通过"不等于缺陷被钉住。判定手段也不再靠读代码猜，
+而是（a）对断言做反汇编看**哪一项真的被求值**；（b）用 spy 给生产方法挂调用记录跑**全量 discover**，
+看"删掉这行测试还会不会绿"；（c）把旧实现做**类级运行时注入**，确认新用例在缺陷形态下变红。
+
+T-21｜`tests/test_panel_float_no_overlap.py:192-193`（T-14 的核心不变量）里 `fy2` 是**未定义名**：`_float_rect` 返回 4 元组、第 192 行用 `_` 丢掉了悬浮窗底缘，第 193 行却引用它；而 7 个组合里项 1 `px2 <= fx1` 全部为真（面板右缘按定义停在 `float_x - _PANEL_GAP`）→ `JUMP_IF_TRUE_OR_POP` 直接跳过，第 4 项**一次都不求值**（`LOAD_GLOBAL fy2` 存在但永不执行）。补上第 4 个值后**仍绿**——纵向两项是"恰好成立"而非被掩盖，故未指向生产缺陷；另补负向对照 `test_overlap_judgement_is_not_masked_by_shortcircuit` 防短路复活｜tests/test_panel_float_no_overlap.py
+
+T-22｜**4 个测试文件只在全量 discover 的收集顺序帮忙时才通过**（单跑必红）：`test_item9_source_reject.py`（11 errors）、`test_bugfix_20260920_t05_viewer.py`（12 errors）、`test_viewer_hotkey.py`（7 errors）、`test_multiview.py`（1 failure）。根因是 `viewer.codec_mod` / `host` 侧 `CaptureManager` 这类**惰性全局**只由 `_load_heavy()` 绑定，而全量跑时靠 `pipeline.py`/`share.py` 的模块级 `from screen import …` 在**收集期**顺带触发——即"这类依赖只在收集顺序帮忙时存在"。四个文件已加模块级显式加载（**不用 try/except 吞失败**：环境缺重依赖时必须明确报错，不能退化成静默跳过）。逐模块单跑体检 **67/67 OK**。体检命令按**退出码**判定：用 `-match 'FAILED'` 会被生产日志里的 `getaddrinfo failed` / `BitBlt failed` / `frpc: login to server failed` 误报 3 个假阳性，用"取输出末行"会被 `test_item100_fixes` 打在生产 traceback 之后的输出骗到｜tests/test_item9_source_reject.py + tests/test_bugfix_20260920_t05_viewer.py + tests/test_viewer_hotkey.py + tests/test_multiview.py
+
+T-23｜`tests/test_capture011_region_geom_missing.py` 的 `test_never_leaks_absolute_coordinates` **无条件通过**：`if reg is not None:` 把 `assertRaises` 整个包住——缺陷形态（返回越界矩形 `(1920,100,2720,700)`）进入断言并通过，修复形态（`reg is None`）整段不执行也通过。改为结论侧断言（`assertIsNone(reg)` + `assertTrue(out_of_range)`），并补一条直接断言旧返回值必被校验器拒的负向对照。注意 capture-011 的功能修复本身**没有失守**（`test_returns_out_of_range_flag` 与 `TestGrabEndToEnd` 三条会红），本条只说明它不该被算作判定力来源｜tests/test_capture011_region_geom_missing.py
+
+T-24｜`tests/test_bugfix_20260924_round7.py` 的日志回收用例**断言过松**：`assertGreaterEqual(deleted, 2)` 而夹具确定值是 **4**（created=125 / remaining=121），"删到 2 个就停"也会绿。改为按夹具公式断言（`created - 1 - _KEEP_FILES`，不硬编码 4，抗 `_KEEP_FILES` 变更）｜tests/test_bugfix_20260924_round7.py
+
+T-25｜`tests/test_item93_cred_dialog.py` 是 `tests/` 下**唯一带 UTF-8 BOM** 的文件（与 `AGENTS.md` 的"UTF-8 无 BOM"约定不符；当前无功能后果，CPython tokenizer 认 BOM）。已剥离 BOM，行尾逐字节核对未动（CRLF 155 / LF 155 前后一致）｜tests/test_item93_cred_dialog.py

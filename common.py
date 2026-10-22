@@ -54,14 +54,20 @@ MAGIC_SERVER = b"OK02"
 
 #: C2（实现方案 §7）：协议版本单一载体。v2.2 = D1 挑战-应答认证（chal/auth_proof/
 #: reg_proof）上线；v2.3（2026-09-18，auth-002）= proof 绑定 user + 域分隔串。
+#: v2.4（2026-10-09，net-045）= 视频帧载荷带 4 字节单调递增帧序号。
 #: 握手主判仍是 MAGIC（旧客户端拒绝行为不变），proto 字段随认证期 CTRL 消息携带，
 #: 服务端据此判断对端能力（观看端以 auth_result.proto 的次版本号作为探测结果）。
-PROTOCOL_VERSION = (2, 3)
+PROTOCOL_VERSION = (2, 4)
 
 #: 观看端要求的最低次版本：v2.2 的 proof 只签 nonce、且原实现信任对端下发的
 #: KDF 参数（auth-002）；新版只与 ≥ 该版本的共享端走挑战-应答，旧版本明确拒绝
 #: 并提示升级（比"发出去被静默拒绝/降级"可排查）。
 PROTO_CHAL_MIN_MINOR = 3
+
+#: net-045（2026-10-09）：对端 proto 次版本 ≥ 该值时，视频帧载荷带 seq。
+#: 载荷布局无法自描述（v2.3/v2.4 都以 ts|codec|flags 开头），只能靠它协商；
+#: 低于该值一律按 v2.3 的 10 字节头解，避免把 NAL 前 4 字节误当序号丢掉。
+VIDEO_SEQ_MINOR = 4
 
 #: C2 §7 第 3 步：proto 强校验开关——"先只加不启用"。当前唯一版本载体仍是
 #: FS02 MAGIC；置 True 后服务端会拒绝 proto 不兼容的客户端（D1 的翻转点）。
@@ -82,6 +88,42 @@ def proto_compatible(msg):
     if isinstance(major, bool) or not isinstance(major, int):
         return True, False
     return True, major == PROTOCOL_VERSION[0]
+
+
+#: net-047（2026-10-10，产品决策"明确拒绝旧观看端"）：共享端拒绝"次版本 <
+#: VIDEO_SEQ_MINOR"的观看端时统一使用的文案。放在协议层常量区，两端与测试共用
+#: 一个字面量——host 发它、viewer 认它，历史上"观看端版本过旧，请更新后重试"
+#: 那条（PROTO_CHAL_MIN_MINOR 门控）是本条的**子集**语义，两者刻意保持不同字面量，
+#: 以便 viewer 能区分"该升级到挑战-应答版本"与"该升级到帧序号版本"。
+PROTO_SEQ_REJECT_MSG = "观看端版本过旧，请更新到 1.5.0 或更高版本"
+
+
+def video_seq_capable(msg):
+    """判定对端是否能解 v2.4 的视频帧序号布局。
+
+    返回 (present, capable)：
+      - present=False：报文没带可用的 proto 字段。对端无法自证能力，**不据此
+        拒绝**——这是刻意保留的缺口：旧版 share.py 中继路径与更早的客户端不带
+        该字段，而 host 无法在认证期区分"不带字段的旧观看端"与"不带字段的旧
+        中继 peer"（后者只发帧、不解码，放行才对）。它们会走到
+        `parse_video_auto` 的 Annex-B 起始码回退。
+      - capable=False：**显式声明**了次版本 < `VIDEO_SEQ_MINOR`。这类对端的解析
+        路径没有起始码判据也没有回退，把 4 字节序号当 NAL 前导，参考链断裂后
+        画面周期性冻结且两端日志正常（libx264 实测 520 帧里 28 帧解不出）。
+        这是必须明确拒绝的一类。
+
+    次版本的类型口径**有意放宽**到 int/float：宁可多拒一次畸形客户端，也不放过
+    一个声明了旧次版本的对端。bool 仍排除——`isinstance(True, int)` 为真，
+    但 `true` 是畸形载荷而不是"次版本 1"，放它进来等于放行一个说不清自己版本的
+    对端。主版本不同不归这里管（那是 `proto_compatible` / `PROTO_ENFORCE` 的口径）。
+    """
+    proto = msg.get("proto") if isinstance(msg, dict) else None
+    if not (isinstance(proto, (list, tuple)) and len(proto) >= 2
+            and isinstance(proto[1], (int, float)) and not isinstance(proto[1], bool)):
+        return False, True
+    if proto[0] != PROTOCOL_VERSION[0]:
+        return True, True          # 主版本不同：交给既有的版本不兼容分支
+    return True, proto[1] >= VIDEO_SEQ_MINOR
 
 
 class Act:
@@ -194,7 +236,7 @@ VIDEO_FLAG_KEY = 0x01
 
 #: 品牌与应用信息
 APP_NAME = "队友视野"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 APP_COPYRIGHT = "Copyright © 2026 TeamVision Team"
 #: 作者署名（显示于启动画面与 exe 版本信息）
 APP_AUTHOR = "by 西琳"
@@ -379,6 +421,21 @@ _VIDEO_HDR = struct.Struct(">BIQBB")    # kind, length, ts, codec, flags
 _MSG_HDR = struct.Struct(">BI")         # kind, length（中继/控制消息共用）
 _LEN_U32 = struct.Struct(">I")
 
+# net-045（2026-10-09，协议 v2.4）：视频帧载荷新增 4 字节**单调递增帧序号**。
+# 动机：此前载荷只有 ts/codec/flags，没有序号，接收端一旦发现损伤只能整体重置
+# 解码器（`_invalidate_media`），把本来还能解码的帧一并丢掉；有了序号就能改成
+# "丢弃到下一个可解码点"，这是裸 TCP 队头阻塞下唯一能做的选择性恢复。
+#
+# 两种布局（codec/flags 位置不变，seq 插在 flags 之后、NAL 之前）：
+#   v2.3  ts(8) | codec(1) | flags(1) | NAL              —— 载荷头 10 字节
+#   v2.4  ts(8) | codec(1) | flags(1) | seq(4) | NAL      —— 载荷头 14 字节
+# 布局无法自描述（两种都以 ts/codec/flags 开头），所以必须由对端 proto 次版本
+# 协商决定用哪种，见 VIDEO_SEQ_MINOR。
+_VIDEO_SEQ_HDR = struct.Struct(">BIQBBI")  # kind, length, ts, codec, flags, seq
+_VIDEO_PAYLOAD_BASE = 10                    # v2.3：ts(8)+codec(1)+flags(1)
+_VIDEO_SEQ_PAYLOAD_BASE = 14                # v2.4：再 + seq(4)
+_SEQ_U32 = struct.Struct(">I")
+
 
 def pack_frame(jpeg_bytes, ts=None):
     """将 JPEG 数据打包为一帧消息，返回 [kind=1][4 字节大端长度][8 字节微秒时间戳 ">Q"][JPEG]。
@@ -390,25 +447,167 @@ def pack_frame(jpeg_bytes, ts=None):
     return _FRAME_HDR.pack(MSG_FRAME, 8 + len(jpeg_bytes), ts) + jpeg_bytes
 
 
-def pack_video(video_bytes, ts=None, keyframe=False, codec=CODEC_H264):
+def pack_video(video_bytes, ts=None, keyframe=False, codec=CODEC_H264, seq=None):
     """将视频帧（Annex-B NAL）打包为视频帧消息。
 
-    返回 [kind=3][4 字节大端长度][8 字节微秒采集时间戳 ">Q"][1 字节 codec][1 字节 flags][NAL]。
-    codec 指示 H.264/HEVC，flags bit0 = 关键帧标记；长度字段 = 10 + len(video_bytes)。
+    v2.3 返回 [kind=3][4B 大端长度][8B 微秒 ts][1B codec][1B flags][NAL]（长度 = 10 + N）。
+    v2.4（`seq` 非 None 时）在 flags 之后追加 4 字节大端单调递增序号
+    （长度 = 14 + N），见 net-045。`seq=None` 即保持 v2.3 布局，供与未升级对端通信。
     """
     if ts is None:
         ts = int(time.time() * 1_000_000)
     flags = VIDEO_FLAG_KEY if keyframe else 0
-    return (_VIDEO_HDR.pack(MSG_VIDEO, 10 + len(video_bytes), ts, codec, flags)
+    if seq is None:
+        return (_VIDEO_HDR.pack(MSG_VIDEO, _VIDEO_PAYLOAD_BASE + len(video_bytes),
+                                ts, codec, flags)
+                + video_bytes)
+    return (_VIDEO_SEQ_HDR.pack(MSG_VIDEO, _VIDEO_SEQ_PAYLOAD_BASE + len(video_bytes),
+                                ts, codec, flags, seq & 0xFFFFFFFF)
             + video_bytes)
 
 
-def parse_video(payload):
-    """从视频帧 payload 解包出 (时间戳微秒, codec, flags, Annex-B NAL 字节)。"""
-    if len(payload) < 10:
-        raise ValueError("视频帧 payload 不足 10 字节")
+def parse_video(payload, expect_seq=False):
+    """从视频帧 payload 解包出 (时间戳微秒, codec, flags, NAL 字节, seq)。
+
+    `expect_seq=True` 按 v2.4 布局解（seq 在 flags 之后）；否则按 v2.3 解，seq 返回
+    None。**返回元组恒为 5 元**——不要按对端版本改元组长度，否则调用点的解包
+    会随协议版本而错位。
+    """
+    base = _VIDEO_SEQ_PAYLOAD_BASE if expect_seq else _VIDEO_PAYLOAD_BASE
+    if len(payload) < base:
+        raise ValueError("视频帧 payload 不足 %d 字节" % base)
     (ts,) = struct.unpack(">Q", payload[:8])
-    return ts, payload[8], payload[9], payload[10:]
+    codec, flags = payload[8], payload[9]
+    if not expect_seq:
+        return ts, codec, flags, payload[_VIDEO_PAYLOAD_BASE:], None
+    (seq,) = _SEQ_U32.unpack(payload[10:_VIDEO_SEQ_PAYLOAD_BASE])
+    return ts, codec, flags, payload[_VIDEO_SEQ_PAYLOAD_BASE:], seq
+
+
+class SeqCounter:
+    """net-045（2026-10-09）：每路视频流的单调递增帧序号发生器。
+
+    为什么不用 `itertools.count`：打包发生在 encode 线程、而静止期关键帧应答走
+    另一条路径，`next()` 虽然 GIL 下原子，但把"取号 + 打包"拆到两处后容易在
+    异常重试里重复发同一个号。这里显式持锁。
+
+    **不跳过 0**：接收侧判断"这帧有没有序号"用的是 `None`（v2.3 布局）而不是 0，
+    所以 0 是合法序号。若在这里跳过 0，接收端按相对增量算缺口时，
+    `0xFFFFFFFF → 1` 会被算成 delta=2，凭空记一次丢帧——回绕反而制造假告警。
+    序号 32 位无符号自然回绕（按 30fps 约 4.9 天绕一圈），只用于识别丢帧/错序，
+    不参与解码，回绕本身无害。
+    """
+
+    __slots__ = ("_lock", "_n")
+
+    def __init__(self, start=1):
+        self._lock = threading.Lock()
+        self._n = int(start) & 0xFFFFFFFF
+
+    def next(self):
+        """取下一个序号（32 位无符号，含 0，自然回绕）。"""
+        with self._lock:
+            n = self._n
+            self._n = (n + 1) & 0xFFFFFFFF
+            return n
+
+
+def _annexb_strength(data):
+    """NAL 的 Annex-B 起始码强度：4 字节零填充 → 4，3 字节 → 3，否则 0。
+
+    R8-NET-02（2026-10-10）：判据原来只有"像/不像"两档，而它是布局的唯一线索
+    （载荷无法自描述）。两档不够用——`expect_seq=False` 收到 v2.4 帧时，按 v2.3
+    解出的 `nal = seq(4) + 真 NAL`，`seq == 1` 或 `seq ∈ [256,511]` 时 seq 自己的
+    前 3~4 字节就构成起始码，两档判据"成立"因而永不回退，错位 NAL（多一截
+    `00 00 01 XX`）被当成真载荷喂解码器：XX & 0x1F ∈ [1,5] 时是合法的切片 NAL 头
+    → 参考链断裂，每个 GOP 末段 6~10 帧解不出，画面周期性冻结。
+
+    分档的依据是编码器输出的硬约束：H.264/H.265 的 Annex-B 流恒用 4 字节零填充起始码，
+    所以"真 NAL"的强度恒为 4；被 seq 前缀污染出的伪起始码顶多是 3（`00 00 01 xx`），
+    强度 3 < 4 因而一定输。唯一例外是 `seq == 1`——它的 4 字节恰好就是
+    `00 00 00 01`，两端强度同为 4，由 `parse_video_auto` 按协商布局打破平局。
+    """
+    if data[:4] == b"\x00\x00\x00\x01":
+        return 4
+    if data[:3] == b"\x00\x00\x01":
+        return 3
+    return 0
+
+
+def _looks_like_annexb(data):
+    """NAL 是否以 Annex-B 起始码开头（3 字节或 4 字节零填充形式）。"""
+    return _annexb_strength(data) > 0
+
+
+def peek_video_header(payload):
+    """只取视频帧头 (ts, codec, flags)，**不碰 NAL**——布局无关。
+
+    net-045：中继路径（host 转发共享者上行帧）唯一的需要是从 flags 取关键帧位做门控，
+    而 flags 在 v2.3/v2.4 里都位于第 9 字节，NAL 起点却随 seq 插入而整体后移。
+    用完整解析在这里会两头出错：按错误布局解，NAL 会错位；而靠"NAL 是否像 Annex-B"
+    猜布局，又会把非 Annex-B 的合法载荷误判成损坏帧直接丢弃——中继的职责是校验
+    结构、转发原字节，不该替解码器判断 NAL 内容。
+    """
+    if len(payload) < _VIDEO_PAYLOAD_BASE:
+        raise ValueError("视频帧 payload 不足 %d 字节" % _VIDEO_PAYLOAD_BASE)
+    (ts,) = struct.unpack(">Q", payload[:8])
+    return ts, payload[8], payload[9]
+
+
+def parse_video_auto(payload, expect_seq=False):
+    """net-045：按协商结果解帧，但对**布局不符**做回退，避免混合版本互相错解。
+
+    为什么必须回退：载荷布局无法自描述，而 MultiView 允许旧版 share.py 的共享者
+    连到新版 host.py 再被中继给新版观看端。此时观看端按 v2.4 解，会把 NAL 前 4 字节
+    当成序号吃掉，剩下的 NAL 变成 `01 65 …` 这种缺起始码的碎片——画面直接花掉，
+    而且没有任何报错可查。
+
+    R8-NET-02（2026-10-10）：旧实现是"按协商布局解，解出的 NAL 像 Annex-B 就**立即
+    返回**"，而该判据与布局不是一一映射——`expect_seq=False` 收到 v2.4 帧时，按 v2.3
+    解出的 `nal = seq(4) + 真 NAL`，只要 seq 的前 3~4 字节自己构成起始码就会被采信：
+      · `seq == 1` → 前缀 `00 00 00 01`；
+      · `seq ∈ [256,511]` → 前缀 `00 00 01 xx`，且 `xx & 0x1F ∈ [1,5]` 时是合法的
+        切片 NAL 头。
+    实测后果（libx264/H.264，520 帧）：参考链断裂，每个 GOP 末段 6~10 帧解不出，
+    共丢 28 帧，画面周期性冻结 0.2~0.33 秒；而 `seq` 单调递增必经过这段区间。
+
+    现在的判据：**两种布局都产出候选**，只把起始码强度 > 0 的收进来，再按
+    `(强度, 是否协商布局, 原尝试顺序)` 降序取第一名。
+      · 真 NAL 的起始码强度恒为 4——H.264/H.265 编码器输出固定使用 4 字节零填充
+        起始码，`pack_video` 直接拼接编码器输出，所以"真 NAL 强度 4"是硬约束；
+      · 被 seq 前缀污染出的伪起始码顶多是 3（`00 00 01 xx`），强度 3 < 4，一定输；
+      · `seq == 1` 时前缀恰好是 `00 00 00 01`，两端强度同为 4——这是**不可判定**的真
+        歧义（该序号与真 NAL 起始码逐字节相同），由"是否协商布局"打破；若连协商
+        方向也相同含义（`expect_seq=False` 时 v2.3 就是第一顺位），则按**原尝试顺序**
+        返回，逐字保持修前行为。
+    两种布局都不产出候选（强度为 0）即判定损坏，抛 ValueError。
+
+    判据边界（如实登记）：真 NAL 用 3 字节起始码时，上述强度差会消失（两边都是 3），
+    此时若帧确实带 seq 则仍可能错解或判损坏。真实编码器不会输出 3 字节起始码，属合成
+    数据才有的形态。
+    """
+    order = (True, False) if expect_seq else (False, True)
+    last_err = None
+    best = None
+    for rank, use_seq in enumerate(order):
+        try:
+            ts, codec, flags, nal, seq = parse_video(payload, expect_seq=use_seq)
+        except ValueError as e:      # 载荷长度不够该布局的最小头
+            last_err = e
+            continue
+        strength = _annexb_strength(nal)
+        if strength <= 0:
+            last_err = ValueError("NAL 缺 Annex-B 起始码（疑似布局不符）")
+            continue
+        # 末位用 -rank（原尝试顺序）：强度与协商方向都打平时保持修前的先到先得——
+        # 修前就是"按 order 逐个试，第一个像 Annex-B 的就返回"，所以 `seq == 1`
+        # 且 expect_seq=False 时返回的是**协商布局**（v2.3）的解析结果。
+        key = (strength, use_seq == expect_seq, -rank)
+        if best is None or key > best[0]:
+            best = (key, (ts, codec, flags, nal, seq))
+    if best is not None:
+        return best[1]
+    raise last_err or ValueError("视频帧 payload 无法解出 NAL")
 
 
 def pack_msg(obj):

@@ -12,17 +12,23 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import messagebox, simpledialog, ttk
 
 import mss
 
-import logger as logger_mod
 import diag
+import logger as logger_mod
 import ui_common
 import update_check
 from common import (
-    APP_NAME, APP_VERSION, DEFAULT_CONFIG, data_dir, save_config, register_policy,
-    REGISTER_POLICIES, safe_int,
+    APP_NAME,
+    APP_VERSION,
+    DEFAULT_CONFIG,
+    REGISTER_POLICIES,
+    data_dir,
+    register_policy,
+    safe_int,
+    save_config,
 )
 
 #: ui-007：监听地址非法值兜底——与 DEFAULT_CONFIG/配置迁移/界面文案同源，避免漂移
@@ -32,8 +38,14 @@ log = logger_mod.get_logger()
 
 #: 与观看端面板一致的深色主题配色（第 136 条 C3：单一来源在 ui_common，此处仅重导出）
 from ui_common import (
-    COL_BG, COL_CARD, COL_CTRL, COL_FG, COL_DIM, COL_ACCENT,
-    COL_ONLINE, COL_OFFLINE,
+    COL_ACCENT,
+    COL_BG,
+    COL_CARD,
+    COL_CTRL,
+    COL_DIM,
+    COL_FG,
+    COL_OFFLINE,
+    COL_ONLINE,
 )
 
 #: 注册策略 → 界面文案（顺序即下拉框顺序，首项为默认）
@@ -123,7 +135,38 @@ class HostConsole:
     def _show_update_hint(self, msg):
         # ui-019（2026-09-18）：与其余跨线程回调统一走 _post_ui 收口——旧实现直接
         # root.after 从更新检查线程投递，退出瞬间可能撞正在销毁的 Tcl 解释器
-        self._post_ui(lambda: self._set_status(msg))
+        self._post_ui(lambda: self._apply_update_hint(msg))
+
+    def _apply_update_hint(self, msg):
+        """第 9 轮：记下页面地址、显示「前往下载」按钮，状态栏只放"有新版"一句。
+
+        状态栏是单行、右侧已被公网地址占着，整段提示（含 URL）会把它挤到看不见；
+        地址交给按钮。msg 为空 = 收起按钮（例如取消勾选时）。
+        """
+        self._update_hint = msg or ""
+        self._update_url = update_check.extract_url(self._update_hint)
+        try:
+            if self._update_hint:
+                self._update_btn.pack(side="left", padx=(10, 0))
+            else:
+                self._update_btn.pack_forget()
+        except Exception as e:
+            logger_mod.get_logger().debug("更新按钮显隐失败：%s", e)
+        if self._update_hint:
+            self._set_status(update_check.hint_headline(self._update_hint))
+
+    def _on_update_click(self):
+        """打开 release 页面；浏览器拉不起来时把地址复制到剪贴板并说明（不让按钮点空）。"""
+        url = self._update_url or update_check.release_url()
+        if update_check.open_url(url):
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            self._set_status("无法自动打开浏览器，下载地址已复制到剪贴板", error=True)
+        except Exception as e:
+            logger_mod.get_logger().info("复制更新地址失败：%s", e)
+            self._set_status("无法打开浏览器，请手动访问 %s" % url, error=True)
 
     # ---------- 界面搭建 ----------
 
@@ -194,7 +237,10 @@ class HostConsole:
                                     fg=COL_FG, insertbackground=COL_FG, relief="flat",
                                     font=("Consolas", 10))
         self._addr_entry.pack(side="left", fill="x", expand=True, padx=8)
-        self._button(addr_row, "复制", self._copy_addr, accent=True).pack(side="left")
+        # 第 9 轮（部署与更新）：地址旁加一个直达隧道服务商的链接——用户配好公网地址后
+        # 要做的下一件事通常是"去控制台把远端端口对上"，此前只能在 README 里找网址。
+        self._link_label(addr_row, "服务商控制台", update_check.PANEL_URL).pack(
+            side="left", padx=(8, 0))
 
         # ---------- frpc 区 ----------
         frp_card = self._card(self.root, "frpc 隧道")
@@ -287,6 +333,12 @@ class HostConsole:
                        bg=COL_CARD, fg=COL_FG, selectcolor=COL_CTRL,
                        activebackground=COL_CARD, activeforeground=COL_FG,
                        font=("Microsoft YaHei", 9)).pack(side="left", padx=(18, 0))
+        # 第 9 轮：更新提示从"状态栏一句话"升级为可点开的入口——
+        # 勾了「检查更新」且发现新版时这个按钮才出现，点击打开 release 页面。
+        self._update_btn = self._button(row, "有新版 · 前往下载", self._on_update_click,
+                                        accent=True)
+        self._update_url = None
+        self._update_hint = ""
         btn_row = tk.Frame(trans_card, bg=COL_CARD)
         btn_row.pack(fill="x", padx=10, pady=(4, 8))
         self._button(btn_row, "应用传输设置", self._trans_save, accent=True).pack(side="left")
@@ -453,6 +505,14 @@ class HostConsole:
 
     # ---------- 事件 ----------
 
+    @staticmethod
+    def _link_label(parent, text, url):
+        """可点击的链接标签（悬停手型）：与观看端「关于」里的链接同一种做法。"""
+        lb = tk.Label(parent, text=text, bg=COL_BG, fg=COL_ACCENT, cursor="hand2",
+                      font=("Microsoft YaHei", 9, "underline"))
+        lb.bind("<Button-1>", lambda _e: update_check.open_url(url))
+        return lb
+
     def _copy_addr(self):
         addr = self._addr_var.get().strip()
         if not addr:
@@ -586,8 +646,11 @@ class HostConsole:
             # G28/ui-040（2026-09-24）：勾选后本会话原先不触发任何检查——update_check
             # 是一次性检查且只有启动期调用，opt-in 要等下次启动才生效，而状态栏却写
             # "每 24 小时向 GitHub 查询一次"（双重谎报）。勾选即补一次后台检查。
-            update_check.start_background_check(
-                cfg, lambda msg: self._post_ui(lambda m=msg: self._set_status(m)))
+            update_check.start_background_check(cfg, self._show_update_hint)
+        else:
+            # 第 9 轮：取消勾选 = 不再提示，入口也要收起，否则按钮留在界面上
+            # 点开还是不连网的旧版本页
+            self._apply_update_hint(None)
         self._set_status("更新检查已%s%s" % (
             "开启（每 24 小时向 GitHub 查询一次）" if on else "关闭（不再外连）", ""))
 
@@ -853,6 +916,19 @@ class HostConsole:
         except Exception:
             pass
 
+        def _fail(err):
+            # ui-022（2026-10-09）：原来写的是
+            #     except Exception as e:
+            #         self._post_ui(lambda: self._finish_export(None, "", e))
+            # `except ... as e` 会在块尾隐式解绑 `e`，而 _post_ui 走
+            # ui_common.post_to_ui 的 `root.after(0, fn)` 延迟执行——回调真正跑到时
+            # `e` 早已被解绑，抛 NameError。结果是双重的：失败弹框永不出现，且
+            # _finish_export 是 `_diag_exporting = False` 的唯一复位点，回调一崩守卫
+            # 就永久停在 True，此后每次点击只得到"上一次诊断包仍在导出中"。
+            # 改为把 err 作为**参数**同步传进来（err 是本函数的形参，不会被解绑），
+            # 与观看端 viewer.py:3351 `_work` 调 `_done(None, e)` 是同一写法。
+            self._post_ui(lambda: self._finish_export(None, "", err))
+
         def _work():
             try:
                 report = diag.build_report_text(cfg, extra_text=extra_text)
@@ -861,9 +937,10 @@ class HostConsole:
                                              logs_dir=logs_dir,
                                              extra_text=extra_text,
                                              pid=os.getpid())
-                self._post_ui(lambda: self._finish_export(path, report, None))
             except Exception as e:      # 工作线程异常也必须回到主线程反馈
-                self._post_ui(lambda: self._finish_export(None, "", e))
+                _fail(e)
+                return
+            self._post_ui(lambda: self._finish_export(path, report, None))
 
         threading.Thread(target=_work, name="diag-export", daemon=True).start()
 

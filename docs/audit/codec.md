@@ -26,6 +26,8 @@ codec-017｜set_bitrate 加「重建中」护栏：一次调整只构造一套�
 codec-018｜share 侧关键帧兜底只走 JPEG（不再可能送 P 帧并谎报成功、也不消费请求）｜tests/test_bugfix_20260924_round7.py
 codec-019｜PyAV 缺失时记一条一次性告警（不再零日志永久跑 JPEG）｜tests/test_bugfix_20260924_round7.py
 
+codec-020｜**分辨率档位切换每帧同步拆装编码器**：尺寸不符时的重建在 `_encode_locked` 的锁内进行（硬件编码器 93–110ms，而 30fps 一帧预算 33ms），失败时旧上下文已按新尺寸落账、回退路径也只剩 JPEG。现 `VideoEncoder.set_size` 按 set_fps 的同一契约（锁外构造、锁内切换、失败回滚尺寸），`pipeline.FrameEncoder` 按返回值落账并按 1→2→4…30s 退避；失败期间帧按**编码器实际尺寸**送出，画幅与码流尺寸始终一致｜tests/test_round11_resize.py
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 codec 的条目。一行一条 `第 N 条｜简述`。

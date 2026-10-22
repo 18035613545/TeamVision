@@ -9,11 +9,19 @@ import unittest
 
 import numpy as np
 
+import host
+import screen
+import share as share_mod
 from common import MSG_CTRL, MSG_FRAME, parse_message
 
-import screen
-import host
-import share as share_mod
+# 依赖声明（task-9，2026-10-10）：`TestScreenExtraction.test_host_reexports_screen_symbols`
+# 断言 `host.CaptureManager is screen.CaptureManager`，而 host 侧那批符号是**惰性模块
+# 全局**（host.py:43 哨兵 None，只有 `host._load_heavy()`（host.py:47-56）才绑定）。
+# 全量 discover 时能被别的模块（如 host.py:1228 `HostRuntime.__init__` 的兜底）先填上，
+# **单跑**则 host.CaptureManager 仍是 None → `None is not <class 'screen.CaptureManager'>`
+# 这 1 例失败。显式声明依赖后两种跑法一致。
+# 不用 try/except 包加载：环境装不上重依赖时必须**明确报错**。
+host._load_heavy()
 
 
 def recv_frames(sock, timeout):
@@ -87,7 +95,7 @@ class TestClientInfoMultiView(unittest.TestCase):
             a.close(); b.close()
 
 
-class _StubSender(object):
+class _StubSender:
     """_sender_active=True 的假订阅者：captured 收集 enqueue_frame 的消息。"""
 
     def __init__(self, watch_source="local", need_key=True):
@@ -156,6 +164,7 @@ class TestRouteFrame(unittest.TestCase):
 def _read_ctrl(sock, timeout=1.0):
     """从 socket 读一条 MSG_CTRL 消息并解析为 dict（仅用于已连接的 socketpair）。"""
     import select
+
     import common
     buf = b""
     end = time.time() + timeout
@@ -181,6 +190,7 @@ class TestRoster(unittest.TestCase):
 
     def _runtime(self):
         import threading
+
         import host
         rt = host.HostRuntime.__new__(host.HostRuntime)
         rt.clients = {}
@@ -236,7 +246,7 @@ class TestRoster(unittest.TestCase):
             a.close(); b.close()
 
 
-class _FakeCapture(object):
+class _FakeCapture:
     """可编程伪采集器：按帧序返回静止或运动帧。"""
 
     def __init__(self):

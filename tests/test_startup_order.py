@@ -18,7 +18,7 @@ FORBIDDEN_TOP = {"cv2", "numpy", "PIL"}
 
 
 def _top_level_import_modules(path):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         tree = ast.parse(f.read(), filename=path)
     names = set()
     for node in tree.body:            # 只看模块顶层，函数体内的 import 不在范围
@@ -58,7 +58,7 @@ class TestLoadHeavy(unittest.TestCase):
     def test_host_load_heavy_idempotent_and_screen_contract(self):
         import host
         host._load_heavy()
-        pipe_1, enc_1 = host.pipeline, host.encode_bgr
+        pipe_1, _enc_1 = host.pipeline, host.encode_bgr
         host._load_heavy()
         self.assertIs(host.pipeline, pipe_1)
         import pipeline

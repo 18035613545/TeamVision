@@ -35,7 +35,6 @@ import common
 import host
 import update_check
 
-
 # ---------------------------------------------------------------- T-07
 
 class TestAuth011IterResetOnPasswordChange(unittest.TestCase):

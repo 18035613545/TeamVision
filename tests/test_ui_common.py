@@ -9,7 +9,6 @@
 4) build_style：clam + 基础控件 + Panel.* 并集的实际生效值（需真实 Tk，缺失则跳过）。
 """
 import ast
-import inspect
 import io
 import os
 import sys
@@ -100,9 +99,11 @@ class TestPostToUi(unittest.TestCase):
         class _Root:
             def after(self, delay, fn):
                 calls.append((delay, fn))
-        fn = lambda: None
-        ui_common.post_to_ui(_Root(), fn)
-        self.assertEqual(calls, [(0, fn)])
+        def _fn():
+            pass
+
+        ui_common.post_to_ui(_Root(), _fn)
+        self.assertEqual(calls, [(0, _fn)])
 
     def test_no_inline_execution_on_failure(self):
         """ui-004（2026-09-18）：投递失败**不得**在工作线程就地执行控件回调。"""
@@ -150,7 +151,9 @@ class TestBuildStyle(unittest.TestCase):
         try:
             cls.root = tk.Tk()
         except Exception as e:
-            raise unittest.SkipTest("无法创建 Tk 根窗口: %s" % e)
+            # 根窗口建不起来不是本用例要测的行为：`from None` 让 unittest 报出的
+            # skip 原因只含 Tk 的原始错误，不挂上这一层语义无关的异常链。
+            raise unittest.SkipTest("无法创建 Tk 根窗口: %s" % e) from None
         cls.root.withdraw()
 
     @classmethod

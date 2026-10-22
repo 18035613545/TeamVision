@@ -18,7 +18,6 @@ import os
 import shutil
 import tempfile
 import threading
-import time
 import unittest
 from unittest import mock
 
@@ -288,6 +287,7 @@ class TestTkImageLifetime(unittest.TestCase):
 
     def test_panel_preview_clear_branch_does_not_raise(self):
         import tkinter as tk
+
         from PIL import ImageTk
         app = viewer.ViewerApp.__new__(viewer.ViewerApp)
         app.running = True

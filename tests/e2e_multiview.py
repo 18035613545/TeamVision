@@ -603,7 +603,7 @@ def _run():
     LOG_DIR = tempfile.mkdtemp(prefix="e2e_multiview_")
     print("日志目录: %s" % LOG_DIR, flush=True)
 
-    with open(CONFIG, "r", encoding="utf-8") as f:
+    with open(CONFIG, encoding="utf-8") as f:
         cfg = json.load(f)
     cfg["viewer"]["channels"] = [{"name": "E2E频道", "addr": "127.0.0.1:%d" % PORT}]
     cfg["viewer"]["panel_topmost"] = False
@@ -768,7 +768,7 @@ def _run():
 
 
 def assert_changed(c0, c1, desc, results):
-    d = max(abs(a - b) for a, b in zip(c0, c1))
+    d = max(abs(a - b) for a, b in zip(c0, c1, strict=True))
     if d < 15:
         raise AssertionError("%s：按钮中心色几乎不变 %r -> %r" % (desc, c0, c1))
     results.append(("PASS", desc))

@@ -2,7 +2,6 @@
 """阶段 2 续（第 113–116 条）：C2 Event 唤醒、C3 零拷贝打包、C4 面板增量刷新、C6 解码器复用。"""
 import struct
 import threading
-import time
 import unittest
 from unittest import mock
 
@@ -147,7 +146,7 @@ class TestC3PackStructs(unittest.TestCase):
         vid = common.pack_video(b"NAL", ts=7, keyframe=False)
         consumed, kind, payload = common.parse_message(bytearray(vid))
         self.assertEqual(kind, common.MSG_VIDEO)
-        ts, codec, flags, nal = common.parse_video(payload)
+        ts, codec, flags, nal, _seq = common.parse_video(payload)
         repacked = common.pack_video(nal, ts=ts, keyframe=bool(flags & 1), codec=codec)
         self.assertEqual(repacked, vid)
 
@@ -242,7 +241,6 @@ class TestC4PanelIncremental(unittest.TestCase):
         return app
 
     def test_unchanged_snapshot_does_not_rebuild(self):
-        import viewer
         tree = _FakeTree(n=1)
         tree.rows["0"] = {
             "values": ("●", "H264·A", "127.0.0.1:5700", "30", "1"),

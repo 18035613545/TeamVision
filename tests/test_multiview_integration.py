@@ -9,15 +9,25 @@ import copy
 import json
 import select
 import socket
-import threading
 import time
 import unittest
 
 import numpy as np
 
-from common import (DEFAULT_CONFIG, client_handshake, send_msg, recv_msg,
-                    pack_frame, pack_video, parse_message, parse_video,
-                    MSG_FRAME, MSG_VIDEO, MSG_CTRL, CODEC_H264)
+from common import (
+    CODEC_H264,
+    DEFAULT_CONFIG,
+    MSG_CTRL,
+    MSG_FRAME,
+    MSG_VIDEO,
+    client_handshake,
+    pack_frame,
+    pack_video,
+    parse_message,
+    parse_video,
+    recv_msg,
+    send_msg,
+)
 from host import HostRuntime
 
 JPEG_BYTES = None  # 惰性生成：64x36 纯色 JPEG
@@ -198,7 +208,7 @@ class TestHubMultiView(unittest.TestCase):
             msgs = recv_kinds(a, timeout=3.0)
             vids = frames(msgs, MSG_VIDEO)
             self.assertTrue(vids)
-            ts, codec, flags, nal = parse_video(vids[0][1])
+            ts, codec, flags, nal, _seq = parse_video(vids[0][1])
             self.assertEqual(nal, b"KEY2")
             self.assertTrue(flags & 1)
             # need_key 清除后非关键帧放行
@@ -206,7 +216,7 @@ class TestHubMultiView(unittest.TestCase):
             msgs = recv_kinds(a, timeout=3.0)
             vids = frames(msgs, MSG_VIDEO)
             self.assertTrue(vids)
-            _, _, _, nal = parse_video(vids[0][1])
+            _, _, _, nal, _seq = parse_video(vids[0][1])
             self.assertEqual(nal, b"P1")
         finally:
             a.close(); b.close()

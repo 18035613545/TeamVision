@@ -16,6 +16,16 @@ capture-007｜_pick_output_idx 分清「几何枚举不可用」（保留序号�
 capture-008｜normalize_region 放行负原点（副屏在主屏左侧可框选）；host_ui 越界校验改按显示器并集四至｜tests/test_bugfix_20260924_round7.py
 capture-009｜share 侧空帧重建改时间判据 5.0 秒（与 host 对齐，静止下不再每 ~1.5 秒重建 DXGI）｜tests/test_bugfix_20260924_round7.py
 capture-010｜dxcam 匹配告警集提到模块级（跨重建实例只报一次）｜tests/test_bugfix_20260924_round7.py
+capture-011｜`_dxgi_region` 在「显示器几何取不到」时按越界处理并回退 mss，不再把虚拟桌面绝对坐标当输出内相对坐标递给 dxcam（0.3.0 抛 ValueError → 连续 5 次触发一轮重建循环）｜tests/test_capture011_region_geom_missing.py
+capture-012｜新增 `probe_geometry`/`geometry_changed` 几何漂移判据，`_grab_mss` 整屏分支改用探针矩形；显示设置变更后不再冻结在旧帧（mss 的 `monitors` 每实例只算一次，而 `BitBlt` 源矩形离屏时返回成功却不写目标 DIB → 三条判据全静默）｜tests/test_capture012_geometry_drift.py
+capture-013｜`_grab_mss` 区分「序号越界」的两类成因：曾有效 → 屏被拔除，放弃本帧；从未有效 → 配置写错（`safe_int` 只有下界无上界，`monitor: 99` 可达），降级到第 1 块屏继续出图并指明 `host.capture.monitor`。判据是 `_monitor_rect()` **之前**的 `self._geometry`——它内部会刷新该字段，之后再取则恒判为配置错误｜tests/test_capture012_geometry_drift.py
+capture-014｜区域采集也走几何探针（新增 `_fit_region_to_desktop`）：区域矩形在桌面内是否有效由当前几何决定，分辨率改小后旧区域越界 → `BitBlt` 离屏"成功且不写入"，实测同尺寸离屏源返回上次抓帧的**逐字节副本**、部分越界写入全零。部分越界夹到可见交集，完全离屏退回整屏（不退成丢帧，否则永久黑屏不自愈）｜tests/test_capture012_geometry_drift.py
+
+第 8 轮（2026-10-10，`docs/audit/round8/`）：
+
+capture-015｜`FrameEncoder._ensure_encoder` 的「就地重建失败」路径**每帧重试一次完整编码器构造、不落负缓存**：同一个函数里的构造失败路径有 `_retry_at`/`_backoff` 指数退避，而 `set_fps(fps)` 返回 False 时（`codec.py:334-337` 的 codec-012 有意回滚 `_fps` 让下一帧重试——那个决定是对的）没有任何频率约束。实测 30 帧调用 30 次 `_create_ctx_with`（源码自述单次 93–110ms），而 30fps 每帧预算只有 33ms，且该状态下 `available` 恒 True、**永不回退 JPEG**。现给该路径独立退避（`_fps_retry_at`/`_fps_backoff`，换实例即复位）——**刻意不复用构造退避**，共用会让一次帧率失败顺带推迟一次真正需要的重建｜tests/test_round8_capture.py
+
+capture-016｜`_refresh_geometry` 的降级承诺**兑现不了**：except 分支（mss 私有字段 `_monitors` 不可用/结构变化）返回 True 并声称"改用重建采集器"，但该函数全仓只有一个调用点 `_monitor_rect`（纯查询热路径），采集器重建的唯一入口是 `CaptureSource._rebuild()`，且上游真改了 `_monitors` 时重建出来的 mss **同样没有该字段**——重建 100% 无效。现删掉承诺、订正 docstring（返回值只表示"本帧检出了几何漂移"，两个出口同义），并把原来只锁"返回 True"的用例改为钉四个可观测后果（基准已刷新 / 未触发任何重建 / 不外抛 / 之后取到探针新几何而非陈旧缓存）｜tests/test_capture012_geometry_drift.py
 
 ## 历史（旧编号，冻结）
 

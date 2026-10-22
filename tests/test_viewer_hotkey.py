@@ -9,6 +9,15 @@ import unittest
 
 import viewer
 
+# 依赖声明（task-9，2026-10-10）：本文件构造真实 `viewer.ViewerApp`，其 `__init__`
+# 建频道列表时会经 `Channel.__init__`（viewer.py:2004→2005→332）取
+# `codec_mod.VideoDecoder()`，而 `viewer.codec_mod` 是**惰性模块全局**（viewer.py:35
+# 哨兵 None，只有 `viewer._load_heavy()` 才赋值）。全量 discover 时靠 pipeline.py /
+# share.py 的模块级 `from screen import …` 在收集期顺带触发，**单跑**则 codec_mod 仍为
+# None → 7/9 例报 AttributeError。显式声明依赖后两种跑法一致。
+# 不用 try/except 包加载：环境装不上重依赖时必须**明确报错**。
+viewer._load_heavy()
+
 
 def make_cfg(channels=None):
     """最小可用配置（ViewerApp.__init__ 只读 viewer 段的展示/网络键）。"""

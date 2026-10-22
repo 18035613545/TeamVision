@@ -6,7 +6,7 @@
 
 采集屏幕 → H.264 / HEVC 硬件编码 → TCP 广播 → 悬浮窗实时观看
 
-`by 西琳` · v1.4.0 · Windows 10/11 64 位
+`by 西琳` · v1.5.0 · Windows 10/11 64 位
 
 **本项目禁止用于任何商业用途**
 
@@ -76,6 +76,18 @@
 | `Ctrl + Alt + ↑/↓` | 上一个 / 下一个画面源 |
 | `Alt + 1…9` | 直接切到第 N 个频道 |
 
+<details>
+<summary>v1.5.0 批次改动摘要（更新提示 / 布局预设 / 分辨率切换 / 卸载）</summary>
+
+- **更新提示可点**：勾选「检查更新」后，发现新版会在控制台出现「前往下载 / 下载新版」按钮，直接打开对应版本的 release 页面；关于窗口里的链接也可点击。
+- **布局预设**：观看端「设置」区一键切换「大宽屏 / 标准 / 小地图」，同时改显示宽度与透明度（窄屏上自动夹到屏幕可用宽度）。
+- **分辨率档位切换免卡顿**：显示分辨率或缩放档位变化时，编码器改为"锁外重建 + 失败退避"，
+  不再每帧同步拆装一次硬件编码器；切换失败期间按编码器实际尺寸出帧，画幅与码流始终一致。
+- **卸载更安全**：卸载安装包不再整目录删除两端共用的 `%LOCALAPPDATA%\TeamVision`，
+  改为在卸载前逐项询问是否删除账户与配置。
+
+</details>
+
 ---
 
 ## 系统要求
@@ -90,7 +102,7 @@
 
 ### 方式一：安装包（推荐）
 
-[下载 TeamVision-Setup-1.4.0.exe](https://github.com/18035613545/TeamVision/releases/tag/v1.4.0) —— 安装后自动放置共享端与观看端两个程序目录。
+[下载 TeamVision-Setup-1.5.0.exe](https://github.com/18035613545/TeamVision/releases/tag/v1.5.0) —— 安装后自动放置共享端与观看端两个程序目录。
 
 > 安装包为**用户级安装**（默认装到 `%LOCALAPPDATA%\Programs\TeamVision`，不需要管理员权限）。
 > 程序为 **onedir** 形态，各自带 `_internal` 运行库目录：
@@ -100,7 +112,7 @@
 > 也不会失败），并从旧版本的 exe 同目录自动迁移已有配置。
 >
 > 自行构建时（`build_exe.bat` → `build_installer.bat`）产物在 `dist\`：`fps-host\`、`fps-viewer\`、
-> `frpc.exe`（构建前若把 frpc.exe 放在仓库根，脚本会自动复制进 `dist\`）、`TeamVision-Setup-1.4.0.exe`。
+> `frpc.exe`（构建前若把 frpc.exe 放在仓库根，脚本会自动复制进 `dist\`）、`TeamVision-Setup-1.5.0.exe`。
 
 ### 方式二：绿色版
 
@@ -268,7 +280,7 @@ run_tests.bat
   前会**自动把 `vendor\` 接入 `sys.path`**，所以源码运行时"独占全屏黑屏 → 把 `capture.backend`
   设为 `dxgi`"这条排障建议同样有效（若日志出现 `dxgi 后端不可用，回退 mss`，先确认 `vendor\dxcam` 存在）。
 - **打包产物**：`dist\fps-host\`、`dist\fps-viewer\`（各自含 `_internal\`）、`dist\frpc.exe`
-  （构建前把 `frpc.exe` 放在仓库根，脚本会自动复制）、`dist\TeamVision-Setup-1.4.0.exe`。
+  （构建前把 `frpc.exe` 放在仓库根，脚本会自动复制）、`dist\TeamVision-Setup-1.5.0.exe`。
   `build_exe.bat` 末尾会调用 `sign_exe.ps1` 做 Authenticode 签名：脚本**签名后会复核文件本身**，
   若时间戳签名导致哈希不符会自动去掉时间戳重签（大安装包上实测会触发）。**签名前请先退出
   正在运行的 fps-host / fps-viewer**，否则 exe 被占用会签名失败。
@@ -277,7 +289,7 @@ run_tests.bat
 
 ---
 
-## 近期修复（v1.4.0）
+## 近期修复（v1.5.0）
 
 以下问题已在当前构建中修好，版本变更总纲见 [`docs/changelog.md`](docs/changelog.md)，
 逐条证据与验证方式见

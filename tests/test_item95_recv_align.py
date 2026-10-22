@@ -30,7 +30,6 @@ import unittest
 
 import common
 
-
 _HOST_PY = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "host.py")
 
@@ -50,7 +49,7 @@ class _FakeSock:
         if self.closed:
             raise OSError("socket closed")
         if not self._buf:
-            raise socket.timeout("no data within 2s")   # 旧客户端：无数据
+            raise socket.timeout("no data within 2s")   # noqa: UP041 — 旧客户端：无数据
         chunk = bytes(self._buf[:n])
         del self._buf[:n]
         self.consumed += len(chunk)
@@ -73,7 +72,7 @@ def _site2_old(sock):
     try:
         sock.settimeout(2.0)
         common.recv_msg(sock)
-    except socket.timeout:
+    except socket.timeout:  # noqa: UP041 — 复刻旧 Site 2 的原始 except 形态
         pass            # fall-through（旧客户端路径，但无法区分是否已消费字节）
     except Exception:
         pass            # fall-through（错位也照样进接收循环）
@@ -154,7 +153,7 @@ class TestRealHostSourceMatchesReplica(unittest.TestCase):
     """把复刻锚定到真实 host.py：select 门控存在、旧的 fall-through 忽略日志已移除。"""
 
     def setUp(self):
-        with open(_HOST_PY, "r", encoding="utf-8") as f:
+        with open(_HOST_PY, encoding="utf-8") as f:
             self.src = f.read()
 
     def test_select_gate_present(self):

@@ -108,7 +108,7 @@ def _wait_action(sock, action, timeout=6.0, state=None):
         sock.settimeout(max(0.2, deadline - time.time()))
         try:
             chunk = sock.recv(65536)
-        except (socket.timeout, OSError):
+        except (socket.timeout, OSError):  # noqa: UP041 — 复刻调用点的原始写法
             state["buf"] = buf
             return None
         if not chunk:
@@ -227,7 +227,7 @@ class TestMessageDeadline(unittest.TestCase):
                 if not s.recv(65536):
                     closed = True
                     break
-            except socket.timeout:
+            except socket.timeout:  # noqa: UP041 — 同 host 调用点的原始写法
                 continue
             except OSError:
                 closed = True
@@ -973,7 +973,7 @@ def _count_frames(sock, duration):
         sock.settimeout(max(0.05, deadline - time.time()))
         try:
             chunk = sock.recv(65536)
-        except (socket.timeout, OSError):
+        except (socket.timeout, OSError):  # noqa: UP041 — 复刻取帧循环的原始写法
             break
         if not chunk:
             break
