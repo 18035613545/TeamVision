@@ -24,7 +24,7 @@ from common import (
     APP_NAME,
     APP_VERSION,
     DEFAULT_CONFIG,
-    # net-050（v2.5）：反馈的过期门槛（与共享端 ABR 判据同源）
+    # net-051（v2.5）：反馈的过期门槛（与共享端 ABR 判据同源）
     FB_MAX_AGE_S,
     REGISTER_POLICIES,
     data_dir,
@@ -359,7 +359,7 @@ class HostConsole:
         tree.heading("uptime", text="已连接")
         tree.heading("rate", text="速率")
         tree.heading("total", text="累计流量")
-        # net-050（v2.5）：观看端上报的实测体验（延迟/积压/丢帧）。
+        # net-051（v2.5）：观看端上报的实测体验（延迟/积压/丢帧）。
         # 这一列是"我这边发得挺顺，但队友说卡"这类问题的落点——没有它就只能靠猜。
         tree.heading("quality", text="观看体验")
         tree.column("user", width=80, minwidth=60, stretch=False, anchor="center")
@@ -1147,7 +1147,7 @@ class HostConsole:
     def _fmt_quality(fb, age_s):
         """把一条质量反馈（common.parse_feedback 的结果）格式化成表格里的一格。
 
-        net-050（v2.5）：三种状态要分得开，否则用户读不出含义——
+        net-051（v2.5）：三种状态要分得开，否则用户读不出含义——
           未上报：这一端还没发过反馈（旧版观看端，或反馈开关关了）；
           已过期：曾经发过，但最近 10 秒没发（该端掉线了，或它自己卡到发不出）；
           有数据：正常显示（延迟 / 积压 / 丢帧）。

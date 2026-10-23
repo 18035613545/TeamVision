@@ -32,7 +32,7 @@ from common import (
 
 log = logger.get_logger()
 
-#: net-050（v2.5）：两次降档之间的最小间隔（秒）。共享端每 2 秒转达一次"卡"的
+#: net-051（v2.5）：两次降档之间的最小间隔（秒）。共享端每 2 秒转达一次"卡"的
 #: 反馈，不设间隔的话 2500 Kbps 会在十几秒内一路塌到下限——用户还没来得及反应，
 #: 画质已经掉到底了。
 _FB_DROP_COOLDOWN_S = 10.0
@@ -79,7 +79,7 @@ class ScreenShareSession:
         self._target_width = safe_int(codec_cfg.get("target_width", 854) or 0, 854, 0)
         self._encoder_sel = codec_cfg.get("encoder", "auto")
         self._bitrate = safe_int(codec_cfg.get("bitrate_kbps", 2500), 2500, 64) * 1000
-        # net-050（v2.5）：反馈调档的三个锚点——配置值（回升目标）、下限（不塌穿）、
+        # net-051（v2.5）：反馈调档的三个锚点——配置值（回升目标）、下限（不塌穿）、
         # 最近一次"卡"反馈的时刻（回升计时）。_bitrate 本身就是当前码率（bps）。
         self._cfg_bitrate = self._bitrate
         self._min_bitrate = safe_int(codec_cfg.get("min_bitrate_kbps", 400), 400, 64) * 1000
@@ -160,7 +160,7 @@ class ScreenShareSession:
     def apply_feedback(self, fb):
         """按观看端反馈下调上行码率；返回调整后的码率（Kbps），未调整返回 None。
 
-        net-050（v2.5）：这一端是**真正持有编码器**的那一方，共享端改不了它的码率，
+        net-051（v2.5）：这一端是**真正持有编码器**的那一方，共享端改不了它的码率，
         所以"某个观看端看这条流很卡"必须落到这里才有用。
 
         只在反馈判定为"卡"时下调（`common.feedback_is_stuck`）；降档有 10 秒冷却——
@@ -248,7 +248,7 @@ class ScreenShareSession:
         try:
             while not self._stop.is_set():
                 t0 = time.perf_counter()
-                # net-050（v2.5）：久未收到"卡"的反馈 → 码率往配置值回升一档。
+                # net-051（v2.5）：久未收到"卡"的反馈 → 码率往配置值回升一档。
                 # 放在循环头部：恢复是"没有消息时"发生的事，不能等下一条反馈才想起来。
                 self._maybe_restore_bitrate()
                 ts_us = int(time.time() * 1_000_000)

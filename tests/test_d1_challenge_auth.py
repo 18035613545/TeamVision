@@ -597,11 +597,11 @@ class D1ProtocolSurface(unittest.TestCase):
     def test_defaults_and_constants(self):
         # auth-002（2026-09-18）：2.3 = proof 绑定 user + 域分隔串
         # net-045（2026-10-09）：2.4 = 视频帧载荷带单调递增帧序号
-        # net-050（2026-10-23）：2.5 = 质量反馈（控制消息）
+        # net-051（2026-10-23）：2.5 = 质量反馈（控制消息）
         self.assertEqual(common.PROTOCOL_VERSION, (2, 5))
         # 挑战-应答的准入门槛仍是 2.3（认证面未变），帧序号门槛另由 VIDEO_SEQ_MINOR 把关
         self.assertEqual(common.PROTO_CHAL_MIN_MINOR, 3)
-        # net-050：2.5 **不抬** VIDEO_SEQ_MINOR —— 反馈走控制通道，视频载荷布局没变。
+        # net-051：2.5 **不抬** VIDEO_SEQ_MINOR —— 反馈走控制通道，视频载荷布局没变。
         # 抬了它就会把 1.5.0 的观看端在认证期拒掉（net-047 刚立的先例）。
         self.assertEqual(common.VIDEO_SEQ_MINOR, 4)
         self.assertEqual(common.DEFAULT_CONFIG["host"]["auth"]["chal_response"],

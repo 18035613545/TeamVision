@@ -6,7 +6,7 @@
 
 采集屏幕 → H.264 / HEVC 硬件编码 → TCP 广播 → 悬浮窗实时观看
 
-`by 西琳` · v1.5.0 · Windows 10/11 64 位
+`by 西琳` · v1.6.0（开发中） · Windows 10/11 64 位
 
 **本项目禁止用于任何商业用途**
 
@@ -77,6 +77,21 @@
 | `Alt + 1…9` | 直接切到第 N 个频道 |
 
 <details>
+<summary>v1.6.0 批次改动摘要（画质反馈闭环）</summary>
+
+- **共享端终于"看得见"队友那头的卡顿**：观看端每 3 秒把实测体验（解码积压、
+  网络丢帧率、RTT、单帧解码耗时）报给共享端；共享端据此调整画质——
+  **链路带宽不够**时降码率，**观看端 CPU 解码跟不上**时降分辨率与帧率
+  （解码量由像素数×帧数决定，降码率对它无效）。
+- **控制台多一列"观看体验"**：每个在线观看端的 RTT / 积压 / 丢帧一目了然，
+  不用再靠"我这边发得挺顺但他说卡"来猜。
+- **悬浮窗状态行如实标出积压与丢帧**：一眼分清"网络差"还是"本机解码慢"。
+- **多人场景**：队友源（别人共享给你的画面）的卡顿反馈会**转达**给真正持有
+  编码器的那一端，由它下调上行码率。
+
+</details>
+
+<details>
 <summary>v1.5.0 批次改动摘要（更新提示 / 布局预设 / 分辨率切换 / 卸载）</summary>
 
 - **更新提示可点**：勾选「检查更新」后，发现新版会在控制台出现「前往下载 / 下载新版」按钮，直接打开对应版本的 release 页面；关于窗口里的链接也可点击。
@@ -104,6 +119,9 @@
 
 [下载 TeamVision-Setup-1.5.0.exe](https://github.com/18035613545/TeamVision/releases/tag/v1.5.0) —— 安装后自动放置共享端与观看端两个程序目录。
 
+> 仓库当前源码版本是 **v1.6.0（开发中，未发布）**；已发布的最新安装包仍是 1.5.0
+> （[Releases 列表](https://github.com/18035613545/TeamVision/releases) 始终是最准的）。
+>
 > 安装包为**用户级安装**（默认装到 `%LOCALAPPDATA%\Programs\TeamVision`，不需要管理员权限）。
 > 程序为 **onedir** 形态，各自带 `_internal` 运行库目录：
 > `%LOCALAPPDATA%\Programs\TeamVision\fps-host\fps-host.exe`（共享端）与
@@ -112,7 +130,7 @@
 > 也不会失败），并从旧版本的 exe 同目录自动迁移已有配置。
 >
 > 自行构建时（`build_exe.bat` → `build_installer.bat`）产物在 `dist\`：`fps-host\`、`fps-viewer\`、
-> `frpc.exe`（构建前若把 frpc.exe 放在仓库根，脚本会自动复制进 `dist\`）、`TeamVision-Setup-1.5.0.exe`。
+> `frpc.exe`（构建前若把 frpc.exe 放在仓库根，脚本会自动复制进 `dist\`）、`TeamVision-Setup-1.6.0.exe`。
 
 ### 方式二：绿色版
 
@@ -280,7 +298,7 @@ run_tests.bat
   前会**自动把 `vendor\` 接入 `sys.path`**，所以源码运行时"独占全屏黑屏 → 把 `capture.backend`
   设为 `dxgi`"这条排障建议同样有效（若日志出现 `dxgi 后端不可用，回退 mss`，先确认 `vendor\dxcam` 存在）。
 - **打包产物**：`dist\fps-host\`、`dist\fps-viewer\`（各自含 `_internal\`）、`dist\frpc.exe`
-  （构建前把 `frpc.exe` 放在仓库根，脚本会自动复制）、`dist\TeamVision-Setup-1.5.0.exe`。
+  （构建前把 `frpc.exe` 放在仓库根，脚本会自动复制）、`dist\TeamVision-Setup-1.6.0.exe`。
   `build_exe.bat` 末尾会调用 `sign_exe.ps1` 做 Authenticode 签名：脚本**签名后会复核文件本身**，
   若时间戳签名导致哈希不符会自动去掉时间戳重签（大安装包上实测会触发）。**签名前请先退出
   正在运行的 fps-host / fps-viewer**，否则 exe 被占用会签名失败。

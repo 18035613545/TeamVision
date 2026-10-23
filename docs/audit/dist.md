@@ -44,6 +44,19 @@ dist-028｜安装链两处口径缺口：(a) `installer.iss` 的 AppVersion / Ou
 
 dist-029｜**mypy 门禁的存量红登记**：`pyproject.toml` 的 4 模块清单（第 8 轮未提交改动）带来 5 条存量错误——`codec.py` 的 av 可选导入把模块/类型名赋 None（3 条）、`_WARNED_ONCE: set` 与 `_PICK_WARNED: set` 缺类型实参（2 条）；按 HEAD 的 pyproject（只查 common.py）为绿，说明这是清单扩面时没跑过的红。本轮写范围不动这些行，改为在 `pyproject.toml` 里按错误类别 `disable_error_code` 显式放行并写明修法——**代价是 `assignment`/`misc`/`var-annotated` 三类在 CI 里整体不可见**，修掉 5 处后必须删掉这三行｜—（CI 自身）
 
+第 12 轮（2026-10-23，工程收口）：
+
+dist-030｜**打包链完全在 CI 之外**：AGENTS.md 早已登记此事，但一直没补。第 9 轮的实际代价很具体——`installer.iss` 里被写进一条 Inno **不存在**的指令（`UninstallablePathsDataFiles`），单测与 lint 全绿，直到真正编译安装包才炸（6.7.3 报 `Unrecognized [Setup] section directive`）。现补 `package` job（`workflow_dispatch` 或 `v*` tag 触发，**不挂 PR**——一次完整打包约 10 分钟）：装依赖 → 补 vendor（dxcam 钉在 DXcam 的 `v0.3.0` tag 上；PyPI 上的 0.0.5 是滞后的旧版，且钉 tag 是为了上游 HEAD 变动不把 CI 弄红）→ PyInstaller 出两个 exe → 校验产物（**av 的 FFmpeg DLL 必须在**：漏了 `import av` 失败被 codec.py 静默吞掉、用户端无声退回 JPEG，带宽 5-20 倍回退——这正是 dist-068 的成因）→ choco 装 Inno Setup 6 → ISCC 编译安装包 → 校验产物。**刻意不含签名**（需要证书，CI 里没有；无证书时 sign_exe.ps1 会自签，那是本机行为，验不了"对外分发"）与 `frpc.exe`（第三方产物，installer.iss 对它是 skipifsourcedoesntexist）｜—（CI 自身）
+
+dist-031｜**CI 无法手动触发**（`tests` workflow 没有 `workflow_dispatch`）：想验一次得推分支或改点无关代码——这是"门禁之外的事"长期没被跑起来的原因之一。已补 `workflow_dispatch`，并让 `v*` tag 也触发（发版前自动验一次）｜—（CI 自身）
+
+dist-032｜`update_check.check_release`（第 10 轮写好、dist-027 登记"当前不接线"）**是一段没人调的死代码**——死代码会烂，而它烂掉时没人会发现（没有调用方就没有覆盖）。现接线：`check_update` 就是 `check_release` 的文案出口（传 role：共享端 "host"、观看端 "viewer"）。两处实现要点：① **缓存里存原始发布列表而不是判定结果**——判定要按角色来，同机两端的共享端与观看端看到的是同一份列表、结论不同，把判定结果存进缓存会让两端互相把对方的缓存顶掉（每次都判定为"缓存过期"而重新打网络）；② 取数从 `/releases/latest` 改成 `/releases?per_page=10`——拆包后要在一页里找出"本机角色最高的那次发布"，只取 latest 一条找不出来。旧格式缓存（只有 tag/page）仍可读，升级后不会白白多打一次网络｜tests/test_round10_release_check.py + tests/test_b4_update_check.py + tests/test_round9_update_links.py
+
+dist-033｜`.archify/`（本机 AI 工具的输出目录）此前一直靠"没 `git add` 就没提交"侥幸挡住——这类"靠人不犯错"的防线迟早会被一次 `git add -A` 破掉。已进 `.gitignore`｜—
+
+dist-034｜**mypy 存量红已清零**（dist-029 的收口）：那三行 `disable_error_code` 让 `assignment`/`misc`/`var-annotated` 三类错误在 CI 里**整体不可见**——为 5 条存量红长期关掉三道检查，代价远大于收益。修法与当初 pyproject 里写下的方案一致：`codec.py` 的 `av = None` → `av = cast(Any, None)`；`PictureType` 不再作为模块级类型名单独导入（把类型名赋 None 会被判 "Cannot assign to a type"），改从 `av.video.frame.PictureType` 取；`_WARNED_ONCE: set` / `_PICK_WARNED: set` → `set[str]`。三行放行随之删除｜—（CI 自身）
+
+
 ## 历史（旧编号，冻结）
 
 > 逐条来自 `docs/audit/README.md` 冻结对照表，归属为 dist 的条目。一行一条 `第 N 条｜简述`。

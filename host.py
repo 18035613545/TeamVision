@@ -69,7 +69,7 @@ from common import (  # noqa: F401
     AUTH_TIMEOUT_DEFAULT_S,
     AUTH_TIMEOUT_MIN_S,
     CODEC_H264,
-    # net-050（v2.5）：反馈的过期门槛与"卡/解码受限"判据（与观看端共用同一份）
+    # net-051（v2.5）：反馈的过期门槛与"卡/解码受限"判据（与观看端共用同一份）
     FB_MAX_AGE_S,
     KDF_ITER_MAX,
     # auth-002/auth-006（2026-09-18）：KDF 参数与凭据长度的校验口径
@@ -118,7 +118,7 @@ from common import (  # noqa: F401
     normalize_region,
     pack_frame,
     pack_video,
-    # net-050（v2.5）：质量反馈的字段口径与解析（两端共用同一份定义）
+    # net-051（v2.5）：质量反馈的字段口径与解析（两端共用同一份定义）
     parse_feedback,
     parse_message,
     parse_message_raw,
@@ -630,7 +630,7 @@ class ClientInfo:
         # 观众端已按 B8 主修（会话自行终止 → unshare + UI 提示）上报，这里是共享端侧的
         # 兜底标注，让"幽灵源"在源列表里可见。
         self.last_up_at = 0.0
-        # net-050（v2.5）：该连接最近一次上报的质量反馈与上报时刻。
+        # net-051（v2.5）：该连接最近一次上报的质量反馈与上报时刻。
         # fb = common.parse_feedback 的规范化结果（只含合法字段）；
         # fb_at = 上报时刻（单调钟），用于判断"这条反馈是不是过期了"。
         self.fb = None
@@ -1264,7 +1264,7 @@ class HostRuntime:
         # 第 104 条（B3）：向 peer 共享者转发关键帧请求的冷却表（share_id -> 时刻）
         self._peer_key_lock = threading.Lock()
         self._peer_key_at = {}
-        # net-050（v2.5）：向 peer 共享者**转达质量反馈**的冷却表（share_id -> 时刻）。
+        # net-051（v2.5）：向 peer 共享者**转达质量反馈**的冷却表（share_id -> 时刻）。
         # 与关键帧冷却表分开：两者的事件频率与语义都不同，共用一张表会让一次
         # 关键帧请求把紧随其后的反馈转达也压掉（反馈是持续信号，关键帧是一次性事件）。
         self._peer_fb_lock = threading.Lock()
@@ -1441,7 +1441,7 @@ class HostRuntime:
                     table.pop(share_id, None)
             except Exception:
                 pass
-        # net-050：反馈转达的冷却表同口径清理（同一个 share_id 复用会让新成员
+        # net-051：反馈转达的冷却表同口径清理（同一个 share_id 复用会让新成员
         # 一上任就被上一任的冷却压掉反馈转达）。
         fb_table = getattr(self, "_peer_fb_at", None)
         fb_lock = getattr(self, "_peer_fb_lock", None)
@@ -1601,7 +1601,7 @@ class HostRuntime:
                     total_mb = info.bytes_sent / (1024.0 * 1024.0)
             else:
                 total_mb = getattr(info, "bytes_sent", 0) / (1024.0 * 1024.0)
-            # net-050（v2.5）：把这一端的实测体验带进快照，供控制台"观看体验"列显示。
+            # net-051（v2.5）：把这一端的实测体验带进快照，供控制台"观看体验"列显示。
             # fb_age_s 让 UI 能区分"还没上报"与"上报过但已过期"。
             fb = getattr(info, "fb", None)
             fb_at = getattr(info, "fb_at", 0.0)
@@ -2319,7 +2319,7 @@ def _ctrl_unshare(runtime, info, addr):
 
 
 def _handle_feedback(sock, info, runtime, msg, addr):
-    """处理观看端上报的质量反馈（net-050，协议 v2.5）。
+    """处理观看端上报的质量反馈（net-051，协议 v2.5）。
 
     **反馈归到哪一路，以服务端的订阅账本为准**（`info.watch_source`），不采信报文里
     带的任何"我在看哪一路"字段：客户端可以谎报，但谎报对自己没好处——服务端按自己
@@ -2438,7 +2438,7 @@ def _dispatch_ctrl(sock, info, runtime, msg, addr, auth_cfg):
             if _request_local_keyframe(runtime):
                 log.debug("客户端 %s 请求关键帧，已置位强制 IDR", addr)
     elif action == Act.FEEDBACK:
-        # net-050（v2.5）：观看端上报质量反馈。旧版共享端不认识这个 action，
+        # net-051（v2.5）：观看端上报质量反馈。旧版共享端不认识这个 action，
         # 走到末尾无 else 分支 → 静默忽略，两端照常互通。
         _handle_feedback(sock, info, runtime, msg, addr)
     elif action in (Act.PROBE, Act.LOGIN, Act.REGISTER):
@@ -3925,7 +3925,7 @@ def _abr_degrade(runtime, p, cur, effective_send_ms, recent_drop, prefer="bitrat
     `level` 只在**真的重建了编码器**时才非空：否则持续拥塞/变化落在滞后带内时会每秒
     打印一条并未发生的“降级”。已到降级下限时 level 同样为空。
 
-    net-050（v2.5）：`prefer="scale"` 时**先削画幅与帧率、码率最后才动**。
+    net-051（v2.5）：`prefer="scale"` 时**先削画幅与帧率、码率最后才动**。
     为什么需要这一档：解码量由"像素数 × 帧数"决定，与码率无关——观看端是**解码
     受限**（CPU 跟不上）时降码率一点忙都帮不上，能救它的是分辨率与帧率；反过来，
     链路受限（下行带宽不够）时该先动码率。判据见 common.feedback_is_decode_bound。
@@ -4066,7 +4066,7 @@ def _perf_tick(runtime, p):
     lag_us = int(time.time() * 1_000_000) - frame_ts if frame_ts > 0 else 0
     congested = (effective_send_ms > budget_ms or recent_drop
                  or (frame_ts > 0 and lag_us > 800_000))
-    # net-050（v2.5）：订阅端反馈这一路判据。上面三项（发送耗时/本机丢帧/帧龄）
+    # net-051（v2.5）：订阅端反馈这一路判据。上面三项（发送耗时/本机丢帧/帧龄）
     # **全都发生在字节离开本机之前**——共享端看不见"观看端解码跟不上、下行带宽
     # 不够"，而那恰恰是用户抱怨"延迟高/画面卡"时最常见的原因。观看端把它的实际
     # 体验报上来，这条盲区才算补上。
@@ -4083,7 +4083,7 @@ def _perf_tick(runtime, p):
         prefer = "scale" if (fb_stuck and feedback_is_decode_bound(fb_worst)) else "bitrate"
         _abr_degrade(runtime, p, stats, effective_send_ms, recent_drop, prefer=prefer)
     elif (stats["send_fps"] >= 5 and not recent_drop
-          # net-050：有人报"卡"时不回升——回升会让链路刚缓过来又立刻顶回去，
+          # net-051：有人报"卡"时不回升——回升会让链路刚缓过来又立刻顶回去，
           # 在"发送侧正常、观看端受限"的场景里反复横跳。
           and not fb_stuck
           # B9：没有订阅者时不回升——send_fps 已由 _send_loop 在"零投递"时归零，这里
