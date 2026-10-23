@@ -69,14 +69,13 @@ python_version = "3.10"
 # 注解位置，函数体基本没被查。要真正扩面需给这些函数补注解或开
 # `--check-untyped-defs`（会引入大量新错误，属独立议题，本轮不做）。
 #
-# 第 9 轮（2026-10-10 之后）：登记**存量红**并显式放行，而不是让门禁一直红着。
-# 基线有 5 条错误，全部落在本轮的写范围之外，成因已在代码里写明：
-#   av 可选导入（codec.py:35-36）——`except` 分支把模块名/类型名赋成 None，
-#       mypy 按"模块与类型不能被赋 None"报 3 条；
-#   set 需要类型实参（`_WARNED_ONCE: set` / `_PICK_WARNED: set` 两处 _x: set = set()）。
-# 代码位置与 pyproject 本身都是第 8 轮未提交改动带来的，本轮不顺手改别人的设计；
-# 修法（`av = None` 改为 `av = cast(...)`；两个集合写 `set[str]`）可在拆包轮统一收口，
-# 届时把下面三行删掉。注意：这会让 3 类错误在 CI 里**看不见**，属已知的覆盖面缺口。
-disable_error_code = ["assignment", "misc", "var-annotated"]
+# 第 9 轮（2026-10-10 之后）：登记**存量红**并显式放行（disable_error_code 三行）。
+# 第 12 轮（2026-10-23）**已收口**：那 5 条存量红修完，三行放行随之删除——
+# 它们原先让 `assignment` / `misc` / `var-annotated` 三类错误在 CI 里**整体不可见**
+# （dist-029 登记的覆盖面缺口），留着等于长期关掉三道检查。修法：
+#   codec.py 的可选导入：`av = None` → `av = cast(Any, None)`；
+#     `PictureType` 不再作为模块级类型名单独导入（赋 None 会被判 "Cannot assign
+#     to a type"），改从 `av.video.frame.PictureType` 取；
+#   `_WARNED_ONCE: set` / `_PICK_WARNED: set` → `set[str]`。
 files = ["common.py", "codec.py", "pipeline.py", "ui_common.py"]
 ignore_missing_imports = true
