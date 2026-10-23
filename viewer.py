@@ -440,6 +440,9 @@ class Channel:
         #: 网络丢帧率统计：应收帧数与累计序号缺口
         self._fb_frames_seen = 0
         self._fb_drop_pct = 0.0
+        #: 源帧率（由帧的采集时间戳差估出）与算它用的 1 秒滑窗样本
+        self._fb_src_fps = 0.0
+        self._src_ts_samples = []
         #: 上次上报反馈的时刻（单调钟）
         self._fb_sent_at = 0.0
         threading.Thread(
@@ -563,6 +566,35 @@ class Channel:
         # net-051：应收帧计数（丢帧率的分母）。与 `_fb_gaps` 一起在每次上报后清零。
         # 这里不做加锁——两个计数都是估算用的观感数据，丢掉一帧不影响结论。
         self._fb_frames_seen = getattr(self, "_fb_frames_seen", 0) + 1
+
+    def _note_src_fps(self, ts_us):
+        """由**相邻帧的采集时间戳差**估出源帧率。
+
+        为什么不能直接用 `self.fps`（显示帧率）来判"解码受限"：解码受限时
+        观看端**显示**的帧率恰恰是掉下来的那个数——源 30fps、每帧解码 30ms 时
+        观看端只显示 15fps，用 15fps 算预算（66ms）会把"解码 30ms"判成
+        "只占 45%、不紧张"，于是共享端去降码率——而降码率对解码受限完全无效。
+        源帧率必须从**源侧的时间戳**（本批帧的采集时刻）算，那是发送端的节奏，
+        不受本机解码速度影响。
+
+        实现：一个 1 秒滑动窗口的 (采集时刻) 样本，窗口内相邻差值的倒数即源帧率。
+        时间戳是**源端的墙钟**（采集时刻），两端时钟偏差是常量，对"差值"无影响。
+        """
+        now = time.monotonic()
+        samples = getattr(self, "_src_ts_samples", None)
+        if samples is None:
+            samples = self._src_ts_samples = []
+        samples.append((now, int(ts_us)))
+        cutoff = now - 1.0
+        while samples and samples[0][0] <= cutoff:
+            samples.pop(0)
+        if len(samples) < 2:
+            return
+        span_us = samples[-1][1] - samples[0][1]
+        if span_us <= 0:
+            return
+        # 样本数 - 1 个间隔
+        self._fb_src_fps = (len(samples) - 1) * 1_000_000.0 / float(span_us)
 
     def _maybe_warn_video_seq_gaps(self):
         """累计缺口跨过阈值时告警一次（带频道名与累计值），每条连接至多一条。
@@ -783,6 +815,9 @@ class Channel:
                             return None
                         self._note_video_seq(seq)
                         video_batch.append((ts, codec, flags, nal))
+                        # net-051：源帧率由**源的采集时间戳**估（不是本机显示帧率——
+                        # 解码受限时显示帧率恰恰是掉下来的那个数，用它会判反）。
+                        self._note_src_fps(ts)
                     elif kind == MSG_FRAME:
                         if len(payload) < 8:
                             log.warning("频道[%s] 帧 payload 过短，跳过", self.name)
@@ -1101,6 +1136,7 @@ class Channel:
         return {
             "action": Act.FEEDBACK,
             "fps": round(float(fps), 1),
+            "src_fps": round(float(getattr(self, "_fb_src_fps", 0.0)), 1),
             "lat_ms": round(self.effective_latency_ms(), 1),
             "rtt_ms": round(float(self.round_trip_ms), 1),
             "backlog_ms": round(float(getattr(self, "_fb_backlog_ms", 0.0)), 1),
@@ -1795,6 +1831,13 @@ class Channel:
         self._fb_gaps = 0
         self._fb_frames_seen = 0
         self._fb_drop_pct = 0.0
+        self._fb_src_fps = 0.0
+        samples = getattr(self, "_src_ts_samples", None)
+        if samples is not None:
+            try:
+                samples.clear()
+            except Exception:
+                pass
 
     # ---------- MultiView：共享开关 / 观看源切换 ----------
 

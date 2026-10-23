@@ -3941,7 +3941,8 @@ def _abr_degrade(runtime, p, cur, effective_send_ms, recent_drop, prefer="bitrat
         elif fps_now > p.fps_min:
             fps_now = max(p.fps_min, int(fps_now / 2))
             level = "帧率 %d" % fps_now
-        else:
+        elif cur["cur_bitrate"] > p.min_bitrate:
+            # 码率是最后一招，且**只在真的高于下限时才动**（见 _degrade_bitrate）
             level = _degrade_bitrate(runtime, p, cur)
     elif cur["video_mode"] and cur["cur_bitrate"] > p.min_bitrate:
         level = _degrade_bitrate(runtime, p, cur)
@@ -3966,14 +3967,28 @@ def _degrade_bitrate(runtime, p, cur):
     单独抽出来是为了让 `_abr_degrade` 的两条分支（先码率 / 先画幅）共用同一份
     "按实测吞吐定目标"的算式——两份算式各写一遍的话，改一处忘另一处，
     两条分支的降级力度就会对不上。
+
+    **绝不能把码率调高**：目标值是 `min(当前 × 0.7, 实测吞吐 × 0.9)`，再拿
+    `min_bitrate` 兜底——但兜底值本身可能**高于当前码率**（用户把
+    `codec.bitrate_kbps` 配到低于 `min_bitrate_kbps` 时就是这样，例如
+    100 Kbps vs 默认下限 400 Kbps）。此时"降级"会把码率从 100 抬到 400，
+    在一个正在为省带宽而降档的会话里反向加码。旧实现在调用点用
+    `cur["cur_bitrate"] > p.min_bitrate` 挡住了这一路（进不了本函数）；
+    抽成函数后这道门必须**留在函数里**——调用方有多处，挡在调用点会漏。
     """
     cur_b = cur["cur_bitrate"]
+    if cur_b <= p.min_bitrate:
+        # 已在下限（或配置本身就低于下限），没有可降的档位
+        return ""
     step_b = int(cur_b * 0.7)
     egress_bps = int(cur.get("egress_bps", 0))
     if egress_bps > 0:
         # 实测吞吐就是链路当前真实上限（含背压下被跳过的帧），留 10% 余量
         step_b = min(step_b, int(egress_bps * 0.9))
     new_b = max(p.min_bitrate, step_b)
+    if new_b >= cur_b:
+        # 兜底下限高于当前值（配置把 bitrate 配得比 min 低）→ 不动
+        return ""
     if not _set_encoder_bitrate(runtime, new_b):
         return ""
     return ("码率 %d Kbps（实测 %d Kbps）" % (new_b // 1000, egress_bps // 1000)
@@ -4080,7 +4095,11 @@ def _perf_tick(runtime, p):
     if congested and stats.get("subscribers", 0) > 0:
         # 解码受限（观看端 CPU 跟不上）时先削画幅/帧率：解码量由像素数×帧数决定，
         # 降码率对它无效；链路受限时才先动码率。
-        prefer = "scale" if (fb_stuck and feedback_is_decode_bound(fb_worst)) else "bitrate"
+        # src_fps 是**源**帧率（观看端按帧的采集时间戳估出）：不能用观看端的显示
+        # 帧率——解码受限时显示帧率恰恰是掉下来的那个数，用它算预算会把
+        # "解码受限"判反，于是去降一个对解码受限毫无作用的码率。
+        prefer = "scale" if (fb_stuck and feedback_is_decode_bound(
+            fb_worst, fps=(fb_worst or {}).get("src_fps"))) else "bitrate"
         _abr_degrade(runtime, p, stats, effective_send_ms, recent_drop, prefer=prefer)
     elif (stats["send_fps"] >= 5 and not recent_drop
           # net-051：有人报"卡"时不回升——回升会让链路刚缓过来又立刻顶回去，

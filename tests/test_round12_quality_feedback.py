@@ -116,6 +116,8 @@ def _channel():
     ch._fb_frames_seen = 0
     ch._fb_gaps = 0
     ch._fb_drop_pct = 0.0
+    ch._fb_src_fps = 0.0
+    ch._src_ts_samples = []
     ch._fb_sent_at = 0.0
     ch._resync = False
     ch._lag_base_d = None
@@ -201,6 +203,45 @@ class TestViewerFeedbackPayload(unittest.TestCase):
         self.assertAlmostEqual(ch._fb_decode_avg_ms, 30.0)
         ch._note_decode_ms(10.0)
         self.assertAlmostEqual(ch._fb_decode_avg_ms, 30.0 * 0.8 + 10.0 * 0.2)
+
+
+class TestViewerSourceFps(unittest.TestCase):
+    """源帧率由**帧的采集时间戳**估出——不能用观看端的显示帧率。
+
+    解码受限时显示帧率恰恰是掉下来的那个数（源 30fps、每帧解码 30ms →
+    只能显示 15fps）。拿它去算"帧预算"会把解码受限判反，于是共享端去降
+    一个对解码受限毫无作用的码率。
+    """
+
+    def test_src_fps_from_capture_timestamps(self):
+        ch = _channel()
+        ch._src_ts_samples = []
+        base_ts = 1_000_000
+        # 30fps：相邻帧的采集时刻差 33.33ms
+        for i in range(10):
+            ch._note_src_fps(base_ts + int(i * 1_000_000 / 30))
+        self.assertAlmostEqual(ch._fb_src_fps, 30.0, delta=0.5)
+
+    def test_src_fps_independent_of_display_fps(self):
+        """观看端显示帧率再低也不影响源帧率的估法。"""
+        ch = _channel()
+        ch._src_ts_samples = []
+        ch.fps = 5.0                       # 显示只有 5fps（解码跟不上）
+        base_ts = 1_000_000
+        for i in range(10):
+            ch._note_src_fps(base_ts + int(i * 1_000_000 / 30))
+        self.assertAlmostEqual(ch._fb_src_fps, 30.0, delta=0.5)
+
+    def test_payload_carries_src_fps(self):
+        ch = _channel()
+        ch._src_ts_samples = []
+        base_ts = 1_000_000
+        for i in range(10):
+            ch._note_src_fps(base_ts + int(i * 1_000_000 / 30))
+        payload = ch._feedback_payload()
+        self.assertAlmostEqual(payload["src_fps"], 30.0, delta=0.5)
+        fb = common.parse_feedback(payload)
+        self.assertIn("src_fps", fb)
 
 
 # ---------------------------------------------------------------------------
@@ -379,17 +420,84 @@ class TestAbrDrivenByFeedback(unittest.TestCase):
         self.assertLess(rt.video_encoder.calls[0], 2_500_000)
 
     def test_decode_bound_prefers_scale_over_bitrate(self):
-        """解码受限（单帧解码占满帧预算）时降码率无效——该削画幅。"""
+        """解码受限（单帧解码占满帧预算）时降码率无效——该削画幅。
+
+        `src_fps` 是**源**帧率：解码受限时观看端的显示帧率恰恰是掉下来的那个数
+        （源 30fps、每帧解码 30ms → 只能显示 15fps），用它算预算会把"解码受限"
+        判反，于是去降一个对解码受限毫无作用的码率。
+        """
         rt = _RuntimeStub()
         info = _InfoStub()
-        info.fb = {"backlog_ms": 2000.0, "drop_pct": 0.0, "fps": 30.0,
-                   "decode_ms": 30.0}
+        info.fb = {"backlog_ms": 2000.0, "drop_pct": 0.0, "fps": 15.0,
+                   "src_fps": 30.0, "decode_ms": 30.0}
         info.fb_at = time.monotonic()
         rt.clients[info.sock] = info
         p = pipeline.PipelineParams(rt.cfg)
         host._perf_tick(rt, p)
         self.assertEqual(rt.video_encoder.calls, [], "解码受限不该先动码率")
         self.assertLess(rt.slot["scale"], 1.0, "解码受限应先削画幅")
+
+    def test_decode_bound_not_inferred_from_display_fps(self):
+        """反例钉住：只看显示帧率会把解码受限判成"不是解码受限"。
+
+        源 30fps / 每帧解码 30ms（预算 33ms，占 90%）→ 观看端只能显示 15fps。
+        若用显示帧率算预算（1000/15 = 66ms），30ms 只占 45% → 判"链路受限" →
+        去降码率 → 对解码受限**完全无效**（解码量由像素数×帧数决定）。
+        """
+        fb = {"fps": 15.0, "src_fps": 30.0, "decode_ms": 30.0}
+        self.assertTrue(common.feedback_is_decode_bound(fb, fps=fb["src_fps"]))
+        # 用显示帧率算就判反了——这正是必须显式传 src_fps 的原因
+        self.assertFalse(common.feedback_is_decode_bound(fb, fps=fb["fps"]))
+
+    def test_degrade_never_raises_bitrate(self):
+        """降级**绝不能把码率调高**。
+
+        用户把 `codec.bitrate_kbps` 配到低于 `min_bitrate_kbps`（如 100 vs 默认
+        下限 400）时，"降到下限"这个兜底值反而**高于**当前码率——于是一个正在
+        为省带宽而降档的会话被反向加码。旧实现在调用点用
+        `cur_bitrate > min_bitrate` 挡住了这一路；抽成 `_degrade_bitrate` 后
+        这道门必须留在函数里（调用方有多处，挡在调用点会漏）。
+        """
+        rt = _RuntimeStub()
+        rt.slot["bitrate"] = 100_000            # 100 Kbps，低于下限 400
+        rt.slot["scale"] = 0.25                # 画幅已到底
+        rt.slot["fps"] = 10                    # 帧率已到底
+        p = pipeline.PipelineParams(rt.cfg)
+        cur = {"quality": 80, "scale": 0.25, "fps_now": 10, "video_mode": True,
+               "cur_bitrate": 100_000, "egress_bps": 0}
+        host._abr_degrade(rt, p, cur, 1.0, False, prefer="scale")
+        self.assertEqual(rt.video_encoder.calls, [],
+                         "降级把码率从 100 Kbps 抬到了 400 Kbps")
+
+    def test_degrade_bitrate_still_lowers_when_above_floor(self):
+        """正常情形下码率降级照旧生效（别把上一条修成"永不降码率"）。"""
+        rt = _RuntimeStub()
+        p = pipeline.PipelineParams(rt.cfg)
+        cur = {"quality": 80, "scale": 1.0, "fps_now": 30, "video_mode": True,
+               "cur_bitrate": 2_500_000, "egress_bps": 0}
+        host._abr_degrade(rt, p, cur, 1.0, False, prefer="bitrate")
+        self.assertEqual(rt.video_encoder.calls, [1_750_000])
+
+    def test_scale_first_then_bitrate_when_both_at_floor(self):
+        """画幅与帧率都到底后，码率才是最后一招——且此时才动它。"""
+        rt = _RuntimeStub()
+        rt.slot["scale"] = 0.25
+        rt.slot["fps"] = 10
+        p = pipeline.PipelineParams(rt.cfg)
+        cur = {"quality": 80, "scale": 0.25, "fps_now": 10, "video_mode": True,
+               "cur_bitrate": 2_500_000, "egress_bps": 0}
+        host._abr_degrade(rt, p, cur, 1.0, False, prefer="scale")
+        self.assertEqual(rt.video_encoder.calls, [1_750_000])
+
+    def test_jpeg_path_unchanged_by_scale_prefer(self):
+        """JPEG 模式（video_mode=False）走质量分支，prefer 不影响它。"""
+        rt = _RuntimeStub()
+        p = pipeline.PipelineParams(rt.cfg)
+        cur = {"quality": 80, "scale": 1.0, "fps_now": 30, "video_mode": False,
+               "cur_bitrate": 0, "egress_bps": 0}
+        host._abr_degrade(rt, p, cur, 1.0, False, prefer="scale")
+        self.assertEqual(rt.slot["quality"], 70)
+        self.assertEqual(rt.video_encoder.calls, [])
 
     def test_no_recovery_while_someone_reports_stuck(self):
         """有人报"卡"时不回升——回升会让链路刚缓过来又立刻顶回去。"""
