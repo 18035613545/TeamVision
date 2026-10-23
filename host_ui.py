@@ -24,6 +24,8 @@ from common import (
     APP_NAME,
     APP_VERSION,
     DEFAULT_CONFIG,
+    # net-050（v2.5）：反馈的过期门槛（与共享端 ABR 判据同源）
+    FB_MAX_AGE_S,
     REGISTER_POLICIES,
     data_dir,
     register_policy,
@@ -347,18 +349,23 @@ class HostConsole:
 
         # ---------- 客户端区 ----------
         client_card = self._card(self.root, "已连接观看端")
-        tree = ttk.Treeview(client_card, columns=("user", "addr", "uptime", "rate", "total"),
+        tree = ttk.Treeview(client_card,
+                            columns=("user", "addr", "uptime", "rate", "total", "quality"),
                             show="headings", height=4)
         tree.heading("user", text="用户")
         tree.heading("addr", text="地址")
         tree.heading("uptime", text="已连接")
         tree.heading("rate", text="速率")
         tree.heading("total", text="累计流量")
+        # net-050（v2.5）：观看端上报的实测体验（延迟/积压/丢帧）。
+        # 这一列是"我这边发得挺顺，但队友说卡"这类问题的落点——没有它就只能靠猜。
+        tree.heading("quality", text="观看体验")
         tree.column("user", width=80, minwidth=60, stretch=False, anchor="center")
         tree.column("addr", width=150, stretch=True)
         tree.column("uptime", width=70, stretch=False, anchor="center")
         tree.column("rate", width=80, stretch=False, anchor="center")
         tree.column("total", width=90, stretch=False, anchor="center")
+        tree.column("quality", width=150, stretch=False, anchor="center")
         tree.pack(fill="x", padx=10, pady=(2, 8))
         self._client_tree = tree
 
@@ -1081,6 +1088,7 @@ class HostConsole:
                 self._fmt_uptime(c["uptime_s"]),
                 "%.0f KB/s" % c["rate_kbps"],
                 "%.1f MB" % c["total_mb"],
+                self._fmt_quality(c.get("fb"), c.get("fb_age_s")),
             ))
         cached = getattr(self, "_client_rows_cache", None)
         if cached is None or len(cached) != len(rows):
@@ -1131,3 +1139,28 @@ class HostConsole:
         if seconds < 3600:
             return "%dm%02ds" % (seconds // 60, seconds % 60)
         return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+    @staticmethod
+    def _fmt_quality(fb, age_s):
+        """把一条质量反馈（common.parse_feedback 的结果）格式化成表格里的一格。
+
+        net-050（v2.5）：三种状态要分得开，否则用户读不出含义——
+          未上报：这一端还没发过反馈（旧版观看端，或反馈开关关了）；
+          已过期：曾经发过，但最近 10 秒没发（该端掉线了，或它自己卡到发不出）；
+          有数据：正常显示（延迟 / 积压 / 丢帧）。
+        """
+        if not fb:
+            return "未上报"
+        if age_s is not None and age_s > FB_MAX_AGE_S:
+            return "已过期"
+        parts = []
+        rtt = fb.get("rtt_ms", 0.0)
+        if rtt > 0:
+            parts.append("RTT %dms" % round(rtt))
+        backlog = fb.get("backlog_ms", 0.0)
+        if backlog >= 200:
+            parts.append("积压 %dms" % round(backlog))
+        drop = fb.get("drop_pct", 0.0)
+        if drop >= 1.0:
+            parts.append("丢帧 %.1f%%" % drop)
+        return " · ".join(parts) if parts else "正常"

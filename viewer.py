@@ -96,6 +96,8 @@ from common import (
     load_config,
     message_pump,
     parse_addr,
+    # net-050（v2.5）：质量反馈的字段口径与解析（两端共用同一份定义）
+    parse_feedback,
     parse_video_auto,
     recv_msg,
     # C1（优化方案 2026-09-17）：原 _cfg_int/_cfg_float 私有副本并入 common。
@@ -117,6 +119,13 @@ _LATENCY_RING_MAX = 900
 #: （默认 GOP 30 帧，但 8 帧的丢包已足够让参考链明显断裂），低于它对网络抖动
 #: 告警没有意义，高于它则用户已经在花屏了才留痕。
 _GAP_WARN_THRESHOLD = 8
+
+#: net-050（v2.5）：悬浮窗状态行里"积压"的显示门槛（毫秒）。
+#: 比共享端判"卡"的门槛（common.FB_STUCK_BACKLOG_MS=800）低——这一行是给**本机
+#: 用户**看的，早点看见"开始排队了"比等到已经卡住才知道有用。
+_FB_DISPLAY_BACKLOG_MS = 200.0
+#: 丢帧率的显示门槛（百分比）：低于 1% 是正常网络抖动，不必占状态行的位置。
+_FB_DISPLAY_DROP_PCT = 1.0
 
 #: 品牌标题（面板标题/悬浮窗占位文字共用）
 APP_TITLE = "%s v%s" % (APP_NAME, APP_VERSION)
@@ -365,6 +374,9 @@ class Channel:
         self._rcvbuf = safe_int(net_cfg.get("rcvbuf_kb", 4096), 4096, 0) * 1024
         self._read_idle_s = safe_float(net_cfg.get("read_idle_s", 5.0), 5.0, 0.5, 600.0)
         self._ping_interval = safe_float(viewer_cfg.get("ping_interval_s", 2.0), 2.0, 0.2, 600.0)
+        # net-050（v2.5）：质量反馈上报周期（秒）。0 = 关闭上报——共享端将看不到
+        # 这一端的体验，ABR 只能退回纯发送侧判据（与 v1.5.0 行为一致）。
+        self._fb_interval = safe_float(viewer_cfg.get("feedback_interval_s", 3.0), 3.0, 0.0, 600.0)
         self._backoff_base = safe_float(rc_cfg.get("base_s", 1.0), 1.0, 0.1, 600.0)
         self._backoff_max = safe_float(rc_cfg.get("max_s", 30.0), 30.0, 0.5, 3600.0)
         self._backoff_factor = safe_float(rc_cfg.get("factor", 2.0), 2.0, 1.0, 10.0)
@@ -416,6 +428,20 @@ class Channel:
         # 最长 5 秒重算一次（悬浮窗 15ms 轮询直接读缓存）。
         self._latency_ring = deque(maxlen=_LATENCY_RING_MAX)
         self._p_stats_cache = None
+        # ---- net-050（v2.5）：质量反馈的本地统计 ----
+        # 这些数只用于**上报**给共享端（让共享端知道"这一端看得卡"），不影响本地解码
+        # 决策——本地该追新还是追新、该丢 P 帧还是丢 P 帧，判据仍是 _backlog_exceeded。
+        #: 解码积压量（毫秒）：相对"本链路历史最优时延"的额外排队延迟。
+        #: 0 = 无积压。由 _backlog_exceeded 每次评估时刷新（不只是超阈值时才记）。
+        self._fb_backlog_ms = 0.0
+        #: 最近一次单帧解码耗时（毫秒）与滑动均值
+        self._fb_decode_ms = 0.0
+        self._fb_decode_avg_ms = 0.0
+        #: 网络丢帧率统计：应收帧数与累计序号缺口
+        self._fb_frames_seen = 0
+        self._fb_drop_pct = 0.0
+        #: 上次上报反馈的时刻（单调钟）
+        self._fb_sent_at = 0.0
         threading.Thread(
             target=self._receiver_loop, name="channel-recv", daemon=True
         ).start()
@@ -527,9 +553,16 @@ class Channel:
             delta = (seq - last) & 0xFFFFFFFF
             # delta==0 是重传（同一序号又来一遍），delta 极大说明回绕/换流，都不算丢帧
             if 1 < delta < 0x80000000:
-                self._video_seq_gaps = getattr(self, "_video_seq_gaps", 0) + delta - 1
+                gap = delta - 1
+                self._video_seq_gaps = getattr(self, "_video_seq_gaps", 0) + gap
+                # net-050：反馈用的丢帧计数**按上报周期清零**（`_video_seq_gaps` 是
+                # 累计值，只适合看趋势；判"现在卡不卡"必须看最近一个周期的丢帧率）。
+                self._fb_gaps = getattr(self, "_fb_gaps", 0) + gap
                 self._maybe_warn_video_seq_gaps()
         self._last_video_seq = seq
+        # net-050：应收帧计数（丢帧率的分母）。与 `_fb_gaps` 一起在每次上报后清零。
+        # 这里不做加锁——两个计数都是估算用的观感数据，丢掉一帧不影响结论。
+        self._fb_frames_seen = getattr(self, "_fb_frames_seen", 0) + 1
 
     def _maybe_warn_video_seq_gaps(self):
         """累计缺口跨过阈值时告警一次（带频道名与累计值），每条连接至多一条。
@@ -876,22 +909,45 @@ class Channel:
         线程绑定创建时的 socket：一旦该连接断开（_active_sock 不再是本 socket），
         立即退出；重连后由新连接的心跳线程接管，避免多次重连累积多个 ping 线程
         同时对同一连接发心跳。
+
+        net-050（v2.5）：同一条线程顺带承担**质量反馈上报**，两个周期各自独立。
+        为什么不另起一个线程：每条连接已经有一个控制线程，再加一个只是把线程数
+        翻倍；这里改成"睡到下一个 ping 或反馈时刻"，谁先到就发谁。
+        为什么反馈要独立于心跳周期：心跳周期是用户可配的（`ping_interval_s` 最大
+        600 秒），照它走的话反馈可能几分钟才发一次，共享端那边就成了瞎的。
         """
+        last_ping = 0.0
+        last_fb = 0.0
+        fb_interval = getattr(self, "_fb_interval", 0.0)
         while self._running:
-            time.sleep(self._ping_interval)
             if self._active_sock is not sock:
-                return  # 连接已重建/断开：旧连接的心跳线程退出
-            try:
-                t = time.time_ns()
-                # net-041（2026-09-24）：RTT 必须用**单调钟**测——旧实现在 PONG 侧用
-                # 墙钟相减，系统时间回拨幅度一旦超过真实 RTT，每个 pong 都算出负值被
-                # `0 < rtt_ms` 丢弃，`round_trip_ms` 永久锁存旧值，而
-                # `effective_latency_ms()` 优先取 RTT/2 → 延迟长期假显示。
-                # wire 上仍带墙钟 t（协议不变），本地另记一份单调时刻按 t 配对。
-                self._note_ping_sent(t, time.monotonic())
-                self._send_locked(sock, {"action": Act.PING, "t": t})
-            except (OSError, ValueError):
-                return  # 连接已断/发送超时，接收循环会负责重连
+                return  # 连接已重建/断开：旧连接的控制线程退出
+            now = time.monotonic()
+            nxt_ping = last_ping + self._ping_interval
+            nxt_fb = (last_fb + fb_interval) if fb_interval > 0 else float("inf")
+            wait = min(nxt_ping, nxt_fb) - now
+            if wait > 0:
+                time.sleep(min(wait, 0.5))
+                continue
+            if now >= nxt_ping:
+                last_ping = now
+                try:
+                    t = time.time_ns()
+                    # net-041（2026-09-24）：RTT 必须用**单调钟**测——旧实现在 PONG 侧用
+                    # 墙钟相减，系统时间回拨幅度一旦超过真实 RTT，每个 pong 都算出负值被
+                    # `0 < rtt_ms` 丢弃，`round_trip_ms` 永久锁存旧值，而
+                    # `effective_latency_ms()` 优先取 RTT/2 → 延迟长期假显示。
+                    # wire 上仍带墙钟 t（协议不变），本地另记一份单调时刻按 t 配对。
+                    self._note_ping_sent(t, time.monotonic())
+                    self._send_locked(sock, {"action": Act.PING, "t": t})
+                except (OSError, ValueError):
+                    return  # 连接已断/发送超时，接收循环会负责重连
+            if now >= nxt_fb:
+                last_fb = now
+                try:
+                    self._send_locked(sock, self._feedback_payload())
+                except (OSError, ValueError):
+                    return  # 同上：发送失败即连接已断
 
     def _note_ping_sent(self, t, mono=None):
         """记录一次 ping 的发出时刻（net-041：RTT 用单调钟配对，键为 wire 上的 t）。
@@ -949,7 +1005,18 @@ class Channel:
     _BACKLOG_RESYNC_GIVEUP_S = 5.0
 
     def _backlog_exceeded(self, now_m, batch):
-        """返回 (是否判定积压, 说明串)。只使用本端单调钟与"钟差/钟差之差"。"""
+        """返回 (是否判定积压, 说明串)。只使用本端单调钟与"钟差/钟差之差"。
+
+        net-050（v2.5）：除了判"是否积压"，这里还把**积压量**（毫秒）记到
+        `self._fb_backlog_ms`——那是上报给共享端的数（共享端据此决定要不要降档）。
+        两条判据量的不是同一件事：
+          ① 时延增量（extra_s）：相对"历史最优时延"的额外排队延迟，**需要基线**，
+             基线刚刷新时为 0；
+          ② 批内跨度比：这一批帧覆盖了多长的采集侧时间、却只用了多短的到达时间，
+             多出来的那截就是"一次性涌到"的排队量，**不需要基线**（首帧即可用）。
+        取两者的较大值。追新模式（`_resync`）下即使观测延迟已回落也照实报一个
+        不小于阈值的量——那一端此刻确实正在"卡住后恢复"，报 0 反而是撒谎。
+        """
         ts_last = int(batch[-1][0])
         d = now_m - ts_last / 1e6          # 含固定钟差，但下面只用它的**差值**
         base = getattr(self, "_lag_base_d", None)
@@ -967,16 +1034,79 @@ class Channel:
             extra_s = 0.0
         else:
             extra_s = d - base
+        backlog_s = max(0.0, extra_s)
         if extra_s > self._BACKLOG_LAG_US / 1e6:
+            self._note_backlog_ms(backlog_s)
             return True, "时延比基线多 %.1f 秒" % extra_s
         if len(batch) >= 2:
             # 批内跨度比：采集时刻差 vs 到达时刻差（两个都是"差"，与绝对钟无关）
             sender_span = (ts_last - int(batch[0][0])) / 1e6
             local_span = now_m - getattr(self, "_batch_first_at", now_m)
-            if sender_span - local_span > self._BACKLOG_LAG_US / 1e6:
+            span_excess = sender_span - local_span
+            if span_excess > backlog_s:
+                backlog_s = span_excess
+            if span_excess > self._BACKLOG_LAG_US / 1e6:
+                self._note_backlog_ms(backlog_s)
                 return True, ("本批 %d 帧覆盖采集侧 %.1f 秒、却只在 %.2f 秒内到达"
                               % (len(batch), sender_span, max(0.0, local_span)))
+        self._note_backlog_ms(backlog_s)
         return False, ""
+
+    def _note_backlog_ms(self, seconds):
+        """记录当前积压量（秒→毫秒），并处理追新模式下的"不小于阈值"下限。
+
+        追新模式（`_resync`）说明这一端**正在**卡住后恢复：此刻观测到的时延可能已经
+        回落（因为中间帧被丢了），但用户体验仍是坏的。照实报 0 等于让共享端以为
+        "这一端没问题"，于是继续按满码率发——那正是我们要修的场景。
+        """
+        ms = max(0.0, float(seconds) * 1000.0)
+        if getattr(self, "_resync", False):
+            ms = max(ms, self._BACKLOG_LAG_US / 1000.0)
+        self._fb_backlog_ms = ms
+
+    def _note_decode_ms(self, ms):
+        """记录单帧解码耗时（毫秒），并维护一个滑动均值。
+
+        均值用 0.8/0.2 的指数平滑：解码耗时是抖动的（关键帧比 P 帧贵一个量级），
+        取瞬时值会让"解码受限"的判定跟着 GOP 抖动，取长窗口均值又跟不上突发。
+        """
+        try:
+            ms = float(ms)
+        except (TypeError, ValueError):
+            return
+        prev = getattr(self, "_fb_decode_avg_ms", 0.0)
+        self._fb_decode_avg_ms = ms if prev <= 0 else (prev * 0.8 + ms * 0.2)
+        self._fb_decode_ms = ms
+
+    def _feedback_payload(self):
+        """组装本端的质量反馈报文（字段口径见 common.FEEDBACK_FIELDS）。
+
+        丢帧率按**本次上报周期**计算：`_fb_gaps`（帧序号缺口）与 `_fb_frames_seen`
+        （收到的帧数）在组装后一并清零，下个周期重新统计。累计值不适合判"现在卡
+        不卡"——一条半小时前的抖动会把之后所有周期的丢帧率都拉高。
+
+        计数不加锁：两个整数计数器，丢一次自增最多让丢帧率偏差千分之一，
+        而加锁会给接收线程的每帧路径上多一个争用点。
+        """
+        gaps = getattr(self, "_fb_gaps", 0)
+        seen = getattr(self, "_fb_frames_seen", 0)
+        total = gaps + seen
+        drop_pct = (gaps * 100.0 / total) if total > 0 else 0.0
+        self._fb_gaps = 0
+        self._fb_frames_seen = 0
+        # 留一份给 UI 读（清零的是计数，不是这个已算好的比率）
+        self._fb_drop_pct = drop_pct
+        with self.lock:
+            fps = self.fps
+        return {
+            "action": Act.FEEDBACK,
+            "fps": round(float(fps), 1),
+            "lat_ms": round(self.effective_latency_ms(), 1),
+            "rtt_ms": round(float(self.round_trip_ms), 1),
+            "backlog_ms": round(float(getattr(self, "_fb_backlog_ms", 0.0)), 1),
+            "drop_pct": round(drop_pct, 2),
+            "decode_ms": round(float(getattr(self, "_fb_decode_avg_ms", 0.0)), 2),
+        }
 
     def _check_backlog(self, sock, batch):
         """积压检测（net-017，net-034/035 重做）：落后明显时进入追新模式。
@@ -985,11 +1115,14 @@ class Channel:
         ——解码慢于到达时积压只能在 socket 缓冲里越堆越多，延迟爬升且永不回落。
         这里检测到积压即重置解码器、请求关键帧，并让后续批次只喂关键帧直到 IDR
         到位（参考链反正已断，跳过 P 帧可瞬间消化积压）。
+
+        net-050：**先评估再判冷却**——冷却期内不再重置解码器，但积压量仍要刷新，
+        否则上报给共享端的是十分钟前的旧值（冷却 10 秒、基线 60 秒，量级差得远）。
         """
         now_m = time.monotonic()
+        lagged, why = self._backlog_exceeded(now_m, batch)
         if now_m - getattr(self, "_resync_at", 0.0) < self._BACKLOG_COOLDOWN_S:
             return
-        lagged, why = self._backlog_exceeded(now_m, batch)
         if not lagged:
             return
         self._resync_at = now_m
@@ -1051,7 +1184,9 @@ class Channel:
                 self.video_mode = True
                 self._resync = False   # net-017：关键帧到位，退出追新模式
             with self._dec_lock():
+                t_dec = time.perf_counter()
                 frames = self._decoder.decode(nal)
+                self._note_decode_ms((time.perf_counter() - t_dec) * 1000.0)
             if getattr(self._decoder, "needs_keyframe", False):
                 # B6（2026-09-11）：解码器内部已复位（缺参考帧/坏 NAL → flush_buffers），
                 # 参考链被清空，但 _got_key 仍为 True——此后某个 P 帧若被解出（PyAV 在
@@ -1129,6 +1264,9 @@ class Channel:
                 if self.switch_source("local"):
                     self._notify_share_error(
                         "无法观看该队友，频道[%s]已切回本地画面" % self.name)
+        elif action == Act.FB_ADJUST:
+            # net-050（v2.5）：共享端转达的调档依据——"某个观看端看这条流很卡"。
+            self._on_feedback_adjust(msg)
         # 其余 action 忽略（旧 host 兼容已靠此：cap_probe 无响应即旧版）
 
     def effective_latency_ms(self):
@@ -1136,6 +1274,32 @@ class Channel:
         if self.round_trip_ms > 0:
             return self.round_trip_ms / 2.0
         return self.latency_ms
+
+    def _on_feedback_adjust(self, msg):
+        """处理共享端转达的调档指令：把本端的上行码率降下来。
+
+        方向：共享端收到"某个观看端看这条流很卡"的反馈后，判断该降的是**谁的**
+        码率。MultiView 下本机可能只是在转发队友的画面，真正持有编码器的是队友
+        那台机器——共享端会把指令发到那台机器去；本机收到时也一样照办（本机若
+        正在共享，就调自己的上行码率；没在共享则无事可做）。
+
+        报文里带的是**观感指标**而不是"降多少"：降多少由真正持有编码器的那一端
+        自己算——只有它知道自己的当前码率与配置上下界，共享端并不掌握这些。
+        """
+        fb = parse_feedback(msg)
+        if fb is None:
+            return
+        session = self._share
+        if session is None:
+            return   # 本机没在共享，无从调档
+        try:
+            changed = session.apply_feedback(fb)
+        except Exception as e:
+            log.warning("频道[%s] 按反馈调整上行码率失败: %s", self.name, e)
+            return
+        if changed:
+            log.info("频道[%s] 按观看端反馈调整上行码率 → %d Kbps",
+                     self.name, changed)
 
     def _authenticate(self, sock):
         """与服务端完成认证阶段：优先用已保存/缓存凭据自动登录，必要时弹框询问。"""
@@ -1623,6 +1787,14 @@ class Channel:
         self._p_stats_cache = None
         self.latency_ms = 0.0
         self.fps = 0.0
+        # net-050（v2.5）：反馈统计随切源/重连一并作废——新链路的积压量、丢帧率、
+        # 解码耗时与旧链路无关，混在一起会让共享端拿到一个不属于当前源的数。
+        self._fb_backlog_ms = 0.0
+        self._fb_decode_ms = 0.0
+        self._fb_decode_avg_ms = 0.0
+        self._fb_gaps = 0
+        self._fb_frames_seen = 0
+        self._fb_drop_pct = 0.0
 
     # ---------- MultiView：共享开关 / 观看源切换 ----------
 
@@ -4110,6 +4282,15 @@ class ViewerApp:
                 src = ch.watch_source
             if src != "local":
                 text += " · 源:%s" % self._describe_source(ch, src)
+            # net-050（v2.5）：把"本端正在排队/丢帧"如实摆出来。共享端拿到的是
+            # 同一组数（走 FEEDBACK 上报），这边摆出来是为了让用户不必等对方
+            # 排查——"我这边卡"到底是网络差还是本机解码慢，看这行就能分一半。
+            bl = getattr(ch, "_fb_backlog_ms", 0.0)
+            if bl >= _FB_DISPLAY_BACKLOG_MS:
+                text += " · 积压 %dms" % round(bl)
+            dp = getattr(ch, "_fb_drop_pct", 0.0)
+            if dp >= _FB_DISPLAY_DROP_PCT:
+                text += " · 丢帧 %.1f%%" % dp
         # 第 98 条：poll 每 15ms + 每帧都会调本函数，文本多数周期不变；
         # 未变时跳过 configure（仍走 Tcl 命令派发/选项查询，与解码/贴图抢主线程）。
         if text == self._last_status_text:
