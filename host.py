@@ -633,8 +633,10 @@ class ClientInfo:
         # net-051（v2.5）：该连接最近一次上报的质量反馈与上报时刻。
         # fb = common.parse_feedback 的规范化结果（只含合法字段）；
         # fb_at = 上报时刻（单调钟），用于判断"这条反馈是不是过期了"。
-        self.fb = None
-        self.fb_at = 0.0
+        # 两者必须**成对**读写，故存在一个元组里、用 note_feedback /
+        # latest_feedback 访问——分开写、分开读会读到"新反馈配旧时刻"（或反之），
+        # 把刚到的反馈当成过期的丢掉，或把早就过期的当成新鲜的。
+        self._fb_pair = (None, 0.0)
 
         # 独立发送通道：容量为 1，只保留最新帧；网络慢时自动丢弃中间帧
         self.send_queue = queue.Queue(maxsize=1)
@@ -716,6 +718,24 @@ class ClientInfo:
             return False
         times.append(now_m)
         return True
+
+    def note_feedback(self, fb, now=None):
+        """记录一条质量反馈（net-051）。fb 与它的时刻**成对**写入。
+
+        为什么要成对：读取方（ABR 节拍与 GUI 快照）要拿"反馈 + 上报时刻"判断
+        这条反馈是不是过期。分成两个属性分开写、分开读的话，读侧可能拿到
+        "新反馈配旧时刻"——那条刚到的反馈会被当成过期丢掉（而此时它恰恰最
+        该被采纳）；反之则把一条早已过期的反馈当成新鲜的，按幽灵观众的抱怨
+        去降所有人的画质。
+        """
+        self._fb_pair = (fb, now if now is not None else time.monotonic())
+
+    def latest_feedback(self):
+        """取最近一条质量反馈与其上报时刻；返回 (fb, fb_at)，没有则 (None, 0.0)。"""
+        pair = getattr(self, "_fb_pair", None)
+        if not pair:
+            return None, 0.0
+        return pair[0], pair[1]
 
     def note_rx(self, now=None):
         """记录一次客户端活跃（收到了它的任何数据，用于半开连接检测）。"""
@@ -1603,8 +1623,7 @@ class HostRuntime:
                 total_mb = getattr(info, "bytes_sent", 0) / (1024.0 * 1024.0)
             # net-051（v2.5）：把这一端的实测体验带进快照，供控制台"观看体验"列显示。
             # fb_age_s 让 UI 能区分"还没上报"与"上报过但已过期"。
-            fb = getattr(info, "fb", None)
-            fb_at = getattr(info, "fb_at", 0.0)
+            fb, fb_at = info.latest_feedback()
             clients.append({
                 "addr": info.addr,
                 "username": info.username,
@@ -2336,8 +2355,11 @@ def _handle_feedback(sock, info, runtime, msg, addr):
     if fb is None:
         log.debug("客户端 %s 的质量反馈里没有可用字段，已忽略", addr)
         return
-    info.fb = fb
-    info.fb_at = time.monotonic()
+    # 反馈与它的时刻**成对**写入、**成对**读出（见 ClientInfo.note_feedback /
+    # latest_feedback）。分开写、分开读的话，读侧可能拿到"新反馈配旧时刻"——
+    # 那一刻差得远（这条反馈刚到、上一次的是 20 秒前），于是这条刚到的反馈
+    # 被当成"已过期"丢弃；反之则会把一条早已过期的反馈当成新鲜的。
+    info.note_feedback(fb)
     source = getattr(info, "watch_source", "local") or "local"
     if source.startswith("peer:"):
         _forward_feedback_to_peer(runtime, source, fb, addr)
@@ -4137,8 +4159,7 @@ def _worst_local_feedback(runtime, now_mono=None):
     for info in infos:
         if getattr(info, "watch_source", "local") != "local":
             continue
-        fb = getattr(info, "fb", None)
-        at = getattr(info, "fb_at", 0.0)
+        fb, at = info.latest_feedback()
         if not fb or not at:
             continue
         if now - at > FB_MAX_AGE_S:

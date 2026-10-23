@@ -962,7 +962,16 @@ class Channel:
             nxt_fb = (last_fb + fb_interval) if fb_interval > 0 else float("inf")
             wait = min(nxt_ping, nxt_fb) - now
             if wait > 0:
-                time.sleep(min(wait, 0.5))
+                # 用 _stop_evt.wait 而不是 time.sleep：退出时能立刻醒来。
+                # 旧实现 time.sleep(0.5) 最多让线程多活半秒——单独看无所谓，
+                # 但这条线程同时管着心跳与反馈，停不干净会让"退出后仍在发包"
+                # 这种怪事偶尔出现。
+                stop_evt = getattr(self, "_stop_evt", None)
+                if stop_evt is not None:
+                    if stop_evt.wait(min(wait, 0.5)):
+                        return
+                else:
+                    time.sleep(min(wait, 0.5))
                 continue
             if now >= nxt_ping:
                 last_ping = now
@@ -980,9 +989,23 @@ class Channel:
             if now >= nxt_fb:
                 last_fb = now
                 try:
-                    self._send_locked(sock, self._feedback_payload())
+                    payload = self._feedback_payload()
+                except Exception as e:
+                    # 反馈组装里的任何意外**不许**杀死这条线程——它同时管着心跳，
+                    # 一旦死了整条连接的 RTT 统计与"重连后自动补发"都没了，而症状
+                    # 是"延迟一直显示 0、连着重连"，极难往反馈功能上想。
+                    # 记一条日志继续跑（下一个周期再试）。
+                    #
+                    # 注意这里的 except 范围**只包组装**：发送失败（连接已断）
+                    # 另算，那时要退出线程。顺序也不能反——把 ValueError 归进
+                    # "发送失败"那一档的话，组装时的 ValueError 会顺手把线程带走。
+                    log.warning("频道[%s] 质量反馈组装异常（已跳过本轮）：%s",
+                                self.name, e)
+                    continue
+                try:
+                    self._send_locked(sock, payload)
                 except (OSError, ValueError):
-                    return  # 同上：发送失败即连接已断
+                    return  # 发送失败即连接已断
 
     def _note_ping_sent(self, t, mono=None):
         """记录一次 ping 的发出时刻（net-041：RTT 用单调钟配对，键为 wire 上的 t）。

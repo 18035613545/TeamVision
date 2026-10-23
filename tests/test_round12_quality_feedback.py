@@ -205,6 +205,64 @@ class TestViewerFeedbackPayload(unittest.TestCase):
         self.assertAlmostEqual(ch._fb_decode_avg_ms, 30.0 * 0.8 + 10.0 * 0.2)
 
 
+class TestViewerControlThreadResilience(unittest.TestCase):
+    """控制线程（心跳 + 反馈）不许被反馈组装的意外杀死。
+
+    这条线程同时管着心跳与反馈：它一死，整条连接的 RTT 统计与"重连后自动
+    补发"都没了，而症状是"延迟一直显示 0、连着重连"——极难往反馈功能上想。
+    """
+
+    def _channel(self):
+        ch = _channel()
+        ch._running = True
+        ch._active_sock = object()
+        ch._ping_interval = 0.01
+        ch._fb_interval = 0.01
+        ch._stop_evt = threading.Event()
+        ch.sent = []
+
+        def _send(sock, obj, timeout=5.0):
+            ch.sent.append(obj)
+        ch._send_locked = _send
+        return ch
+
+    def test_feedback_error_does_not_kill_the_thread(self):
+        ch = self._channel()
+        calls = {"n": 0}
+        real = ch._feedback_payload
+
+        def _boom():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("模拟组装异常")
+            return real()
+        ch._feedback_payload = _boom
+        # 跑一小会儿：线程必须还活着并继续发心跳
+        th = threading.Thread(target=ch._control_ping_loop, args=(ch._active_sock,),
+                              daemon=True)
+        th.start()
+        time.sleep(0.3)
+        ch._running = False
+        ch._stop_evt.set()
+        th.join(timeout=2.0)
+        self.assertFalse(th.is_alive(), "控制线程没有退出")
+        self.assertGreaterEqual(calls["n"], 2,
+                                "反馈组装抛异常后线程不再继续上报")
+        self.assertTrue(any(o.get("action") == common.Act.PING for o in ch.sent),
+                        "心跳也该继续发（线程没被反馈的异常带走）")
+
+    def test_thread_stops_promptly_on_stop_event(self):
+        ch = self._channel()
+        th = threading.Thread(target=ch._control_ping_loop, args=(ch._active_sock,),
+                              daemon=True)
+        th.start()
+        time.sleep(0.05)
+        ch._running = False
+        ch._stop_evt.set()
+        th.join(timeout=1.0)
+        self.assertFalse(th.is_alive(), "退出时控制线程应当立刻醒来")
+
+
 class TestViewerSourceFps(unittest.TestCase):
     """源帧率由**帧的采集时间戳**估出——不能用观看端的显示帧率。
 
@@ -249,17 +307,26 @@ class TestViewerSourceFps(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class _InfoStub:
-    """ClientInfo 的最小替身：只实现反馈路径真正用到的接口。"""
+    """ClientInfo 的最小替身：只实现反馈路径真正用到的接口。
+
+    反馈用 `_fb_pair` + `note_feedback` / `latest_feedback`——与生产的
+    ClientInfo 同款（反馈与它的时刻成对读写，见 host.ClientInfo.note_feedback）。
+    """
 
     def __init__(self, addr="1.2.3.4:5700", watch_source="local", share_id=None):
         self.addr = addr
         self.username = "u"
         self.watch_source = watch_source
         self.share_id = share_id
-        self.fb = None
-        self.fb_at = 0.0
+        self._fb_pair = (None, 0.0)
         self.sent = []
         self.sock = object()
+
+    def note_feedback(self, fb, now=None):
+        self._fb_pair = (fb, now if now is not None else time.monotonic())
+
+    def latest_feedback(self):
+        return self._fb_pair[0], self._fb_pair[1]
 
     def send_ctrl(self, sock, obj, send_timeout=2.0):
         self.sent.append(obj)
@@ -331,9 +398,10 @@ class TestHostFeedbackDispatch(unittest.TestCase):
         host._dispatch_ctrl(info.sock, info, rt,
                             {"action": common.Act.FEEDBACK, "backlog_ms": 1200,
                              "rtt_ms": 80}, info.addr, {})
-        self.assertIsNotNone(info.fb)
-        self.assertAlmostEqual(info.fb["backlog_ms"], 1200.0)
-        self.assertGreater(info.fb_at, 0.0)
+        fb, fb_at = info.latest_feedback()
+        self.assertIsNotNone(fb)
+        self.assertAlmostEqual(fb["backlog_ms"], 1200.0)
+        self.assertGreater(fb_at, 0.0)
 
     def test_garbage_feedback_is_ignored(self):
         rt = _RuntimeStub()
@@ -341,7 +409,8 @@ class TestHostFeedbackDispatch(unittest.TestCase):
         rt.clients[info.sock] = info
         host._dispatch_ctrl(info.sock, info, rt,
                             {"action": common.Act.FEEDBACK}, info.addr, {})
-        self.assertIsNone(info.fb)
+        fb, _at = info.latest_feedback()
+        self.assertIsNone(fb)
 
     def test_source_is_taken_from_server_side_ledger(self):
         """归源以**服务端的订阅账本**为准，不采信报文里的任何"我在看哪一路"字段——
@@ -358,14 +427,38 @@ class TestHostFeedbackDispatch(unittest.TestCase):
 
 class TestWorstLocalFeedback(unittest.TestCase):
 
+    def test_feedback_and_its_timestamp_are_read_as_a_pair(self):
+        """反馈与它的上报时刻必须**成对**读出。
+
+        分开存、分开读的话，读侧可能拿到"新反馈配旧时刻"——那条刚到的反馈会被
+        当成过期丢掉（而此时它恰恰最该被采纳）。
+        """
+        info = _InfoStub()
+        info.note_feedback({"backlog_ms": 100.0}, now=1000.0)
+        fb, at = info.latest_feedback()
+        self.assertAlmostEqual(fb["backlog_ms"], 100.0)
+        self.assertAlmostEqual(at, 1000.0)
+        # 再写一条：旧的必须整条被换掉，不留半新半旧的状态
+        info.note_feedback({"backlog_ms": 200.0}, now=2000.0)
+        fb, at = info.latest_feedback()
+        self.assertAlmostEqual(fb["backlog_ms"], 200.0)
+        self.assertAlmostEqual(at, 2000.0)
+
+    def test_real_client_info_exposes_the_pair(self):
+        """生产用的 ClientInfo 也有这两个方法（别让测试替身与生产分家）。"""
+        info = host.ClientInfo("1.2.3.4:5700")
+        self.assertEqual(info.latest_feedback(), (None, 0.0))
+        info.note_feedback({"backlog_ms": 5.0})
+        fb, at = info.latest_feedback()
+        self.assertAlmostEqual(fb["backlog_ms"], 5.0)
+        self.assertGreater(at, 0.0)
+
     def test_only_local_source_counted(self):
         """只采信本机源订阅者：订阅 peer:X 的观众归队友的编码器管（net-016 同口径）。"""
         a = _InfoStub(watch_source="local")
-        a.fb = {"backlog_ms": 100.0}
-        a.fb_at = time.monotonic()
+        a.note_feedback({"backlog_ms": 100.0}, now=time.monotonic())
         b = _InfoStub(watch_source="peer:1")
-        b.fb = {"backlog_ms": 5000.0}
-        b.fb_at = time.monotonic()
+        b.note_feedback({"backlog_ms": 5000.0}, now=time.monotonic())
         rt = _RuntimeStub({a.sock: a, b.sock: b})
         worst, count = host._worst_local_feedback(rt)
         self.assertEqual(count, 1)
@@ -375,8 +468,7 @@ class TestWorstLocalFeedback(unittest.TestCase):
         """过期反馈不算数：观看端可能已掉线或自己卡到发不出，拿旧反馈降码率
         等于按幽灵观众的抱怨调整所有人的画质。"""
         a = _InfoStub()
-        a.fb = {"backlog_ms": 5000.0}
-        a.fb_at = time.monotonic() - (common.FB_MAX_AGE_S + 1.0)
+        a.note_feedback({"backlog_ms": 5000.0}, now=time.monotonic() - (common.FB_MAX_AGE_S + 1.0))
         rt = _RuntimeStub({a.sock: a})
         worst, count = host._worst_local_feedback(rt)
         self.assertIsNone(worst)
@@ -384,11 +476,11 @@ class TestWorstLocalFeedback(unittest.TestCase):
 
     def test_stuck_wins_over_merely_large(self):
         a = _InfoStub()
-        a.fb = {"backlog_ms": 500.0, "drop_pct": 0.0}   # 没到阈值，不算卡
-        a.fb_at = time.monotonic()
+        a.note_feedback({"backlog_ms": 500.0, "drop_pct": 0.0},
+                        now=time.monotonic())   # 没到阈值，不算卡
         b = _InfoStub()
-        b.fb = {"backlog_ms": 100.0, "drop_pct": 20.0}  # 丢帧率超阈值，算卡
-        b.fb_at = time.monotonic()
+        b.note_feedback({"backlog_ms": 100.0, "drop_pct": 20.0},
+                        now=time.monotonic())   # 丢帧率超阈值，算卡
         rt = _RuntimeStub({a.sock: a, b.sock: b})
         worst, count = host._worst_local_feedback(rt)
         self.assertEqual(count, 2)
@@ -409,9 +501,8 @@ class TestAbrDrivenByFeedback(unittest.TestCase):
         这正是本轮要补的盲区：旧判据在这条链路上什么都看不见。"""
         rt = _RuntimeStub()
         info = _InfoStub()
-        info.fb = {"backlog_ms": 2000.0, "drop_pct": 0.0, "fps": 30.0,
-                   "decode_ms": 2.0}
-        info.fb_at = time.monotonic()
+        info.note_feedback({"backlog_ms": 2000.0, "drop_pct": 0.0, "fps": 30.0,
+                   "decode_ms": 2.0}, now=time.monotonic())
         rt.clients[info.sock] = info
         p = pipeline.PipelineParams(rt.cfg)
         host._perf_tick(rt, p)
@@ -428,9 +519,8 @@ class TestAbrDrivenByFeedback(unittest.TestCase):
         """
         rt = _RuntimeStub()
         info = _InfoStub()
-        info.fb = {"backlog_ms": 2000.0, "drop_pct": 0.0, "fps": 15.0,
-                   "src_fps": 30.0, "decode_ms": 30.0}
-        info.fb_at = time.monotonic()
+        info.note_feedback({"backlog_ms": 2000.0, "drop_pct": 0.0, "fps": 15.0,
+                   "src_fps": 30.0, "decode_ms": 30.0}, now=time.monotonic())
         rt.clients[info.sock] = info
         p = pipeline.PipelineParams(rt.cfg)
         host._perf_tick(rt, p)
@@ -506,9 +596,8 @@ class TestAbrDrivenByFeedback(unittest.TestCase):
         rt.slot["bitrate"] = 1_000_000
         rt.slot["scale"] = 0.5
         info = _InfoStub()
-        info.fb = {"backlog_ms": 3000.0, "drop_pct": 0.0, "fps": 30.0,
-                   "decode_ms": 2.0}
-        info.fb_at = time.monotonic()
+        info.note_feedback({"backlog_ms": 3000.0, "drop_pct": 0.0, "fps": 30.0,
+                   "decode_ms": 2.0}, now=time.monotonic())
         rt.clients[info.sock] = info
         p = pipeline.PipelineParams(rt.cfg)
         host._perf_tick(rt, p)
@@ -520,9 +609,8 @@ class TestAbrDrivenByFeedback(unittest.TestCase):
     def test_healthy_feedback_does_not_degrade(self):
         rt = _RuntimeStub()
         info = _InfoStub()
-        info.fb = {"backlog_ms": 10.0, "drop_pct": 0.0, "fps": 30.0,
-                   "decode_ms": 2.0}
-        info.fb_at = time.monotonic()
+        info.note_feedback({"backlog_ms": 10.0, "drop_pct": 0.0, "fps": 30.0,
+                   "decode_ms": 2.0}, now=time.monotonic())
         rt.clients[info.sock] = info
         p = pipeline.PipelineParams(rt.cfg)
         host._perf_tick(rt, p)
