@@ -201,7 +201,13 @@ def _release_list(opener, cache_path, now):
         # 旧实现只 log.debug，断网/代理/限流在日志里一个字都看不到
         log.info("更新检查失败（不影响使用）：%s", e)
         old = cached.get("releases") if cached else None
-        return (old if isinstance(old, list) else []), False
+        if isinstance(old, list):
+            return old, False
+        # 旧格式缓存（只有 tag/page）同样能顶：断网时"仍然告诉用户有新版"
+        # 比"装作没事"有用。
+        if isinstance(cached.get("tag") if cached else None, str):
+            return [{"tag_name": cached["tag"], "html_url": cached.get("page")}], False
+        return [], False
     if not releases:
         return [], False
     try:

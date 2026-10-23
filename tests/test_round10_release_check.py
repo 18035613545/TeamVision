@@ -198,5 +198,50 @@ class TestCheckUpdateIsWired(unittest.TestCase):
         self.assertEqual(len(calls), 1, "两端应共享同一份发布列表缓存")
 
 
+class TestOfflineFallback(unittest.TestCase):
+    """断网时旧缓存要能顶住——"仍然告诉用户有新版"比"装作没事"有用。
+
+    第 12 轮把缓存格式从"判定结果"改成"原始发布列表"，旧格式缓存
+    （只有 tag/page）也要照样能读、照样能在断网时顶上去。
+    """
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: [os.remove(os.path.join(d, f))
+                                 for f in os.listdir(d)])
+        self.cache = os.path.join(d, "uc.json")
+        self.cfg = {"update_check": {"enabled": True}}
+
+    def _broken(self, url, timeout=None):
+        raise OSError("no network")
+
+    def _write_cache(self, payload):
+        with open(self.cache, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def test_old_format_cache_survives_outage(self):
+        self._write_cache({"tag": "v99.0.0", "page": "https://h.example/r",
+                           "checked_at": 1e9})
+        msg = update_check.check_update(self.cfg, now=1e9, opener=self._broken,
+                                        cache_path=self.cache)
+        self.assertIsNotNone(msg)
+        self.assertIn("v99.0.0", msg)
+
+    def test_new_format_cache_survives_outage(self):
+        self._write_cache({"checked_at": 1e9,
+                           "releases": [{"tag_name": "v88.0.0",
+                                         "html_url": "https://h.example/r2"}]})
+        msg = update_check.check_update(self.cfg, now=1e9, opener=self._broken,
+                                        cache_path=self.cache)
+        self.assertIsNotNone(msg)
+        self.assertIn("v88.0.0", msg)
+
+    def test_no_cache_and_outage_returns_none(self):
+        """既没缓存又断网 → 不提示（调用方保持旧文案不动），且不抛。"""
+        msg = update_check.check_update(self.cfg, now=1e9, opener=self._broken,
+                                        cache_path=self.cache)
+        self.assertIsNone(msg)
+
+
 if __name__ == "__main__":
     unittest.main()
