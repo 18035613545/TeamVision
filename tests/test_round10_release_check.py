@@ -149,5 +149,54 @@ class TestRoleFilename(unittest.TestCase):
         self.assertIsNone(update_check.role_of_asset_name(None))
 
 
+class TestCheckUpdateIsWired(unittest.TestCase):
+    """第 12 轮：`check_update` 已按角色判定（不再是"最新标签比本机新"）。
+
+    这组用例盯住"接线"这件事本身：两端各自判定、共享同一份缓存。
+    """
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: [os.remove(os.path.join(d, f))
+                                 for f in os.listdir(d)])
+        self.cache = os.path.join(d, "uc.json")
+        self.cfg = {"update_check": {"enabled": True}}
+
+    def _releases(self):
+        return [{"tag_name": "v1.7.0",
+                 "html_url": "https://h.example/r/v1.7.0",
+                 "assets": _assets("viewer", "1.7.0", 11)}]
+
+    def _check(self, role, calls=None):
+        return update_check.check_update(self.cfg, now=1e9,
+                                         opener=_opener(self._releases()),
+                                         cache_path=self.cache, role=role)
+
+    def test_viewer_is_prompted_for_viewer_package(self):
+        msg = self._check("viewer")
+        self.assertIsNotNone(msg)
+        self.assertIn("v1.7.0", msg)
+
+    def test_host_is_not_prompted_for_viewer_only_release(self):
+        """最新那次发布只有观看端的包 → 共享端**不该**被提示去装它
+        （装错包比"没提示"糟得多）。"""
+        self.assertIsNone(self._check("host"))
+
+    def test_both_roles_share_one_cache(self):
+        """缓存里存的是原始发布列表，两端共用同一份：共享端先查过之后，
+        观看端再查**不该**重新打网络（否则同机两端每次启动都各打一次）。"""
+        calls = []
+
+        def opener(url, timeout=None):
+            calls.append(url)
+            return _Resp(json.dumps(self._releases()).encode("utf-8"))
+
+        update_check.check_update(self.cfg, now=1e9, opener=opener,
+                                  cache_path=self.cache, role="host")
+        update_check.check_update(self.cfg, now=1e9, opener=opener,
+                                  cache_path=self.cache, role="viewer")
+        self.assertEqual(len(calls), 1, "两端应共享同一份发布列表缓存")
+
+
 if __name__ == "__main__":
     unittest.main()

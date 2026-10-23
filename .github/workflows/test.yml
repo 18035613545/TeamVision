@@ -23,7 +23,11 @@ name: tests
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  # 第 12 轮（2026-10-23）：加手动触发。CI 此前**无法手动跑**（没有 workflow_dispatch），
+  # "本机跑一遍看看"就得推个分支或改点无关代码——这是"门禁之外的事"长期没被跑起来的原因。
+  workflow_dispatch:
 
 jobs:
   unit:
@@ -50,3 +54,74 @@ jobs:
         env:
           TV_CI_NO_CONDA: "1"
         run: cmd /c run_tests.bat
+
+  # ---------------------------------------------------------------------------
+  # 打包链冒烟（PyInstaller → Inno Setup）
+  # ---------------------------------------------------------------------------
+  # AGENTS.md 早就写着"打包、签名、安装包这条发布链**完全在 CI 之外**，改完只能手工
+  # 验证"。第 9 轮的实际代价：installer.iss 里被我写进一条 Inno **不存在**的指令
+  # （UninstallablePathsDataFiles），单测与 lint 全绿，直到真正编译安装包才炸——
+  # 那条链当时连一道自动化的门都没有。
+  #
+  # 这个 job 把"能自动化的那部分"拉进 CI：编译两个 exe、编安装包、校验产物。
+  # 刻意**不含**的两件事：
+  #   - 签名：需要证书（TEAMVIEW_PFX），CI 里没有；sign_exe.ps1 无证书时会自签，
+  #     那是本机行为，验不了"对外分发"这件事；
+  #   - frpc.exe：第三方产物，不在仓库里（installer.iss 对它是 skipifsourcedoesntexist）。
+  #
+  # 触发：workflow_dispatch（手动）或打 v* tag（发版前自动验一次）。不挂 PR——
+  # 一次完整打包约 10 分钟，不该让每个 PR 都付这个时间。
+  package:
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Vendor dxcam/comtypes (spec 的硬校验缺一即失败)
+        # fps-host.spec 里有一道硬校验：产物分析里找不到 dxcam/comtypes 就 SystemExit。
+        # vendor/ 被 .gitignore（里面是第三方代码），干净克隆必然缺——必须在这里补上，
+        # 否则打包 job 永远只报"缺 dxcam"，测不到真正的打包问题。
+        # dxcam 必须取自 GitHub ra1nty/DXcam（PyPI 上的 0.0.5 是滞后的旧版），
+        # 且钉到 v0.3.0 这个 tag：HEAD 会随上游变动，CI 不该被上游的提交弄红。
+        run: |
+          python -m pip install --no-deps "git+https://github.com/ra1nty/DXcam@v0.3.0" comtypes --target=vendor
+      - name: Build exes (PyInstaller，版本与本机构建一致)
+        run: |
+          python -m pip install pyinstaller==6.21.0
+          pyinstaller --noconfirm --clean fps-host.spec
+          pyinstaller --noconfirm --clean fps-viewer.spec
+      - name: Verify exe artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($p in @("dist\fps-host\fps-host.exe", "dist\fps-viewer\fps-viewer.exe")) {
+            if (-not (Test-Path $p)) { throw "产物缺失: $p" }
+          }
+          # 视频编解码的 FFmpeg DLL 必须打进去：漏了 import av 失败被 codec.py 静默
+          # 吞掉，用户端无声退回 JPEG（带宽 5-20 倍回退）——这正是 dist-068 的成因。
+          $av = Get-ChildItem -Recurse "dist\fps-viewer\_internal" -Filter "av*.dll" -ErrorAction SilentlyContinue
+          if (-not $av) { throw "观看端产物里没有 av 的 FFmpeg DLL —— collect_all('av') 可能被抹掉了" }
+      - name: Install Inno Setup 6
+        run: choco install innosetup --yes --no-progress
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "找不到 ISCC.exe（choco 安装路径不对？）" }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 退出码 $LASTEXITCODE" }
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem dist -Filter "TeamVision-Setup-*.exe" | Select-Object -First 1
+          if (-not $exe) { throw "安装包未生成" }
+          "安装包: $($exe.Name) $([math]::Round($exe.Length/1MB,1)) MB" | Write-Output
+

@@ -2287,8 +2287,10 @@ class ViewerApp:
         # 从子线程调用 Tk 触发 RuntimeError，导致对话框永远不弹出）
         self._mainloop_ready.set()
         # B4（实现方案 §6）：启动后台查一次更新，命中时只改面板状态栏默认文本，失败静默
+        # role="viewer"：判定的是"观看端这一端"有没有更新的安装包。
         update_check.start_background_check(
-            self.cfg, lambda msg: self._post_ui(lambda m=msg: self._set_update_hint(m)))
+            self.cfg, lambda msg: self._post_ui(lambda m=msg: self._set_update_hint(m)),
+            role="viewer")
         try:
             self.root.mainloop()
         finally:

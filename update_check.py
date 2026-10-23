@@ -11,8 +11,17 @@
 **第 10 轮：判定口径从"标签比本机新"改成"本机角色有比本机新的安装包"**（见
 `check_release`）。单包时代 `releases/latest` 的 tag 就是唯一版本号；一旦共享端/观看端
 拆包分别发版，最新那次发布只属于其中一端，另一端的 `latest` 会长期停在更旧的 tag 上，
-按标签判定的话那端用户**从此收不到任何更新提示**。界面仍只消费第 9 轮那套文案
-（`check_update`），`check_release` 当前不接线——拆包发版落地时由它接管文案生成即可。
+按标签判定的话那端用户**从此收不到任何更新提示**。
+
+**第 12 轮（2026-10-23）：这条口径已接线。** `check_update` 现在就是 `check_release`
+的文案出口（传 role），两者共用同一份实现与同一份缓存：
+
+- 缓存里存的是**原始发布列表**而不是判定结果——判定要按角色来，同一台机器上的
+  共享端与观看端看到的是同一份列表、结论不同，把判定结果存进缓存会让两端互相
+  把对方的缓存顶掉（每次都判定为"缓存过期"而重新打网络）。
+- 取数从 `/releases/latest` 改成 `/releases?per_page=10`：拆包后要在一页里找出
+  "本机角色最高的那次发布"，只取 latest 一条是找不出来的。
+- 单包时代的发布（资产名里认不出 Host/Viewer）退回"最高标签"口径，与旧行为一致。
 """
 
 import json
@@ -29,7 +38,6 @@ from common import APP_VERSION, data_dir
 log = logger_mod.get_logger()
 
 REPO = "18035613545/TeamVision"
-API_URL = "https://api.github.com/repos/%s/releases/latest" % REPO
 RELEASES_LIST_URL = "https://api.github.com/repos/%s/releases?per_page=10" % REPO
 RELEASES_URL = "https://github.com/%s/releases" % REPO
 #: 隧道服务商控制台（共享端「公网地址」旁的链接）。穿透本身是外部工具，
@@ -144,93 +152,105 @@ def _read_cache(path):
     return data if isinstance(data, dict) else None
 
 
-def _fetch_tag(opener):
-    """返回 (tag, page)。page = API 给的 html_url；缺失/非 http(s) 时为 None。
+def _fetch_releases(opener):
+    """取最近若干次发布（列表）；失败向上抛，由调用方按"降级用旧缓存"处理。
 
-    旧返回形状是裸 tag（字符串）；本轮多带一个页面地址，全部调用点都在本模块内，
-    测试也一律走 check_update 的文案出口，故直接改为元组。
+    返回值统一是 **list**：`/releases` 正常返回数组；万一拿到单条对象
+    （旧接口形态）也包成单元素列表，调用方不必再分叉。
     """
-    with opener(API_URL, timeout=HTTP_TIMEOUT_S) as resp:
+    with opener(RELEASES_LIST_URL, timeout=HTTP_TIMEOUT_S) as resp:
         raw = resp.read()
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", "replace")
     data = json.loads(raw)
-    if not isinstance(data, dict):
-        return None, None
-    tag = data.get("tag_name")
-    page = data.get("html_url")
-    if not (isinstance(page, str) and page.lower().startswith(_SAFE_SCHEMES)):
-        page = None
-    return (tag if isinstance(tag, str) else None), page
+    if isinstance(data, dict):
+        data = [data]
+    return data if isinstance(data, list) else []
 
 
-def check_update(cfg=None, now=None, opener=None, cache_path=None):
-    """返回提示文案（有新版）或 None（无更新/失败静默）。opener 供测试注入。"""
+def _release_list(opener, cache_path, now):
+    """取发布列表（带 24h 缓存）；返回 (releases, fetched)。
+
+    缓存里存的是**原始列表**，不是"判定结果"——判定要按角色来（拆包后两端
+    看到的是同一份列表、结论不同），把判定结果存进缓存会让共用一台机器的
+    共享端与观看端互相覆盖缓存（每次都判定为"缓存过期"而重新打网络）。
+
+    网络失败时用**旧缓存**继续顶着（哪怕已过期）：断网时"仍然告诉用户有新版"
+    比"装作没事"有用。反之若连旧缓存都没有，返回空列表，由调用方保持旧文案。
+    """
+    cached = _read_cache(cache_path)
+    checked_at = cached.get("checked_at") if cached else None
+    age = (now - checked_at) if isinstance(checked_at, int | float) else None
+    # dist-006（2026-09-18）：年龄必须为**非负**才算新鲜——时钟回拨/缓存被写成
+    # 未来时刻时 (now - checked_at) 恒负，旧判据永远"新鲜"→ 该机器永久不再检查更新
+    fresh = isinstance(age, int | float) and 0 <= age < CACHE_TTL_S
+    if fresh:
+        releases = cached.get("releases")
+        if isinstance(releases, list):
+            return releases, False
+        # 兼容旧格式缓存（{"tag":..., "page":..., "checked_at":...}）：它只记了一个
+        # tag，够还原成"一条没有资产的发布"——角色判定会退回标签口径，与旧行为一致。
+        # 不做这层兼容的话，升级后的第一次检查会白白打一次网络。
+        if isinstance(cached.get("tag"), str):
+            old = {"tag_name": cached["tag"], "html_url": cached.get("page")}
+            return [old], False
+    try:
+        releases = _fetch_releases(opener)
+    except Exception as e:  # 断网/DNS/限流一律降级用旧缓存
+        # dist-007（2026-09-18）：失败必须留痕（默认 INFO 级别可见）——
+        # 旧实现只 log.debug，断网/代理/限流在日志里一个字都看不到
+        log.info("更新检查失败（不影响使用）：%s", e)
+        old = cached.get("releases") if cached else None
+        return (old if isinstance(old, list) else []), False
+    if not releases:
+        return [], False
+    try:
+        # dist-005：临时名带 PID+线程号（host/viewer 同机运行时不再互踩）；
+        # replace 失败重试一次（Windows 上撞读即 PermissionError）
+        tmp = "%s.%d.%d.tmp" % (cache_path, os.getpid(), threading.get_ident())
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"checked_at": now, "releases": releases}, f)
+            try:
+                os.replace(tmp, cache_path)
+            except PermissionError:
+                time.sleep(0.05)
+                os.replace(tmp, cache_path)
+        except OSError as e:
+            # cfg-006（2026-09-20）：临时名唯一（PID+线程），写失败后旧实现
+            # 只 info、不清理 → 磁盘永久留下一个不会再被覆盖回收的残渣
+            # （同族的 _persist_upgrade 落的是含明文 frp token 的整份配置，
+            # 三处清理口径要一致）。replace 成功后 tmp 已不存在，remove 静默。
+            log.info("更新检查缓存写入失败（忽略）：%s", e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    except Exception as e:
+        log.info("更新检查缓存写入异常（忽略）：%s", e)
+    return releases, True
+
+
+def check_update(cfg=None, now=None, opener=None, cache_path=None, role="host"):
+    """返回提示文案（有新版）或 None（无更新/失败静默）。opener 供测试注入。
+
+    第 12 轮（2026-10-23）：判定口径改为"**本机这一端**有没有更新的安装包"
+    （`check_release`），而不是"最新标签是否比本机新"——拆包发版后
+    `releases/latest` 只会是其中一端的新版本，另一端的 latest 停在更旧的 tag 上，
+    按标签判定的话那端用户**从此收不到更新提示**。单包时代两者等价。
+
+    role 决定"本机这一端"是谁：共享端传 "host"、观看端传 "viewer"。
+    """
     if not enabled(cfg):
         return None
-    if opener is None:
-        opener = urllib.request.urlopen
-    if now is None:
-        now = time.time()
-    if cache_path is None:
-        base = data_dir()
-        if not base:
-            return None          # dist-005：无可写数据目录时不检查（旧实现拼接 None）
-        cache_path = os.path.join(base, CACHE_NAME)
-    cached = _read_cache(cache_path)
-    tag = cached.get("tag") if cached else None
-    page = cached.get("page") if cached else None
-    if not (isinstance(page, str) and page.lower().startswith(_SAFE_SCHEMES)):
-        page = None
-    checked_at = cached.get("checked_at") if cached else None
-    # dist-006（2026-09-18）：年龄必须为**非负**才算新鲜——时钟回拨/缓存被写成未来
-    # 时刻时 (now - checked_at) 恒负，旧判据永远"新鲜"→ 该机器永久不再检查更新
-    age = (now - checked_at) if isinstance(checked_at, int | float) else None
-    fresh = (isinstance(tag, str) and age is not None and 0 <= age < CACHE_TTL_S)
-    if not fresh:
-        try:
-            fetched, page = _fetch_tag(opener)
-        except Exception as e:  # 断网/DNS/限流一律降级用旧缓存
-            # dist-007（2026-09-18）：失败必须留痕（默认 INFO 级别可见）——
-            # 旧实现只 log.debug，断网/代理/限流在日志里一个字都看不到
-            log.info("更新检查失败（不影响使用）：%s", e)
-            fetched = None
-        if fetched is not None:
-            tag = fetched
-            checked_at = now
-            try:
-                # dist-005：临时名带 PID+线程号（host/viewer 同机运行时不再互踩）；
-                # replace 失败重试一次（Windows 上撞读即 PermissionError）
-                tmp = "%s.%d.%d.tmp" % (cache_path, os.getpid(),
-                                        threading.get_ident())
-                try:
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump({"checked_at": checked_at, "tag": tag, "page": page}, f)
-                    try:
-                        os.replace(tmp, cache_path)
-                    except PermissionError:
-                        time.sleep(0.05)
-                        os.replace(tmp, cache_path)
-                except OSError as e:
-                    # cfg-006（2026-09-20）：临时名唯一（PID+线程），写失败后旧实现
-                    # 只 info、不清理 → 磁盘永久留下一个不会再被覆盖回收的残渣
-                    # （同族的 _persist_upgrade 落的是含明文 frp token 的整份配置，
-                    # 三处清理口径要一致）。replace 成功后 tmp 已不存在，remove 静默。
-                    log.info("更新检查缓存写入失败（忽略）：%s", e)
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-            except Exception as e:
-                log.info("更新检查缓存写入异常（忽略）：%s", e)
-        elif not (isinstance(tag, str) and is_newer(tag)):
-            return None
-    if not is_newer(tag):
+    info = check_release(role, current=APP_VERSION, now=now, opener=opener,
+                         cache_path=cache_path)
+    if not info.get("update"):
         return None
-    # 页面地址随文案一起回落给 UI：旧缓存/API 缺 html_url 时仍指向 Releases 列表页，
+    # 页面地址随文案一起给 UI：缺 html_url 时由 _release_info 兜到 Releases 页，
     # 用户至少能落到"最近的正式发布"那一屏。tag 来自远端（GitHub 允许 tag 含空格），
     # 用 ' - ' 隔开，hint_headline 按最后一个 " - " 切开，句子里的连字符不受影响。
-    return "有新版 %s 可下载（GitHub Releases） - %s" % (tag, page or RELEASES_URL)
+    return "有新版 %s 可下载（GitHub Releases） - %s" % (info["tag"], info["url"])
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +284,10 @@ def _release_info(role, current, best_tag, release, asset):
     version = best_tag.lstrip("vV")
     page = release.get("html_url")
     if not (isinstance(page, str) and page.lower().startswith(_SAFE_SCHEMES)):
-        page = "%s/tag/v%s" % (RELEASES_URL, version)
+        # 回退到固定 Releases 页（不是按 tag 拼出来的 tag 页）：tag 页在 tag 含
+        # 斜杠等怪字符时拼不出合法地址，而固定页永远打得开——用户至少能落到
+        # "最近的正式发布"那一屏（第 9 轮的既定口径）。
+        page = RELEASES_URL
     download = None
     match_asset = None
     if asset is not None:
@@ -290,48 +313,16 @@ def _release_info(role, current, best_tag, release, asset):
             "download_url": download, "current": current, "source": "releases"}
 
 
-def check_release(role, current=APP_VERSION, now=None, opener=None, cache_path=None):
-    """判定"本机这一端有没有更新的安装包"；返回结构见 _release_info，失败返回
-    {"update": False, "source": "none"/"releases"}，**绝不抛**。
+def _select_release(role, releases, current):
+    """从发布列表里挑出"本机这一端"的最新版本；纯函数，不碰网络与磁盘。
 
     目标版本的选择：
-      1. 在第一页发布里按**角色**找：只认文件名里带 Host/Viewer 且与本机角色一致的
+      1. 在发布里按**角色**找：只认文件名里带 Host/Viewer 且与本机角色一致的
          安装包，取其中最高的版本；
       2. 若一条都认不出（单包时代的发布，或产物名改版），退回"最高标签版本"——
          与旧口径一致；
       3. 预发布标签（解析失败）一律跳过，不会被当成可更新版本。
-    API 不可用时 `update=False` 并标明 source=none，调用方保持旧文案不动。
     """
-    if now is None:
-        now = time.time()
-    if opener is None:
-        opener = urllib.request.urlopen
-    if cache_path is None:
-        base = data_dir()
-        if not base:
-            return {"update": False, "source": "none"}
-        cache_path = os.path.join(base, "release_check.json")
-    cached = _read_cache(cache_path)
-    if cached is not None and isinstance(cached.get("checked_at"), int | float):
-        age = now - cached["checked_at"]
-        cached_info = cached.get("info")
-        if (0 <= age < CACHE_TTL_S and cached.get("role") == role
-                and isinstance(cached_info, dict)):
-            return cached_info
-    try:
-        with opener(RELEASES_LIST_URL, timeout=HTTP_TIMEOUT_S) as resp:
-            raw = resp.read()
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", "replace")
-        releases = json.loads(raw)
-    except Exception as e:
-        log.info("更新检查失败（不影响使用）：%s", e)
-        return {"update": False, "source": "none"}
-    if isinstance(releases, dict):          # 单包形回包：与 /latest 同构
-        releases = [releases]
-    if not isinstance(releases, list):
-        return {"update": False, "source": "none"}
-
     # (版本元组, tag, release, 资产文件名)；单跑一条坏条目不能拖垮整次比对
     candidates = []
     for rel in releases:
@@ -361,35 +352,46 @@ def check_release(role, current=APP_VERSION, now=None, opener=None, cache_path=N
         pool = [(p, t, r, None) for p, t, r in candidates]
     best = max(pool, key=lambda c: c[0])
     if not is_newer(best[1], current):
-        info = {"update": False, "current": current, "source": "releases",
+        return {"update": False, "current": current, "source": "releases",
                 "version": best[1].lstrip("vV")}
-    else:
-        info = _release_info(role, current, best[1], best[2], best[3])
-    try:
-        tmp = "%s.%d.%d.tmp" % (cache_path, os.getpid(), threading.get_ident())
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"checked_at": now, "role": role, "info": info}, f)
-        os.replace(tmp, cache_path)
-    except OSError as e:
-        log.info("更新检查缓存写入失败（忽略）：%s", e)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    return info
+    return _release_info(role, current, best[1], best[2], best[3])
 
 
-def start_background_check(cfg, post_msg):
+def check_release(role, current=APP_VERSION, now=None, opener=None, cache_path=None):
+    """判定"本机这一端有没有更新的安装包"；返回结构见 _release_info，失败返回
+    {"update": False, "source": "none"/"releases"}，**绝不抛**。
+
+    第 12 轮（2026-10-23）：本函数不再自己管缓存——发布列表统一由
+    `_release_list` 取（缓存里存的是**原始列表**，判定按角色现算）。这样
+    共用一台机器的共享端与观看端共享同一份缓存，不会互相把对方的缓存顶掉。
+    """
+    if now is None:
+        now = time.time()
+    if opener is None:
+        opener = urllib.request.urlopen
+    if cache_path is None:
+        base = data_dir()
+        if not base:
+            return {"update": False, "source": "none"}
+        cache_path = os.path.join(base, CACHE_NAME)
+    releases, _fetched = _release_list(opener, cache_path, now)
+    if not releases:
+        return {"update": False, "source": "none"}
+    return _select_release(role, releases, current)
+
+
+def start_background_check(cfg, post_msg, role="host"):
     """启动后台检查线程；发现新版时调用 post_msg(text)（调用方负责回 UI 主线程）。
 
     返回 Thread 或 None（开关关闭时不启动）。线程内任何异常都不外抛。
+    role 决定判定的是哪一端（共享端 "host" / 观看端 "viewer"）。
     """
     if not enabled(cfg):
         return None
 
     def work():
         try:
-            msg = check_update(cfg)
+            msg = check_update(cfg, role=role)
         except Exception as e:
             log.info("更新检查线程异常（不影响使用）：%s", e)
             return

@@ -131,8 +131,10 @@ class HostConsole:
         # （旧实现客户端表格每 500ms 被全删全建两次 → 可见闪烁 + 与推流线程抢锁翻倍）。
         self._poll()
         # B4（实现方案 §6）：启动后台查一次更新，仅写状态栏，失败静默
+        # role="host"：判定的是"共享端这一端"有没有更新的安装包（拆包后两端
+        # 分别发版，按标签判定会让另一端永远收不到提示）。
         update_check.start_background_check(
-            getattr(self.runtime, "cfg", None), self._show_update_hint)
+            getattr(self.runtime, "cfg", None), self._show_update_hint, role="host")
 
     def _show_update_hint(self, msg):
         # ui-019（2026-09-18）：与其余跨线程回调统一走 _post_ui 收口——旧实现直接
@@ -653,7 +655,8 @@ class HostConsole:
             # G28/ui-040（2026-09-24）：勾选后本会话原先不触发任何检查——update_check
             # 是一次性检查且只有启动期调用，opt-in 要等下次启动才生效，而状态栏却写
             # "每 24 小时向 GitHub 查询一次"（双重谎报）。勾选即补一次后台检查。
-            update_check.start_background_check(cfg, self._show_update_hint)
+            update_check.start_background_check(cfg, self._show_update_hint,
+                                                role="host")
         else:
             # 第 9 轮：取消勾选 = 不再提示，入口也要收起，否则按钮留在界面上
             # 点开还是不连网的旧版本页

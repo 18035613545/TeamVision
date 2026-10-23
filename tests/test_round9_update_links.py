@@ -99,7 +99,9 @@ class TestCheckUpdateMessage(unittest.TestCase):
                                   cache_path=cache)
         with open(cache, encoding="utf-8") as f:
             saved = json.load(f)
-        self.assertEqual(saved.get("page"), "https://h.example/r")
+        # 第 12 轮：缓存里存的是**原始发布列表**（判定按角色现算），页面地址
+        # 随发布记录一起存着——不再是顶层的一个 "page" 字段。
+        self.assertEqual(saved["releases"][0]["html_url"], "https://h.example/r")
 
     def test_no_update_returns_none(self):
         self.assertIsNone(self._run({"tag_name": "v0.0.1",
