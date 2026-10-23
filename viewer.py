@@ -3670,6 +3670,14 @@ class ViewerApp:
             else:
                 lines.append("频道「%s」延迟 P95：样本不足（近 30s 仅 %d 帧）" % (
                     ch.name, pn))
+            # net-051：把"本端为什么卡"落到诊断包里——积压（排队）与丢帧（链路）
+            # 指向完全不同的排查方向，混在"延迟高"一个字里会让人往错的方向查。
+            # 这几项同时也是本端报给共享端的那组数（同一口径，common.FEEDBACK_FIELDS）。
+            backlog = getattr(ch, "_fb_backlog_ms", 0.0)
+            drop = getattr(ch, "_fb_drop_pct", 0.0)
+            decode_ms = getattr(ch, "_fb_decode_avg_ms", 0.0)
+            lines.append("频道「%s」质量反馈：积压 %.0f ms · 丢帧 %.2f%% · 单帧解码 %.2f ms"
+                         % (ch.name, backlog, drop, decode_ms))
         # frpc 程序：同时搜索 exe 目录与 SakuraFrpLauncher 默认安装目录
         try:
             frpc_path = self.cfg["host"]["frp"].get("frpc_path", "") or "frpc.exe"

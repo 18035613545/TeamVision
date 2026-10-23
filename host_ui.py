@@ -907,6 +907,22 @@ class HostConsole:
             extra.append("最近公网自检: 失败（%s）" % ns.get("detail", ""))
         else:
             extra.append("最近公网自检: 未运行")
+        # net-051：把**各观看端报上来的实测体验**落进诊断包。"共享端这边一切正常，
+        # 观众说卡"是这个项目最难查的一类问题，而报告里原本只有本端的发送速率，
+        # 看不到任何一端"到底卡在哪"——现在每个在线观众一行。
+        for c in (clients or []):
+            fb = c.get("fb")
+            age = c.get("fb_age_s")
+            who = c.get("username") or c.get("addr") or "?"
+            if not fb:
+                extra.append("观看体验[%s]: 未上报" % who)
+            elif age is not None and age > FB_MAX_AGE_S:
+                extra.append("观看体验[%s]: 已过期（%.0f 秒前上报）" % (who, age))
+            else:
+                extra.append("观看体验[%s]: RTT %.0f ms · 积压 %.0f ms · 丢帧 %.2f%%"
+                             " · 单帧解码 %.2f ms" % (
+                                 who, fb.get("rtt_ms", 0.0), fb.get("backlog_ms", 0.0),
+                                 fb.get("drop_pct", 0.0), fb.get("decode_ms", 0.0)))
         base_dir = data_dir()
         if not base_dir:
             messagebox.showwarning(APP_NAME, "找不到可写的数据目录，无法导出诊断包",
