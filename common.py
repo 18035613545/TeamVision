@@ -55,9 +55,15 @@ MAGIC_SERVER = b"OK02"
 #: C2（实现方案 §7）：协议版本单一载体。v2.2 = D1 挑战-应答认证（chal/auth_proof/
 #: reg_proof）上线；v2.3（2026-09-18，auth-002）= proof 绑定 user + 域分隔串。
 #: v2.4（2026-10-09，net-045）= 视频帧载荷带 4 字节单调递增帧序号。
+#: v2.5（2026-10-23，net-051）= 观看端→共享端的质量反馈（**控制消息**）。
+#:
+#: v2.5 刻意**不动视频载荷布局**——`VIDEO_SEQ_MINOR` 仍是 4，帧头仍是 14 字节。
+#: 反馈走的是 CTRL 通道，两端的 action 分发对未知 action 一律静默忽略
+#: （host 的 `_dispatch_ctrl` 末尾无 else；viewer 的 `_handle_ctrl` 注释"其余 action 忽略"），
+#: 所以 (2,5) 观看端对 (2,4) 共享端只是反馈没人收，反之亦然，两种组合都照常工作。
 #: 握手主判仍是 MAGIC（旧客户端拒绝行为不变），proto 字段随认证期 CTRL 消息携带，
 #: 服务端据此判断对端能力（观看端以 auth_result.proto 的次版本号作为探测结果）。
-PROTOCOL_VERSION = (2, 4)
+PROTOCOL_VERSION = (2, 5)
 
 #: 观看端要求的最低次版本：v2.2 的 proof 只签 nonce、且原实现信任对端下发的
 #: KDF 参数（auth-002）；新版只与 ≥ 该版本的共享端走挑战-应答，旧版本明确拒绝
@@ -150,6 +156,122 @@ class Act:
     CHAL = "chal"
     AUTH_PROOF = "auth_proof"
     REG_PROOF = "reg_proof"
+    # net-051（v2.5）：观看端→共享端的质量反馈（解码积压/丢帧/RTT/解码耗时…）。
+    # 走 CTRL 通道，**不碰视频载荷布局**——所以它不需要抬 VIDEO_SEQ_MINOR，
+    # 与 (2,4) 的对端之间天然互通（对方不认识这个 action 就静默忽略）。
+    FEEDBACK = "feedback"
+    # net-051（v2.5）：共享端→某个共享成员的调档指令。方向与 FEEDBACK 相反：
+    # 观看端把"我这边看得卡"报给共享端，共享端判定该降谁的码率后，
+    # 把建议码率发给真正持有编码器的那一端（MultiView 里可能是队友的机器）。
+    FB_ADJUST = "fb_adjust"
+
+
+# ---------------------------------------------------------------------------
+# net-051（v2.5）：质量反馈的字段口径——**两端共用的单一真源**
+# ---------------------------------------------------------------------------
+#
+# 为什么要共用一份定义：反馈是**对端给的数**，观看端按一套区间组装、共享端按另一套
+# 区间解析的话，两端看到的同一个指标会差出一截（"我报了 900ms 积压，你那边显示 600ms"），
+# 排查时根本不知道该信谁。这里把"字段名 + 合法区间"钉在一处，组装与解析都走它。
+#
+# 字段语义：
+#   fps        观看端**实际显示**帧率（浮点；0 = 暂无画面）
+#   src_fps    **源**帧率（浮点；由帧的采集时间戳差算出，0 = 暂无）
+#   lat_ms     观看端观测到的端到端延迟（毫秒；优先 RTT/2，无 RTT 时回退 ts 差估算）
+#   rtt_ms     应用层往返时延（毫秒；单调钟测得，不受两端墙钟偏差影响）
+#   backlog_ms 解码积压量（毫秒）：相对"本链路历史最优时延"的额外排队延迟
+#   drop_pct   网络丢帧率（百分比）：帧序号缺口占应收帧数的比例
+#   decode_ms  单帧解码耗时（毫秒）：与 1000/**src_fps** 比较可判断"解码受限"还是
+#              "链路受限"——不能用 fps：解码受限时观看端**显示**帧率恰恰是掉下来的
+#              那个数，用它算预算会把"解码受限"判成"不是解码受限"（见
+#              feedback_is_decode_bound 的说明）。
+FEEDBACK_FIELDS = {
+    "fps": (0.0, 240.0),
+    "src_fps": (0.0, 240.0),
+    "lat_ms": (0.0, 60_000.0),
+    "rtt_ms": (0.0, 60_000.0),
+    "backlog_ms": (0.0, 60_000.0),
+    "drop_pct": (0.0, 100.0),
+    "decode_ms": (0.0, 1_000.0),
+}
+
+#: 判定"这一端看得卡"的阈值（共享端侧用，观看端 UI 也用它标红）：
+#: 积压超过该值 = 观看端排队跟不上（解码受限或下行受限）；丢帧率超过该值 = 链路在丢帧。
+FB_STUCK_BACKLOG_MS = 800.0
+FB_STUCK_DROP_PCT = 5.0
+#: 反馈有效期（秒）：超过即视为过期。观看端可能已经掉线、或它自己卡到发不出反馈——
+#: 拿着一条半小时前的旧反馈去降码率，等于按幽灵观众的抱怨调整所有人的画质。
+FB_MAX_AGE_S = 10.0
+
+
+def parse_feedback(msg):
+    """解析一条质量反馈报文；返回规范化 dict，**不可用时返回 None**（绝不抛）。
+
+    规范化 = 只保留 `FEEDBACK_FIELDS` 里存在且合法的字段，数值一律夹到合法区间。
+    缺字段不算错（对端可能只报部分指标），一个合法字段都没有才算不可用。
+
+    为什么夹紧而不是丢弃越界值：反馈是**观感数据**，不是控制指令——一个越界的
+    backlog 最多让共享端误判一次该不该降档，而丢弃它会让"对端报了个离谱值"这件事
+    变成静默无感。这里把不可解析的（非数值/布尔/NaN）丢掉，把可解析的越界值夹住。
+    """
+    if not isinstance(msg, dict):
+        return None
+    out = {}
+    for name, (lo, hi) in FEEDBACK_FIELDS.items():
+        v = msg.get(name)
+        if v is None or isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv != fv:          # NaN：任何比较都假，夹紧会把它变成上界，必须单独剔掉
+            continue
+        out[name] = max(lo, min(hi, fv))
+    if not out:
+        return None
+    return out
+
+
+def feedback_is_stuck(fb):
+    """判断一条反馈是否表示"这一端看得卡"；fb 为 None 或字段缺失时返回 False。"""
+    if not isinstance(fb, dict):
+        return False
+    backlog = fb.get("backlog_ms")
+    drop = fb.get("drop_pct")
+    if isinstance(backlog, (int, float)) and backlog >= FB_STUCK_BACKLOG_MS:
+        return True
+    if isinstance(drop, (int, float)) and drop >= FB_STUCK_DROP_PCT:
+        return True
+    return False
+
+
+def feedback_is_decode_bound(fb, fps=None):
+    """判断"卡"的原因是**解码受限**（该削画幅/帧率）还是**链路受限**（该削码率）。
+
+    判据：单帧解码耗时占掉了帧预算的多少。预算 = 1000/源帧率 毫秒；解码耗时超过
+    预算的 80% 即判为解码受限——此时**降码率帮不上忙**（解码量由像素数×帧数决定，
+    与码率无关），该动的是分辨率与帧率。
+
+    **`fps` 必须是源的帧率，不是观看端的显示帧率**——这两者在解码受限时恰恰
+    不相等：源 30fps、每帧解码 30ms（预算 33ms）时，观看端**显示**只有 15fps
+    （它只能解出一半的帧）。用显示帧率算预算（1000/15 = 66ms）会把
+    "30ms < 53ms" 判成"不是解码受限"，于是共享端去降码率——而降码率对
+    解码受限**完全无效**，真正该动的是分辨率。调用方应传源帧率。
+
+    fps 缺省时退回反馈里自带的 fps；两者都没有则判不了，返回 False（按链路
+    受限处理，与既有 ABR 口径一致：宁可少动一项，也不要在判据不足时乱改画质）。
+    """
+    if not isinstance(fb, dict):
+        return False
+    decode_ms = fb.get("decode_ms")
+    if not isinstance(decode_ms, (int, float)) or decode_ms <= 0:
+        return False
+    rate = fps if isinstance(fps, (int, float)) and fps and fps > 0 else fb.get("fps")
+    if not isinstance(rate, (int, float)) or not rate or rate <= 0:
+        return False
+    budget_ms = 1000.0 / float(rate)
+    return decode_ms >= budget_ms * 0.8
 
 
 #: D1：PBKDF2 参数单一真源（host.AccountManager 与 viewer 挑战流共用，
@@ -236,7 +358,7 @@ VIDEO_FLAG_KEY = 0x01
 
 #: 品牌与应用信息
 APP_NAME = "队友视野"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 APP_COPYRIGHT = "Copyright © 2026 TeamVision Team"
 #: 作者署名（显示于启动画面与 exe 版本信息）
 APP_AUTHOR = "by 西琳"
@@ -371,6 +493,10 @@ DEFAULT_CONFIG = {
             "read_idle_s": 5.0  # 超过该秒数未收到任何数据判定连接停滞
         },
         "ping_interval_s": 2.0,  # 应用层心跳/测 RTT 间隔
+        # net-051（2026-10-23）：质量反馈上报周期（秒）。观看端定期把实测体验
+        # （解码积压/丢帧/RTT/单帧解码耗时）报给共享端，共享端据此调画质。
+        # 0 = 关闭上报——共享端退回纯发送侧判据（与 1.5.0 行为一致）。
+        "feedback_interval_s": 3.0,
         "reconnect": {
             "base_s": 1.0,
             "max_s": 30.0,

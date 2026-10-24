@@ -22,6 +22,7 @@ import pipeline
 # 会把整个共享端巨模块拖进观看端进程，且 host/viewer/share 三套 clamp 互为副本。
 from common import (
     SeqCounter,
+    feedback_is_stuck,
     normalize_region,
     pack_frame,
     pack_video,
@@ -30,6 +31,18 @@ from common import (
 )
 
 log = logger.get_logger()
+
+#: net-051（v2.5）：两次降档之间的最小间隔（秒）。共享端每 2 秒转达一次"卡"的
+#: 反馈，不设间隔的话 2500 Kbps 会在十几秒内一路塌到下限——用户还没来得及反应，
+#: 画质已经掉到底了。
+_FB_DROP_COOLDOWN_S = 10.0
+#: 多久没再收到"卡"的反馈后，开始把码率往配置值回升（秒）。
+_FB_RESTORE_S = 30.0
+#: 回升一档的倍率（与 host 侧 ABR 的码率回升同款：1.3 倍一步，不跳回原值，
+#: 免得链路刚好抽风一下就瞬间反弹）。
+_FB_RESTORE_STEP = 1.3
+#: 降一档的倍率。
+_FB_DROP_STEP = 0.7
 
 
 class ScreenShareSession:
@@ -66,6 +79,14 @@ class ScreenShareSession:
         self._target_width = safe_int(codec_cfg.get("target_width", 854) or 0, 854, 0)
         self._encoder_sel = codec_cfg.get("encoder", "auto")
         self._bitrate = safe_int(codec_cfg.get("bitrate_kbps", 2500), 2500, 64) * 1000
+        # net-051（v2.5）：反馈调档的三个锚点——配置值（回升目标）、下限（不塌穿）、
+        # 最近一次"卡"反馈的时刻（回升计时）。_bitrate 本身就是当前码率（bps）。
+        self._cfg_bitrate = self._bitrate
+        self._min_bitrate = safe_int(codec_cfg.get("min_bitrate_kbps", 400), 400, 64) * 1000
+        if self._min_bitrate > self._cfg_bitrate:
+            self._min_bitrate = self._cfg_bitrate
+        self._fb_stuck_at = 0.0        # 最近一次"卡"反馈时刻（0=还没被投诉过）
+        self._fb_changed_at = 0.0      # 最近一次调档时刻（降档冷却用）
         self._keyint = safe_int(codec_cfg.get("keyint", 60), 60, 1, 3600)
         self._preset = codec_cfg.get("preset", "") or ""
         self._still_enabled = bool(still_cfg.get("enabled", False))
@@ -136,6 +157,57 @@ class ScreenShareSession:
         """线程安全：请求尽快补一帧可独立解码的帧（host 转达的 req_keyframe）。"""
         self._key_evt.set()
 
+    def apply_feedback(self, fb):
+        """按观看端反馈下调上行码率；返回调整后的码率（Kbps），未调整返回 None。
+
+        net-051（v2.5）：这一端是**真正持有编码器**的那一方，共享端改不了它的码率，
+        所以"某个观看端看这条流很卡"必须落到这里才有用。
+
+        只在反馈判定为"卡"时下调（`common.feedback_is_stuck`）；降档有 10 秒冷却——
+        共享端每 2 秒转达一次"卡"，不设冷却的话码率会在十几秒内一路塌到下限。
+        下限取配置的 `codec.min_bitrate_kbps`。
+
+        线程安全：`_bitrate` 是一个数字的读写（CPython 下不会撕裂），上传线程下一帧
+        就会用上新的值；不为此加锁——加锁反而把"接收线程等上传线程"变成一种新的耦合。
+        """
+        if not feedback_is_stuck(fb):
+            return None
+        now = time.monotonic()
+        self._fb_stuck_at = now
+        if now - self._fb_changed_at < _FB_DROP_COOLDOWN_S:
+            return None
+        new_b = max(self._min_bitrate, int(self._bitrate * _FB_DROP_STEP))
+        if new_b >= self._bitrate:
+            return None          # 已在下限，无可再降
+        self._bitrate = new_b
+        self._fb_changed_at = now
+        log.info("频道[%s] 观看端反馈画面卡，上行码率降至 %d Kbps",
+                 self._name, new_b // 1000)
+        return new_b // 1000
+
+    def _maybe_restore_bitrate(self, now=None):
+        """久未收到"卡"的反馈 → 把码率往配置值回升一档；返回新码率（Kbps）或 None。
+
+        为什么由这一端自己计时、而不是让共享端下发"可以升了"：共享端只转达"卡"的
+        反馈（不卡的不转——否则同一条流上"一个卡一个不卡"的两份反馈会互相打架），
+        要它再发一条"可以升了"就得再引入一套跨端状态同步；而这里的判据是纯本地的
+        （多久没被投诉），自己算最简单也最不容易不同步。
+        """
+        now = time.monotonic() if now is None else now
+        if not self._fb_stuck_at:
+            return None
+        if now - self._fb_stuck_at < _FB_RESTORE_S:
+            return None
+        if self._bitrate >= self._cfg_bitrate:
+            self._fb_stuck_at = 0.0    # 已回到配置值，投诉记录清空
+            return None
+        new_b = min(self._cfg_bitrate, int(self._bitrate * _FB_RESTORE_STEP))
+        self._bitrate = new_b
+        self._fb_stuck_at = now       # 继续计时：下一档再等一个周期
+        log.info("频道[%s] 观看端反馈已恢复，上行码率回升至 %d Kbps",
+                 self._name, new_b // 1000)
+        return new_b // 1000
+
     @property
     def alive(self):
         return self._thread is not None and self._thread.is_alive()
@@ -176,6 +248,9 @@ class ScreenShareSession:
         try:
             while not self._stop.is_set():
                 t0 = time.perf_counter()
+                # net-051（v2.5）：久未收到"卡"的反馈 → 码率往配置值回升一档。
+                # 放在循环头部：恢复是"没有消息时"发生的事，不能等下一条反馈才想起来。
+                self._maybe_restore_bitrate()
                 ts_us = int(time.time() * 1_000_000)
                 # 第 3 条：不在此处清除 key_evt。只有真正补出关键帧/发送成功后才清除，
                 # 避免 host 转达的唯一一次请求在 bgr=None/采集异常/静止无缓存路径上被丢掉。

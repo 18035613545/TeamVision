@@ -21,7 +21,7 @@ log = logger.get_logger()
 #: 旧实现把标记挂在 CaptureManager 实例上（`self._pick_warned`），而 `_rebuild()`
 #: 每次都新建实例 → 注释写着"只报一次"、实际每次重建都重报一条，静止/独占全屏下
 #: 约每 1.5 秒一条把 5MB 滚动日志冲刷干净。模块级集合跨实例生效（同 codec 侧口径）。
-_PICK_WARNED: set = set()
+_PICK_WARNED: set[str] = set()
 _PICK_WARNED_MAX = 32
 
 

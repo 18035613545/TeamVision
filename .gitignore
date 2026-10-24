@@ -55,3 +55,7 @@ _tmp_*.py
 
 # auth-015（2026-09-20）：bootstrap 已消耗标记（与 accounts.json 同目录的数据产物，不入库）
 accounts.json.bootstrap-used
+
+# ---- AI 辅助工具的本地输出目录（.archify/）----
+# 本机 AI 工具的会话/中间产物，不属于仓库内容；此前一直靠"没 add 就没提交"侥幸挡住。
+.archify/

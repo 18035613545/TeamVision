@@ -1,10 +1,10 @@
-﻿; 队友视野 TeamVision v1.5.0 安装脚本 (Inno Setup 6)
+﻿; 队友视野 TeamVision v1.6.0 安装脚本 (Inno Setup 6)
 ; 使用方法: 运行 build_installer.bat，或手动执行 ISCC.exe installer.iss
 
 [Setup]
 AppId={{A7D3F9E1-5B2C-4E8A-9D1F-6C4B0A2E8F11}
 AppName=队友视野 TeamVision
-AppVersion=1.5.0
+AppVersion=1.6.0
 ; 版本真源是 common.APP_VERSION：改版本时本文件的文件头注释 / AppVersion /
 ; OutputBaseFilename 三处必须同步（tests/test_round9_installer.py 会逐条比对）。
 AppPublisher=TeamVision Team
@@ -18,7 +18,7 @@ DefaultDirName={localappdata}\Programs\TeamVision
 PrivilegesRequired=lowest
 DefaultGroupName=队友视野
 OutputDir=dist
-OutputBaseFilename=TeamVision-Setup-1.5.0
+OutputBaseFilename=TeamVision-Setup-1.6.0
 SetupIconFile=assets\app.ico
 UninstallDisplayIcon={app}\fps-viewer\fps-viewer.exe
 Compression=lzma2

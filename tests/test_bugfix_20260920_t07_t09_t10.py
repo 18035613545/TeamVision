@@ -142,7 +142,14 @@ class TestUpdateCheckUntestedBranches(unittest.TestCase):
         self.assertTrue(calls, "未来时刻的缓存被判成新鲜 → 永久不再检查（dist-006 回归）")
 
     def test_negative_age_guard_present_in_source(self):
-        src = inspect.getsource(update_check.check_update)
+        """dist-006：年龄判定必须带 0 <= 下界。
+
+        扫**整个模块**的源码（而不是某个函数）：第 12 轮把取数与写缓存挪进了
+        `_release_list`，钉死函数名的话下一次再挪就又"失真"了；要钉的是
+        "年龄为负（未来时刻）不得判成新鲜"这条判据本身还在。
+        行为侧由上面的 `test_future_checked_at_is_not_fresh` 盯着（必须继续打网络）。
+        """
+        src = inspect.getsource(update_check)
         self.assertRegex(src, r"0\s*<=\s*age",
                          "总时限年龄判定缺 0 <= 下界（dist-006 的修复点）")
 
@@ -161,8 +168,13 @@ class TestUpdateCheckUntestedBranches(unittest.TestCase):
                 {"update_check": {"enabled": True}}, opener=boom, cache_path=None))
 
     def test_temp_name_carries_pid_and_thread(self):
-        """dist-005：临时文件名的唯一性（host/viewer 同机运行不互踩）。"""
-        src = inspect.getsource(update_check.check_update)
+        """dist-005：临时文件名的唯一性（host/viewer 同机运行不互踩）。
+
+        扫**整个模块**的源码而不是某个函数：第 12 轮把取数与写缓存挪进了
+        `_release_list`，钉死函数名的话下一次再挪就又"失真"了；这里要钉的是
+        "临时名带 PID + 线程号"这条性质本身。
+        """
+        src = inspect.getsource(update_check)
         self.assertRegex(src, r'"\.tmp"\s*%\s*\(.*os\.getpid\(\).*threading\.get_ident\(\)\)'
                          r"|\.tmp[^\n]*%[^\n]*os\.getpid\(\)",
                          "更新检查缓存临时名未带 PID")

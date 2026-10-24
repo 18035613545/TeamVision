@@ -64,11 +64,12 @@ class TestCheckUpdate(_TmpCache):
     #: dist-004（2026-09-18）后更新检查默认关闭——测试统一显式开启
     _ON = {"update_check": {"enabled": True}}
 
-    def _check(self, payload, calls=None, cfg=None):
+    def _check(self, payload, calls=None, cfg=None, role="host"):
         return update_check.check_update(cfg if cfg is not None else self._ON,
                                          now=self.NOW,
                                          opener=_opener(payload, calls),
-                                         cache_path=self.cache)
+                                         cache_path=self.cache,
+                                         role=role)
 
     def test_newer_tag_shows_hint_and_caches(self):
         calls = []
@@ -78,8 +79,11 @@ class TestCheckUpdate(_TmpCache):
         self.assertEqual(len(calls), 1)
         with open(self.cache, encoding="utf-8") as f:
             cached = json.load(f)
-        self.assertEqual(cached["tag"], "v99.0.0")
+        # 第 12 轮：缓存里存的是**原始发布列表**（判定按角色现算），
+        # 不再是"判定结果"——两端共用一台机器时结果缓存会互相顶掉。
         self.assertEqual(cached["checked_at"], self.NOW)
+        self.assertIsInstance(cached["releases"], list)
+        self.assertEqual(cached["releases"][0]["tag_name"], "v99.0.0")
 
     def test_same_or_older_tag_no_hint(self):
         self.assertIsNone(self._check({"tag_name": "v" + common.APP_VERSION}))

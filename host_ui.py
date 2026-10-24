@@ -24,6 +24,8 @@ from common import (
     APP_NAME,
     APP_VERSION,
     DEFAULT_CONFIG,
+    # net-051（v2.5）：反馈的过期门槛（与共享端 ABR 判据同源）
+    FB_MAX_AGE_S,
     REGISTER_POLICIES,
     data_dir,
     register_policy,
@@ -129,8 +131,10 @@ class HostConsole:
         # （旧实现客户端表格每 500ms 被全删全建两次 → 可见闪烁 + 与推流线程抢锁翻倍）。
         self._poll()
         # B4（实现方案 §6）：启动后台查一次更新，仅写状态栏，失败静默
+        # role="host"：判定的是"共享端这一端"有没有更新的安装包（拆包后两端
+        # 分别发版，按标签判定会让另一端永远收不到提示）。
         update_check.start_background_check(
-            getattr(self.runtime, "cfg", None), self._show_update_hint)
+            getattr(self.runtime, "cfg", None), self._show_update_hint, role="host")
 
     def _show_update_hint(self, msg):
         # ui-019（2026-09-18）：与其余跨线程回调统一走 _post_ui 收口——旧实现直接
@@ -347,18 +351,23 @@ class HostConsole:
 
         # ---------- 客户端区 ----------
         client_card = self._card(self.root, "已连接观看端")
-        tree = ttk.Treeview(client_card, columns=("user", "addr", "uptime", "rate", "total"),
+        tree = ttk.Treeview(client_card,
+                            columns=("user", "addr", "uptime", "rate", "total", "quality"),
                             show="headings", height=4)
         tree.heading("user", text="用户")
         tree.heading("addr", text="地址")
         tree.heading("uptime", text="已连接")
         tree.heading("rate", text="速率")
         tree.heading("total", text="累计流量")
+        # net-051（v2.5）：观看端上报的实测体验（延迟/积压/丢帧）。
+        # 这一列是"我这边发得挺顺，但队友说卡"这类问题的落点——没有它就只能靠猜。
+        tree.heading("quality", text="观看体验")
         tree.column("user", width=80, minwidth=60, stretch=False, anchor="center")
         tree.column("addr", width=150, stretch=True)
         tree.column("uptime", width=70, stretch=False, anchor="center")
         tree.column("rate", width=80, stretch=False, anchor="center")
         tree.column("total", width=90, stretch=False, anchor="center")
+        tree.column("quality", width=150, stretch=False, anchor="center")
         tree.pack(fill="x", padx=10, pady=(2, 8))
         self._client_tree = tree
 
@@ -646,7 +655,8 @@ class HostConsole:
             # G28/ui-040（2026-09-24）：勾选后本会话原先不触发任何检查——update_check
             # 是一次性检查且只有启动期调用，opt-in 要等下次启动才生效，而状态栏却写
             # "每 24 小时向 GitHub 查询一次"（双重谎报）。勾选即补一次后台检查。
-            update_check.start_background_check(cfg, self._show_update_hint)
+            update_check.start_background_check(cfg, self._show_update_hint,
+                                                role="host")
         else:
             # 第 9 轮：取消勾选 = 不再提示，入口也要收起，否则按钮留在界面上
             # 点开还是不连网的旧版本页
@@ -897,6 +907,22 @@ class HostConsole:
             extra.append("最近公网自检: 失败（%s）" % ns.get("detail", ""))
         else:
             extra.append("最近公网自检: 未运行")
+        # net-051：把**各观看端报上来的实测体验**落进诊断包。"共享端这边一切正常，
+        # 观众说卡"是这个项目最难查的一类问题，而报告里原本只有本端的发送速率，
+        # 看不到任何一端"到底卡在哪"——现在每个在线观众一行。
+        for c in (clients or []):
+            fb = c.get("fb")
+            age = c.get("fb_age_s")
+            who = c.get("username") or c.get("addr") or "?"
+            if not fb:
+                extra.append("观看体验[%s]: 未上报" % who)
+            elif age is not None and age > FB_MAX_AGE_S:
+                extra.append("观看体验[%s]: 已过期（%.0f 秒前上报）" % (who, age))
+            else:
+                extra.append("观看体验[%s]: RTT %.0f ms · 积压 %.0f ms · 丢帧 %.2f%%"
+                             " · 单帧解码 %.2f ms" % (
+                                 who, fb.get("rtt_ms", 0.0), fb.get("backlog_ms", 0.0),
+                                 fb.get("drop_pct", 0.0), fb.get("decode_ms", 0.0)))
         base_dir = data_dir()
         if not base_dir:
             messagebox.showwarning(APP_NAME, "找不到可写的数据目录，无法导出诊断包",
@@ -1081,6 +1107,7 @@ class HostConsole:
                 self._fmt_uptime(c["uptime_s"]),
                 "%.0f KB/s" % c["rate_kbps"],
                 "%.1f MB" % c["total_mb"],
+                self._fmt_quality(c.get("fb"), c.get("fb_age_s")),
             ))
         cached = getattr(self, "_client_rows_cache", None)
         if cached is None or len(cached) != len(rows):
@@ -1131,3 +1158,28 @@ class HostConsole:
         if seconds < 3600:
             return "%dm%02ds" % (seconds // 60, seconds % 60)
         return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+    @staticmethod
+    def _fmt_quality(fb, age_s):
+        """把一条质量反馈（common.parse_feedback 的结果）格式化成表格里的一格。
+
+        net-051（v2.5）：三种状态要分得开，否则用户读不出含义——
+          未上报：这一端还没发过反馈（旧版观看端，或反馈开关关了）；
+          已过期：曾经发过，但最近 10 秒没发（该端掉线了，或它自己卡到发不出）；
+          有数据：正常显示（延迟 / 积压 / 丢帧）。
+        """
+        if not fb:
+            return "未上报"
+        if age_s is not None and age_s > FB_MAX_AGE_S:
+            return "已过期"
+        parts = []
+        rtt = fb.get("rtt_ms", 0.0)
+        if rtt > 0:
+            parts.append("RTT %dms" % round(rtt))
+        backlog = fb.get("backlog_ms", 0.0)
+        if backlog >= 200:
+            parts.append("积压 %dms" % round(backlog))
+        drop = fb.get("drop_pct", 0.0)
+        if drop >= 1.0:
+            parts.append("丢帧 %.1f%%" % drop)
+        return " · ".join(parts) if parts else "正常"

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-队友视野 TeamVision —— Windows 平台的 FPS 游戏低延迟屏幕共享工具(队友端采集并做 H.264/HEVC 编码,主控端解码播放)。v1.5.0。
+队友视野 TeamVision —— Windows 平台的 FPS 游戏低延迟屏幕共享工具(队友端采集并做 H.264/HEVC 编码,主控端解码播放)。v1.6.0（开发中；已发布 v1.5.0）。
 
 ## 环境与命令
 
@@ -14,7 +14,7 @@
 
 ## 目录
 
-- `tests/` —— 67 个 `test*.py` 单测;另有 4 个不进 CI 的重负载脚本(`e2e_multiview.py`、`e2e_signalwin.py`、`soak_viewer_8h.py`、`stress_max_clients.py`)
+- `tests/` —— 73 个 `test*.py` 单测;另有 4 个不进 CI 的重负载脚本(`e2e_multiview.py`、`e2e_signalwin.py`、`soak_viewer_8h.py`、`stress_max_clients.py`)
 - `docs/` —— 中文文档;`docs/audit/` 是按模块(auth / capture / cfg / codec / dist / doc / net / test / ui)分列的审计记录
 - `assets/` —— 图标与启动图(`splash.png`),由 `gen_assets.py` 生成
 - 根目录平铺模块,**不是 Python 包**(无 `__init__.py`):`common.py` 公共库、`host.py` 共享端、`viewer.py` 主控端、`screen.py` 采集、`codec.py` 编解码、`pipeline.py` 传输,另有 `share.py` / `logger.py` / `update_check.py` / `ui_common.py`
@@ -31,14 +31,24 @@
 
 ## CI 的实际覆盖范围(比看上去窄)
 
-`.github/workflows/test.yml` 名为 `tests`,只在 push 到 `main` 和开 PR 时跑,**没有 `workflow_dispatch`**,无法手动触发。
-它只做四件事:装依赖 → `ruff check *.py tests` → `python -m mypy` → `cmd /c run_tests.bat`。
+`.github/workflows/test.yml` 名为 `tests`。触发条件:push 到 `main`、开 PR、**手动 `workflow_dispatch`**、
+以及打 `v*` tag(第 12 轮补的 `workflow_dispatch` 与 tag 触发)。
+`unit` job 只做四件事:装依赖 → `ruff check *.py tests` → `python -m mypy` → `cmd /c run_tests.bat`。
+
+另有 `package` job(第 12 轮新增):**只**在 `workflow_dispatch` 或 `v*` tag 时跑,不挂 PR
+(一次完整打包约 10 分钟)。它把 PyInstaller → Inno Setup 这条链拉进 CI:
+装依赖 → 补 `vendor/`(dxcam 钉在 DXcam 的 `v0.3.0` tag)→ 出两个 exe →
+校验产物(av 的 FFmpeg DLL 必须在)→ ISCC 编安装包 → 校验产物。
+**不含签名**(需要证书)与 `frpc.exe`(第三方产物)。
 
 由此推出两条容易踩的推论:
 
 1. 改了 lint/类型检查清单之外的目录,那道门不会替你查。`tests/` 曾在清单外待了很久,
    实测积了 89 处违规(含 `F821` 未定义名),2026-10-10 才纳入 `ruff`,**纳入前它一直是盲区**。
-2. 打包、签名、安装包这条发布链**完全在 CI 之外**,改完只能手工验证。
+2. 打包链现在有了一道 CI 门,但**签名与产物内容的人工核验仍在 CI 之外**——
+   `package` job 验的是"能编出来",不是"编出来的东西对"(第 9 轮我往 `installer.iss`
+   写进一条 Inno 不存在的指令,单测与 lint 全绿,直到真正编译安装包才炸;
+   那条链当时连一道自动化的门都没有,现在至少有一道)。
 
 ## 环境陷阱
 

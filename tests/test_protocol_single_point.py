@@ -91,10 +91,15 @@ class TestActionSinglePoint(unittest.TestCase):
 
     def test_protocol_version_is_single_carrier(self):
         # C2：PROTOCOL_VERSION 是唯一的版本载体；2.3 = proof 绑定用户名（auth-002），
-        # 2.4 = 视频帧带单调递增帧序号（net-045）
+        # 2.4 = 视频帧带单调递增帧序号（net-045），
+        # 2.5 = 观看端→共享端的质量反馈（net-051，控制消息，**不动视频载荷布局**）
         self.assertEqual(Act.__dict__.get("AUTH_RESULT"), "auth_result")
-        self.assertEqual(common.PROTOCOL_VERSION, (2, 4))
+        self.assertEqual(common.PROTOCOL_VERSION, (2, 5))
         self.assertEqual(common.MAGIC_CLIENT, b"FS02")
+        # net-051：2.5 只加了控制消息，**视频载荷布局的门槛不得跟着抬**——
+        # 抬了 VIDEO_SEQ_MINOR 就等于让所有 1.5.0 观看端被认证期拒绝（net-047 的先例）。
+        self.assertEqual(common.VIDEO_SEQ_MINOR, 4)
+        self.assertEqual(common.PROTO_CHAL_MIN_MINOR, 3)
 
 
 class _FakeSock:

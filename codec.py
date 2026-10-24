@@ -25,15 +25,21 @@
 import threading
 import time
 from fractions import Fraction
+from typing import Any, cast
 
 # 注（C9）：不再 import numpy——本模块只处理字节/帧对象，无任何 np.* 调用。
 try:
     import av
-    from av.video.frame import PictureType
+    import av.video.frame
     _AV_AVAILABLE = True
 except Exception:  # PyAV 未安装（源码瘦身环境/打包缺依赖）
-    av = None
-    PictureType = None
+    # 可选导入的失败分支：把名字置空是既有写法（下面每一处使用前都先判
+    # _AV_AVAILABLE），但 mypy 按"模块不能被赋 None"报错。显式 cast 成 Any
+    # 不是放宽检查，是把"这里可能没有"讲清楚——真正的判据是 _AV_AVAILABLE。
+    # PictureType 不再单独导入：它作为类型名被赋 None 会被 mypy 判成
+    # "Cannot assign to a type"（misc），改从模块取（av.video.frame.PictureType）
+    # 既避开这条，也让"它属于 av.video.frame"这件事显式起来。
+    av = cast(Any, None)
     _AV_AVAILABLE = False
 
 from common import CODEC_H264, CODEC_HEVC
@@ -57,7 +63,7 @@ _SW_PRESETS = frozenset({
 })
 
 #: 一次性告警集（codec-019 等）：同一 key 只报一条
-_WARNED_ONCE: set = set()
+_WARNED_ONCE: set[str] = set()
 
 
 def _warn_once(key, msg, *args):
@@ -415,7 +421,7 @@ class VideoEncoder:
             frame = av.VideoFrame.from_ndarray(bgr, format="bgr24")
             frame.pts = int(raw_ts) if raw_ts is not None else int(time.time() * 1_000_000)
             if force_key:
-                frame.pict_type = PictureType.I
+                frame.pict_type = av.video.frame.PictureType.I
             pkts = list(self._ctx.encode(frame))
         except Exception as e:
             # 第 6 条：连续编码失败计数；超限则永久标记不可用并回退 JPEG，
